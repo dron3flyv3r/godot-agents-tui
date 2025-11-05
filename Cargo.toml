@@ -1,0 +1,29 @@
+[package]
+name = "controller-mk2"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+color-eyre = "0.6.3"
+crossterm = "0.28.1"
+nix = { version = "0.30.1", features = ["signal"] }
+ratatui = "0.29.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[build]
+target-dir = "target" # optional, keep default
+rustflags = ["-C", "target-cpu=native"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+incremental = false
+
+[package.metadata]
+# optional metadata if you want to reference it later
+
+[alias]
+build-root = "build --release && cp target/release/${CARGO_PKG_NAME} ."
