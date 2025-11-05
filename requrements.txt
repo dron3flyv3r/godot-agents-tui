@@ -1,3 +1,5 @@
 godot-rl
 ray[rllib]
 godot-rl[sb3]
+onnx
+torch
