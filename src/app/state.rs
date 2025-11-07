@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::ops::Index;
@@ -12,516 +11,20 @@ use color_eyre::{
     eyre::{bail, WrapErr},
     Result,
 };
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
-use crate::project::{ProjectInfo, ProjectManager};
+use super::config::{
+    ConfigField, ExportConfig, ExportField, ExportMode, ExportState, RllibStopMode, TrainingConfig,
+    TrainingMode, EXPORT_CONFIG_FILENAME, TRAINING_CONFIG_FILENAME,
+};
+use super::file_browser::{FileBrowserEntry, FileBrowserKind, FileBrowserState, FileBrowserTarget};
+use super::metrics::{ChartData, ChartMetricKind, ChartMetricOption, MetricSample};
+use crate::domain::{ProjectInfo, ProjectManager};
+use serde_json::Value;
 
 const TRAINING_BUFFER_LIMIT: usize = 500;
 const EXPORT_BUFFER_LIMIT: usize = 500;
 const METRIC_PREFIX: &str = "@METRIC ";
 const TRAINING_METRIC_HISTORY_LIMIT: usize = 2000;
-
-#[derive(Debug, Clone, Default)]
-pub struct PolicyMetrics {
-    reward_mean: Option<f64>,
-    reward_min: Option<f64>,
-    reward_max: Option<f64>,
-    episode_len_mean: Option<f64>,
-    completed_episodes: Option<u64>,
-    learner_stats: BTreeMap<String, f64>,
-    custom_metrics: BTreeMap<String, f64>,
-}
-
-impl PolicyMetrics {
-    pub fn reward_mean(&self) -> Option<f64> {
-        self.reward_mean
-    }
-
-    pub fn reward_min(&self) -> Option<f64> {
-        self.reward_min
-    }
-
-    pub fn reward_max(&self) -> Option<f64> {
-        self.reward_max
-    }
-
-    pub fn episode_len_mean(&self) -> Option<f64> {
-        self.episode_len_mean
-    }
-
-    pub fn completed_episodes(&self) -> Option<u64> {
-        self.completed_episodes
-    }
-
-    pub fn learner_stats(&self) -> &BTreeMap<String, f64> {
-        &self.learner_stats
-    }
-
-    pub fn custom_metrics(&self) -> &BTreeMap<String, f64> {
-        &self.custom_metrics
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct MetricSample {
-    timestamp: Option<String>,
-    training_iteration: Option<u64>,
-    timesteps_total: Option<u64>,
-    episodes_total: Option<u64>,
-    episodes_this_iter: Option<u64>,
-    episode_reward_mean: Option<f64>,
-    episode_reward_min: Option<f64>,
-    episode_reward_max: Option<f64>,
-    episode_len_mean: Option<f64>,
-    time_this_iter_s: Option<f64>,
-    time_total_s: Option<f64>,
-    env_steps_this_iter: Option<u64>,
-    env_throughput: Option<f64>,
-    num_env_steps_sampled: Option<u64>,
-    num_env_steps_trained: Option<u64>,
-    num_agent_steps_sampled: Option<u64>,
-    num_agent_steps_trained: Option<u64>,
-    custom_metrics: BTreeMap<String, f64>,
-    policies: BTreeMap<String, PolicyMetrics>,
-    checkpoints: Option<u64>,
-}
-
-impl MetricSample {
-    fn from_value(value: &Value, checkpoint_frequency: u64) -> Option<Self> {
-        let kind = value.get("kind").and_then(Value::as_str);
-        if kind != Some("iteration") {
-            return None;
-        }
-
-        let training_iteration = value.get("training_iteration").and_then(value_as_u64);
-        let timesteps_total = value.get("timesteps_total").and_then(value_as_u64);
-        let checkpoints = training_iteration.and_then(|iteration| {
-            if checkpoint_frequency == 0 {
-                None
-            } else {
-                Some(iteration / checkpoint_frequency)
-            }
-        });
-
-        Some(Self {
-            timestamp: value
-                .get("timestamp")
-                .and_then(Value::as_str)
-                .map(|s| s.to_string()),
-            training_iteration,
-            timesteps_total,
-            episodes_total: value.get("episodes_total").and_then(value_as_u64),
-            episodes_this_iter: value.get("episodes_this_iter").and_then(value_as_u64),
-            episode_reward_mean: value.get("episode_reward_mean").and_then(value_as_f64),
-            episode_reward_min: value.get("episode_reward_min").and_then(value_as_f64),
-            episode_reward_max: value.get("episode_reward_max").and_then(value_as_f64),
-            episode_len_mean: value.get("episode_len_mean").and_then(value_as_f64),
-            time_this_iter_s: value.get("time_this_iter_s").and_then(value_as_f64),
-            time_total_s: value.get("time_total_s").and_then(value_as_f64),
-            env_steps_this_iter: value.get("env_steps_this_iter").and_then(value_as_u64),
-            env_throughput: value.get("env_throughput").and_then(value_as_f64),
-            num_env_steps_sampled: value.get("num_env_steps_sampled").and_then(value_as_u64),
-            num_env_steps_trained: value.get("num_env_steps_trained").and_then(value_as_u64),
-            num_agent_steps_sampled: value.get("num_agent_steps_sampled").and_then(value_as_u64),
-            num_agent_steps_trained: value.get("num_agent_steps_trained").and_then(value_as_u64),
-            custom_metrics: value
-                .get("custom_metrics")
-                .and_then(value_as_f64_map)
-                .unwrap_or_default(),
-            policies: value
-                .get("policies")
-                .and_then(value_as_policy_map)
-                .unwrap_or_default(),
-            checkpoints
-        })
-    }
-
-    pub fn timestamp(&self) -> Option<&str> {
-        self.timestamp.as_deref()
-    }
-
-    pub fn training_iteration(&self) -> Option<u64> {
-        self.training_iteration
-    }
-
-    pub fn timesteps_total(&self) -> Option<u64> {
-        self.timesteps_total
-    }
-
-    pub fn episode_reward_mean(&self) -> Option<f64> {
-        self.episode_reward_mean
-    }
-
-    pub fn episode_reward_min(&self) -> Option<f64> {
-        self.episode_reward_min
-    }
-
-    pub fn episode_reward_max(&self) -> Option<f64> {
-        self.episode_reward_max
-    }
-
-    pub fn episodes_total(&self) -> Option<u64> {
-        self.episodes_total
-    }
-
-    pub fn episodes_this_iter(&self) -> Option<u64> {
-        self.episodes_this_iter
-    }
-
-    pub fn episode_len_mean(&self) -> Option<f64> {
-        self.episode_len_mean
-    }
-
-    pub fn time_this_iter_s(&self) -> Option<f64> {
-        self.time_this_iter_s
-    }
-
-    pub fn time_total_s(&self) -> Option<f64> {
-        self.time_total_s
-    }
-
-    pub fn env_steps_this_iter(&self) -> Option<u64> {
-        self.env_steps_this_iter
-    }
-
-    pub fn env_throughput(&self) -> Option<f64> {
-        self.env_throughput
-    }
-
-    pub fn num_env_steps_sampled(&self) -> Option<u64> {
-        self.num_env_steps_sampled
-    }
-
-    pub fn num_env_steps_trained(&self) -> Option<u64> {
-        self.num_env_steps_trained
-    }
-
-    pub fn num_agent_steps_sampled(&self) -> Option<u64> {
-        self.num_agent_steps_sampled
-    }
-
-    pub fn num_agent_steps_trained(&self) -> Option<u64> {
-        self.num_agent_steps_trained
-    }
-
-    pub fn custom_metrics(&self) -> &BTreeMap<String, f64> {
-        &self.custom_metrics
-    }
-
-    pub fn policies(&self) -> &BTreeMap<String, PolicyMetrics> {
-        &self.policies
-    }
-
-    pub fn checkpoints(&self) -> Option<u64> {
-        self.checkpoints
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum ChartMetricKind {
-    EpisodeRewardMean,
-    EpisodeLenMean,
-    EnvThroughput,
-    CustomMetric(String),
-    PolicyRewardMean,
-    PolicyEpisodeLenMean,
-    PolicyLearnerStat(String),
-    PolicyCustomMetric(String),
-    // Multi-policy overlays
-    AllPoliciesRewardMean,
-    AllPoliciesEpisodeLenMean,
-    AllPoliciesLearnerStat(String),
-}
-
-#[derive(Debug, Clone)]
-pub struct ChartMetricOption {
-    label: String,
-    kind: ChartMetricKind,
-    policy_id: Option<String>,
-}
-
-impl ChartMetricOption {
-    fn new(label: impl Into<String>, kind: ChartMetricKind) -> Self {
-        Self {
-            label: label.into(),
-            kind,
-            policy_id: None,
-        }
-    }
-
-    fn with_policy(
-        label: impl Into<String>,
-        policy_id: impl Into<String>,
-        kind: ChartMetricKind,
-    ) -> Self {
-        Self {
-            label: label.into(),
-            kind,
-            policy_id: Some(policy_id.into()),
-        }
-    }
-
-    pub fn label(&self) -> &str {
-        &self.label
-    }
-
-    pub fn policy_id(&self) -> Option<&str> {
-        self.policy_id.as_deref()
-    }
-
-    pub fn kind(&self) -> &ChartMetricKind {
-        &self.kind
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ChartData {
-    pub label: String,
-    pub points: Vec<(f64, f64)>,
-}
-
-fn value_as_u64(value: &Value) -> Option<u64> {
-    match value {
-        Value::Number(number) => {
-            if let Some(u) = number.as_u64() {
-                Some(u)
-            } else if let Some(i) = number.as_i64() {
-                (i >= 0).then(|| i as u64)
-            } else {
-                number.as_f64().and_then(|f| {
-                    if f >= 0.0 {
-                        Some(f.trunc() as u64)
-                    } else {
-                        None
-                    }
-                })
-            }
-        }
-        Value::String(string) => string.parse::<u64>().ok(),
-        _ => None,
-    }
-}
-
-fn value_as_f64_map(value: &Value) -> Option<BTreeMap<String, f64>> {
-    let object = value.as_object()?;
-    let mut map = BTreeMap::new();
-    for (key, val) in object {
-        if let Some(number) = value_as_f64(val) {
-            map.insert(key.clone(), number);
-        }
-    }
-    Some(map)
-}
-
-fn value_as_policy_map(value: &Value) -> Option<BTreeMap<String, PolicyMetrics>> {
-    let object = value.as_object()?;
-    let mut map = BTreeMap::new();
-    for (policy_id, metrics) in object {
-        if let Some(policy_metrics) = value_as_policy_metrics(metrics) {
-            map.insert(policy_id.clone(), policy_metrics);
-        }
-    }
-    Some(map)
-}
-
-fn value_as_policy_metrics(value: &Value) -> Option<PolicyMetrics> {
-    let object = value.as_object()?;
-    let mut policy = PolicyMetrics::default();
-    if let Some(mean) = object.get("reward_mean").and_then(value_as_f64) {
-        policy.reward_mean = Some(mean);
-    }
-    if let Some(min) = object.get("reward_min").and_then(value_as_f64) {
-        policy.reward_min = Some(min);
-    }
-    if let Some(max) = object.get("reward_max").and_then(value_as_f64) {
-        policy.reward_max = Some(max);
-    }
-    if let Some(len) = object.get("episode_len_mean").and_then(value_as_f64) {
-        policy.episode_len_mean = Some(len);
-    }
-    if let Some(completed) = object.get("completed_episodes").and_then(value_as_u64) {
-        policy.completed_episodes = Some(completed);
-    }
-    if let Some(custom) = object.get("custom_metrics").and_then(value_as_f64_map) {
-        policy.custom_metrics = custom;
-    }
-    if let Some(learner) = object.get("learner").and_then(value_as_f64_map_recursive) {
-        policy.learner_stats = learner;
-    }
-    Some(policy)
-}
-
-fn value_as_f64_map_recursive(value: &Value) -> Option<BTreeMap<String, f64>> {
-    let mut map = BTreeMap::new();
-    collect_numeric_values("", value, &mut map);
-    if map.is_empty() {
-        None
-    } else {
-        Some(map)
-    }
-}
-
-fn collect_numeric_values(prefix: &str, value: &Value, out: &mut BTreeMap<String, f64>) {
-    match value {
-        Value::Object(obj) => {
-            for (key, val) in obj {
-                let new_prefix = if prefix.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{prefix}.{key}")
-                };
-                collect_numeric_values(&new_prefix, val, out);
-            }
-        }
-        Value::Array(items) => {
-            for (index, item) in items.iter().enumerate() {
-                let new_prefix = if prefix.is_empty() {
-                    format!("[{index}]")
-                } else {
-                    format!("{prefix}[{index}]")
-                };
-                collect_numeric_values(&new_prefix, item, out);
-            }
-        }
-        _ => {
-            if let Some(number) = value_as_f64(value) {
-                let key = if prefix.is_empty() {
-                    "value".to_string()
-                } else {
-                    prefix.to_string()
-                };
-                out.insert(key, number);
-            }
-        }
-    }
-}
-
-fn value_as_f64(value: &Value) -> Option<f64> {
-    match value {
-        Value::Number(number) => number
-            .as_f64()
-            .or_else(|| number.as_i64().map(|i| i as f64)),
-        Value::String(string) => string.parse::<f64>().ok(),
-        _ => None,
-    }
-}
-const TRAINING_CONFIG_FILENAME: &str = "training_config.json";
-const EXPORT_CONFIG_FILENAME: &str = "export_config.json";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TrainingMode {
-    SingleAgent, // Stable Baselines 3
-    MultiAgent,  // RLlib
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RllibStopMode {
-    TimeSeconds,
-    Timesteps,
-}
-
-impl Default for RllibStopMode {
-    fn default() -> Self {
-        Self::TimeSeconds
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct TrainingConfig {
-    pub mode: TrainingMode,
-    pub env_path: String,
-    pub timesteps: u64,
-    pub experiment_name: String,
-    // SB3 specific
-    pub sb3_policy_layers: Vec<usize>,
-    pub sb3_viz: bool,
-    pub sb3_speedup: u32,
-    pub sb3_n_parallel: u32,
-    pub sb3_learning_rate: f64,
-    pub sb3_batch_size: u32,
-    pub sb3_n_steps: u32,
-    pub sb3_gamma: f64,
-    pub sb3_gae_lambda: f64,
-    pub sb3_ent_coef: f64,
-    pub sb3_clip_range: f64,
-    pub sb3_vf_coef: f64,
-    pub sb3_max_grad_norm: f64,
-    // RLlib specific
-    pub rllib_config_file: String,
-    pub rllib_show_window: bool,
-    pub rllib_num_workers: u32,
-    pub rllib_num_envs_per_worker: u32,
-    pub rllib_train_batch_size: u32,
-    pub rllib_sgd_minibatch_size: u32,
-    pub rllib_num_sgd_iter: u32,
-    pub rllib_lr: f64,
-    pub rllib_gamma: f64,
-    pub rllib_lambda: f64,
-    pub rllib_clip_param: f64,
-    pub rllib_entropy_coeff: f64,
-    pub rllib_vf_loss_coeff: f64,
-    pub rllib_grad_clip: f64,
-    pub rllib_framework: String,
-    pub rllib_activation: String,
-    pub rllib_batch_mode: String,
-    pub rllib_rollout_fragment_length: u32,
-    pub rllib_fcnet_hiddens: Vec<usize>,
-    pub rllib_checkpoint_frequency: u32,
-    pub rllib_resume_from: String,
-    pub rllib_stop_mode: RllibStopMode,
-    pub rllib_stop_time_seconds: u64,
-}
-
-impl Default for TrainingConfig {
-    fn default() -> Self {
-        Self {
-            mode: TrainingMode::SingleAgent,
-            env_path: String::new(),
-            timesteps: 1_000_000,
-            experiment_name: "training".to_string(),
-            sb3_policy_layers: vec![256, 256],
-            sb3_viz: false,
-            sb3_speedup: 1,
-            sb3_n_parallel: 1,
-            sb3_learning_rate: 3e-4,
-            sb3_batch_size: 64,
-            sb3_n_steps: 2048,
-            sb3_gamma: 0.99,
-            sb3_gae_lambda: 0.95,
-            sb3_ent_coef: 0.01,
-            sb3_clip_range: 0.2,
-            sb3_vf_coef: 0.5,
-            sb3_max_grad_norm: 0.5,
-            rllib_config_file: "rllib_config.yaml".to_string(),
-            rllib_show_window: false,
-            rllib_num_workers: 4,
-            rllib_num_envs_per_worker: 1,
-            rllib_train_batch_size: 4000,
-            rllib_sgd_minibatch_size: 128,
-            rllib_num_sgd_iter: 30,
-            rllib_lr: 3e-4,
-            rllib_gamma: 0.99,
-            rllib_lambda: 0.95,
-            rllib_clip_param: 0.2,
-            rllib_entropy_coeff: 0.01,
-            rllib_vf_loss_coeff: 0.5,
-            rllib_grad_clip: 0.5,
-            rllib_framework: "torch".to_string(),
-            rllib_activation: "relu".to_string(),
-            rllib_batch_mode: "truncate_episodes".to_string(),
-            rllib_rollout_fragment_length: 200,
-            rllib_fcnet_hiddens: vec![256, 256],
-            rllib_checkpoint_frequency: 20,
-            rllib_resume_from: String::new(),
-            rllib_stop_mode: RllibStopMode::TimeSeconds,
-            rllib_stop_time_seconds: 1_000_000,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabId {
@@ -574,389 +77,126 @@ pub enum MetricsFocus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConfigField {
-    EnvPath,
-    Timesteps,
-    ExperimentName,
-    Sb3Speedup,
-    Sb3NParallel,
-    Sb3Viz,
-    Sb3PolicyLayers,
-    Sb3LearningRate,
-    Sb3BatchSize,
-    Sb3NSteps,
-    Sb3Gamma,
-    Sb3GaeLambda,
-    Sb3EntCoef,
-    Sb3ClipRange,
-    Sb3VfCoef,
-    Sb3MaxGradNorm,
-    RllibConfigFile,
-    RllibShowWindow,
-    RllibNumWorkers,
-    RllibNumEnvWorkers,
-    RllibTrainBatchSize,
-    RllibSgdMinibatchSize,
-    RllibNumSgdIter,
-    RllibLr,
-    RllibGamma,
-    RllibLambda,
-    RllibClipParam,
-    RllibEntropyCoeff,
-    RllibVfLossCoeff,
-    RllibGradClip,
-    RllibFramework,
-    RllibActivation,
-    RllibBatchMode,
-    RllibRolloutFragmentLength,
-    RllibFcnetHiddens,
-    RllibCheckpointFrequency,
-    RllibResumeFrom,
-    RllibStopMode,
-    RllibStopTimeSeconds,
+pub enum SettingsField {
+    AnimationsEnabled,
+    AnimationSpeed,
+    AutoScrollTrainingLog,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExportMode {
-    StableBaselines3,
-    Rllib,
-}
-
-impl Default for ExportMode {
-    fn default() -> Self {
-        ExportMode::StableBaselines3
-    }
-}
-
-impl ExportMode {
+impl SettingsField {
     pub fn label(self) -> &'static str {
         match self {
-            ExportMode::StableBaselines3 => "Stable-Baselines3",
-            ExportMode::Rllib => "RLlib",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExportField {
-    Sb3ModelPath,
-    Sb3OutputPath,
-    Sb3Algo,
-    Sb3Opset,
-    Sb3IrVersion,
-    Sb3UseObsArray,
-    Sb3SkipVerify,
-    RllibCheckpointPath,
-    RllibCheckpointNumber,
-    RllibOutputDir,
-    RllibPolicyId,
-    RllibOpset,
-    RllibIrVersion,
-    RllibMultiagent,
-}
-
-impl ExportField {
-    pub fn label(self) -> &'static str {
-        match self {
-            ExportField::Sb3ModelPath => "SB3 Model (.zip)",
-            ExportField::Sb3OutputPath => "SB3 Output (.onnx)",
-            ExportField::Sb3Algo => "SB3 Algorithm",
-            ExportField::Sb3Opset => "SB3 Opset",
-            ExportField::Sb3IrVersion => "SB3 IR Version",
-            ExportField::Sb3UseObsArray => "SB3 Use Obs Array",
-            ExportField::Sb3SkipVerify => "SB3 Skip Verification",
-            ExportField::RllibCheckpointPath => "RLlib Checkpoint Dir",
-            ExportField::RllibCheckpointNumber => "RLlib Checkpoint Number",
-            ExportField::RllibOutputDir => "RLlib Output Dir",
-            ExportField::RllibPolicyId => "RLlib Policy ID",
-            ExportField::RllibOpset => "RLlib Opset",
-            ExportField::RllibIrVersion => "RLlib IR Version",
-            ExportField::RllibMultiagent => "RLlib Multi-agent",
-        }
-    }
-
-    pub fn is_toggle(self) -> bool {
-        matches!(
-            self,
-            ExportField::Sb3UseObsArray | ExportField::Sb3SkipVerify | ExportField::RllibMultiagent
-        )
-    }
-
-    pub fn uses_file_browser(self) -> bool {
-        matches!(
-            self,
-            ExportField::Sb3ModelPath
-                | ExportField::Sb3OutputPath
-                | ExportField::RllibCheckpointPath
-                | ExportField::RllibOutputDir
-        )
-    }
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileBrowserTarget {
-    Config(ConfigField),
-    Export(ExportField),
-}
-
-#[derive(Debug, Clone)]
-pub enum FileBrowserKind {
-    Directory {
-        allow_create: bool,
-        require_checkpoints: bool,
-    },
-    ExistingFile {
-        extensions: Vec<String>,
-    },
-    OutputFile {
-        extension: Option<String>,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileBrowserState {
-    Browsing,
-    NamingFolder,
-    NamingFile,
-}
-
-#[derive(Debug, Clone)]
-pub enum FileBrowserEntry {
-    Parent(PathBuf),
-    Directory(PathBuf),
-    File(PathBuf),
-}
-
-impl FileBrowserEntry {
-    pub fn path(&self) -> &Path {
-        match self {
-            FileBrowserEntry::Parent(path)
-            | FileBrowserEntry::Directory(path)
-            | FileBrowserEntry::File(path) => path,
-        }
-    }
-
-    // pub fn is_dir(&self) -> bool {
-    //     matches!(
-    //         self,
-    //         FileBrowserEntry::Parent(_) | FileBrowserEntry::Directory(_)
-    //     )
-    // }
-
-    pub fn is_parent(&self) -> bool {
-        matches!(self, FileBrowserEntry::Parent(_))
-    }
-
-    pub fn display_name(&self) -> String {
-        if self.is_parent() {
-            return String::from("[..]");
-        }
-
-        self.path()
-            .file_name()
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| self.path().display().to_string())
-    }
-
-    // pub fn extension(&self) -> Option<&str> {
-    //     if matches!(self, FileBrowserEntry::File(_)) {
-    //         self.path().extension().and_then(|s| s.to_str())
-    //     } else {
-    //         None
-    //     }
-    // }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ExportConfig {
-    pub sb3_model_path: String,
-    pub sb3_output_path: String,
-    pub sb3_algo: String,
-    pub sb3_opset: u32,
-    pub sb3_ir_version: u32,
-    pub sb3_use_obs_array: bool,
-    pub sb3_skip_verify: bool,
-    pub rllib_checkpoint_path: String,
-    pub rllib_checkpoint_number: Option<u32>,
-    pub rllib_output_dir: String,
-    pub rllib_policy_id: String,
-    pub rllib_opset: u32,
-    pub rllib_ir_version: u32,
-    pub rllib_multiagent: bool,
-}
-
-impl Default for ExportConfig {
-    fn default() -> Self {
-        Self {
-            sb3_model_path: String::new(),
-            sb3_output_path: String::new(),
-            sb3_algo: String::new(),
-            sb3_opset: 13,
-            sb3_ir_version: 9,
-            sb3_use_obs_array: false,
-            sb3_skip_verify: false,
-            rllib_checkpoint_path: String::new(),
-            rllib_checkpoint_number: None,
-            rllib_output_dir: String::new(),
-            rllib_policy_id: String::new(),
-            rllib_opset: 13,
-            rllib_ir_version: 9,
-            rllib_multiagent: true,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-struct ExportState {
-    mode: ExportMode,
-    config: ExportConfig,
-}
-
-impl Default for ExportState {
-    fn default() -> Self {
-        Self {
-            mode: ExportMode::default(),
-            config: ExportConfig::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExportFocus {
-    Fields,
-    Output,
-}
-
-impl ConfigField {
-    pub fn label(self) -> &'static str {
-        match self {
-            ConfigField::EnvPath => "Environment Path",
-            ConfigField::Timesteps => "Timesteps",
-            ConfigField::ExperimentName => "Experiment Name",
-            ConfigField::Sb3Speedup => "SB3 Speedup",
-            ConfigField::Sb3NParallel => "SB3 Parallel Envs",
-            ConfigField::Sb3Viz => "SB3 Visualization",
-            ConfigField::Sb3PolicyLayers => "SB3 Policy Layers",
-            ConfigField::Sb3LearningRate => "SB3 Learning Rate",
-            ConfigField::Sb3BatchSize => "SB3 Batch Size",
-            ConfigField::Sb3NSteps => "SB3 n_steps",
-            ConfigField::Sb3Gamma => "SB3 Gamma",
-            ConfigField::Sb3GaeLambda => "SB3 GAE Lambda",
-            ConfigField::Sb3EntCoef => "SB3 Entropy Coef",
-            ConfigField::Sb3ClipRange => "SB3 Clip Range",
-            ConfigField::Sb3VfCoef => "SB3 VF Coef",
-            ConfigField::Sb3MaxGradNorm => "SB3 Max Grad Norm",
-            ConfigField::RllibConfigFile => "RLlib Config File",
-            ConfigField::RllibShowWindow => "RLlib Show Window",
-            ConfigField::RllibNumWorkers => "RLlib Workers",
-            ConfigField::RllibNumEnvWorkers => "RLlib Envs/Worker",
-            ConfigField::RllibTrainBatchSize => "RLlib Train Batch",
-            ConfigField::RllibSgdMinibatchSize => "RLlib Minibatch",
-            ConfigField::RllibNumSgdIter => "RLlib SGD Iterations",
-            ConfigField::RllibLr => "RLlib Learning Rate",
-            ConfigField::RllibGamma => "RLlib Gamma",
-            ConfigField::RllibLambda => "RLlib Lambda",
-            ConfigField::RllibClipParam => "RLlib Clip Param",
-            ConfigField::RllibEntropyCoeff => "RLlib Entropy Coef",
-            ConfigField::RllibVfLossCoeff => "RLlib VF Loss Coef",
-            ConfigField::RllibGradClip => "RLlib Grad Clip",
-            ConfigField::RllibFramework => "RLlib Framework",
-            ConfigField::RllibActivation => "RLlib Activation",
-            ConfigField::RllibBatchMode => "RLlib Batch Mode",
-            ConfigField::RllibRolloutFragmentLength => "RLlib Rollout Fragment",
-            ConfigField::RllibFcnetHiddens => "RLlib FC Layers",
-            ConfigField::RllibCheckpointFrequency => "RLlib Checkpoint Frequency",
-            ConfigField::RllibResumeFrom => "RLlib Resume Directory",
-            ConfigField::RllibStopMode => "RLlib Stop Mode",
-            ConfigField::RllibStopTimeSeconds => "RLlib Time Limit (s)",
-            // ConfigField::RllibCheckpointFrequency => {
-            //     self.training_config.rllib_checkpoint_frequency.to_string()
-            // }
+            SettingsField::AnimationsEnabled => "Animations",
+            SettingsField::AnimationSpeed => "Animation Speed",
+            SettingsField::AutoScrollTrainingLog => "Training Log Auto-scroll",
         }
     }
 
     pub fn description(self) -> &'static str {
         match self {
-            ConfigField::EnvPath => {
-                "Executable path to the exported Godot environment used for training."
+            SettingsField::AnimationsEnabled => {
+                "Toggle spinners and pulsing highlights throughout the UI."
             }
-            ConfigField::Timesteps => {
-                "Total environment timesteps to run before stopping training."
-            }
-            ConfigField::ExperimentName => {
-                "Name used for experiment folders, checkpoints, and logs."
-            }
-            ConfigField::Sb3Speedup => "Simulation speed multiplier applied while SB3 is running.",
-            ConfigField::Sb3NParallel => {
-                "Number of parallel environments to launch for SB3 training."
-            }
-            ConfigField::Sb3Viz => "Enable to render the Godot window during SB3 training.",
-            ConfigField::Sb3PolicyLayers => {
-                "Comma-separated hidden layer sizes for the SB3 policy network."
-            }
-            ConfigField::Sb3LearningRate => "Learning rate used by the SB3 optimizer.",
-            ConfigField::Sb3BatchSize => "Batch size sampled when performing SB3 updates.",
-            ConfigField::Sb3NSteps => "Steps collected per rollout before each SB3 update.",
-            ConfigField::Sb3Gamma => "Discount factor (gamma) applied to future rewards in SB3.",
-            ConfigField::Sb3GaeLambda => {
-                "GAE lambda balancing bias and variance for SB3 advantages."
-            }
-            ConfigField::Sb3EntCoef => "Entropy bonus encouraging exploration in SB3.",
-            ConfigField::Sb3ClipRange => "PPO clip range limiting SB3 policy updates.",
-            ConfigField::Sb3VfCoef => "Weight applied to the SB3 value function loss.",
-            ConfigField::Sb3MaxGradNorm => "Maximum gradient norm before SB3 clips updates.",
-            ConfigField::RllibConfigFile => {
-                "Relative path where the generated RLlib config YAML is saved."
-            }
-            ConfigField::RllibShowWindow => {
-                "Show the Godot window during RLlib training when enabled."
-            }
-            ConfigField::RllibNumWorkers => "Number of RLlib rollout workers to spawn.",
-            ConfigField::RllibNumEnvWorkers => "Environments created per RLlib worker.",
-            ConfigField::RllibTrainBatchSize => {
-                "Total batch size RLlib gathers before each optimization step."
-            }
-            ConfigField::RllibSgdMinibatchSize => "Minibatch size used inside RLlib's SGD loop.",
-            ConfigField::RllibNumSgdIter => "How many SGD passes RLlib runs per collected batch.",
-            ConfigField::RllibLr => "Learning rate for the RLlib optimizer.",
-            ConfigField::RllibGamma => {
-                "Discount factor (gamma) applied to future rewards in RLlib."
-            }
-            ConfigField::RllibLambda => "GAE lambda used for RLlib advantage estimates.",
-            ConfigField::RllibClipParam => {
-                "PPO clip parameter limiting RLlib policy update magnitude."
-            }
-            ConfigField::RllibEntropyCoeff => "Entropy bonus encouraging exploration in RLlib.",
-            ConfigField::RllibVfLossCoeff => "Weight applied to RLlib's value function loss.",
-            ConfigField::RllibGradClip => "Maximum gradient norm before RLlib clips updates.",
-            ConfigField::RllibFramework => "Deep learning backend RLlib should use (torch or tf).",
-            ConfigField::RllibActivation => "Activation function for RLlib fully connected layers.",
-            ConfigField::RllibBatchMode => {
-                "Choose between episode or fragment based RLlib batching."
-            }
-            ConfigField::RllibRolloutFragmentLength => {
-                "Steps per rollout fragment collected by each RLlib worker."
-            }
-            ConfigField::RllibFcnetHiddens => {
-                "Comma-separated hidden layer sizes for RLlib's fully connected net."
-            }
-            ConfigField::RllibCheckpointFrequency => {
-                "Number of iterations between RLlib checkpoints."
-            }
-            ConfigField::RllibResumeFrom => {
-                "Optional checkpoint directory to resume RLlib training from."
-            }
-            ConfigField::RllibStopMode => {
-                "Select whether RLlib stops by elapsed time or total timesteps."
-            }
-            ConfigField::RllibStopTimeSeconds => {
-                "Target duration in seconds when using time-based stopping."
+            SettingsField::AnimationSpeed => "Adjust how fast animated indicators update.",
+            SettingsField::AutoScrollTrainingLog => {
+                "Follow the latest training output automatically when new lines arrive."
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnimationSpeed {
+    Slow,
+    Normal,
+    Fast,
+}
+
+impl AnimationSpeed {
+    fn label(self) -> &'static str {
+        match self {
+            AnimationSpeed::Slow => "Slow",
+            AnimationSpeed::Normal => "Normal",
+            AnimationSpeed::Fast => "Fast",
+        }
+    }
+
+    fn interval_ms(self) -> u64 {
+        match self {
+            AnimationSpeed::Slow => 400,
+            AnimationSpeed::Normal => 200,
+            AnimationSpeed::Fast => 120,
+        }
+    }
+
+    fn step(self, direction: i32) -> Self {
+        use AnimationSpeed::*;
+        let speeds = [Slow, Normal, Fast];
+        let idx = speeds.iter().position(|s| s == &self).unwrap_or(1) as i32;
+        let len = speeds.len() as i32;
+        let mut next = idx + direction;
+        if next < 0 {
+            next = 0;
+        } else if next >= len {
+            next = len - 1;
+        }
+        speeds[next as usize]
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ControllerSettings {
+    animations_enabled: bool,
+    animation_speed: AnimationSpeed,
+    auto_scroll_training_log: bool,
+}
+
+impl Default for ControllerSettings {
+    fn default() -> Self {
+        Self {
+            animations_enabled: true,
+            animation_speed: AnimationSpeed::Normal,
+            auto_scroll_training_log: true,
+        }
+    }
+}
+
+impl ControllerSettings {
+    fn toggle_animations(&mut self) {
+        self.animations_enabled = !self.animations_enabled;
+    }
+
+    fn toggle_auto_scroll(&mut self) {
+        self.auto_scroll_training_log = !self.auto_scroll_training_log;
+    }
+
+    fn change_speed(&mut self, direction: i32) {
+        self.animation_speed = self.animation_speed.step(direction);
+    }
+
+    pub fn animations_enabled(&self) -> bool {
+        self.animations_enabled
+    }
+
+    pub fn animation_speed(&self) -> AnimationSpeed {
+        self.animation_speed
+    }
+
+    pub fn auto_scroll_training_log(&self) -> bool {
+        self.auto_scroll_training_log
+    }
+}
+
+const SETTINGS_FIELDS: [SettingsField; 3] = [
+    SettingsField::AnimationsEnabled,
+    SettingsField::AnimationSpeed,
+    SettingsField::AutoScrollTrainingLog,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFocus {
+    Fields,
+    Output,
 }
 
 #[derive(Debug)]
@@ -1037,6 +277,10 @@ pub struct App {
     // Python environment check results
     python_sb3_available: Option<bool>,
     python_ray_available: Option<bool>,
+
+    controller_settings: ControllerSettings,
+    settings_selection: usize,
+    ui_animation_anchor: Instant,
 }
 
 impl App {
@@ -1130,6 +374,10 @@ impl App {
 
             python_sb3_available: None,
             python_ray_available: None,
+
+            controller_settings: ControllerSettings::default(),
+            settings_selection: 0,
+            ui_animation_anchor: Instant::now(),
         };
 
         app.ensure_selection_valid();
@@ -1157,25 +405,9 @@ impl App {
         }
     }
 
-    pub fn next_tab(&mut self) {
-        self.active_tab_index = (self.active_tab_index + 1) % self.tabs.len();
-    }
-
-    pub fn previous_tab(&mut self) {
-        if self.active_tab_index == 0 {
-            self.active_tab_index = self.tabs.len() - 1;
-        } else {
-            self.active_tab_index -= 1;
-        }
-    }
-
     pub fn should_quit(&self) -> bool {
         self.should_quit
     }
-
-    // pub fn quit(&mut self) {
-    //     self.should_quit = true;
-    // }
 
     pub fn projects(&self) -> &[ProjectInfo] {
         &self.projects
@@ -1221,7 +453,7 @@ impl App {
     fn check_python_environment(&mut self) {
         let python_cmd = determine_python_command();
         let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        
+
         let check_script = match find_script(&base_dir, "check_py_env.py") {
             Ok(script) => script,
             Err(_) => {
@@ -1232,9 +464,7 @@ impl App {
             }
         };
 
-        let output = Command::new(&python_cmd)
-            .arg(&check_script)
-            .output();
+        let output = Command::new(&python_cmd).arg(&check_script).output();
 
         match output {
             Ok(result) => {
@@ -1412,7 +642,7 @@ impl App {
                     format!("All Policies - Episode Length ({num_policies} policies)"),
                     ChartMetricKind::AllPoliciesEpisodeLenMean,
                 ));
-                
+
                 // Collect all unique learner stat keys
                 let mut learner_stat_keys = std::collections::HashSet::new();
                 for (_, metrics) in latest.policies() {
@@ -1420,7 +650,7 @@ impl App {
                         learner_stat_keys.insert(key.clone());
                     }
                 }
-                
+
                 // Add overlay options for each learner stat
                 for key in learner_stat_keys {
                     options.push(ChartMetricOption::new(
@@ -1579,9 +809,12 @@ impl App {
     }
 
     /// Get multi-series chart data for overlay charts
-    pub fn chart_multi_series_data(&self, option: &ChartMetricOption) -> Vec<(String, Vec<(f64, f64)>)> {
+    pub fn chart_multi_series_data(
+        &self,
+        option: &ChartMetricOption,
+    ) -> Vec<(String, Vec<(f64, f64)>)> {
         let samples = self.training_metrics_history();
-        
+
         match option.kind() {
             ChartMetricKind::AllPoliciesRewardMean => {
                 // Collect all policy IDs
@@ -1591,11 +824,13 @@ impl App {
                         policy_ids.insert(id.clone());
                     }
                 }
-                
+
                 // Sort policy IDs
                 let mut sorted_ids: Vec<_> = policy_ids.into_iter().collect();
-                sorted_ids.sort_by(|a, b| crate::ui::alphanumeric_sort_key(a).cmp(&crate::ui::alphanumeric_sort_key(b)));
-                
+                sorted_ids.sort_by(|a, b| {
+                    crate::ui::alphanumeric_sort_key(a).cmp(&crate::ui::alphanumeric_sort_key(b))
+                });
+
                 // Build series for each policy
                 sorted_ids
                     .into_iter()
@@ -1622,10 +857,12 @@ impl App {
                         policy_ids.insert(id.clone());
                     }
                 }
-                
+
                 let mut sorted_ids: Vec<_> = policy_ids.into_iter().collect();
-                sorted_ids.sort_by(|a, b| crate::ui::alphanumeric_sort_key(a).cmp(&crate::ui::alphanumeric_sort_key(b)));
-                
+                sorted_ids.sort_by(|a, b| {
+                    crate::ui::alphanumeric_sort_key(a).cmp(&crate::ui::alphanumeric_sort_key(b))
+                });
+
                 sorted_ids
                     .into_iter()
                     .map(|policy_id| {
@@ -1651,10 +888,12 @@ impl App {
                         policy_ids.insert(id.clone());
                     }
                 }
-                
+
                 let mut sorted_ids: Vec<_> = policy_ids.into_iter().collect();
-                sorted_ids.sort_by(|a, b| crate::ui::alphanumeric_sort_key(a).cmp(&crate::ui::alphanumeric_sort_key(b)));
-                
+                sorted_ids.sort_by(|a, b| {
+                    crate::ui::alphanumeric_sort_key(a).cmp(&crate::ui::alphanumeric_sort_key(b))
+                });
+
                 sorted_ids
                     .into_iter()
                     .map(|policy_id| {
@@ -1683,13 +922,125 @@ impl App {
         self.metrics_focus
     }
 
-    pub fn metrics_cycle_focus_next(&mut self) {
+    pub fn animations_enabled(&self) -> bool {
+        self.controller_settings.animations_enabled()
+    }
 
+    pub fn animation_phase(&self) -> usize {
+        if !self.controller_settings.animations_enabled() {
+            return 0;
+        }
+        let interval = self
+            .controller_settings
+            .animation_speed()
+            .interval_ms()
+            .max(1);
+        let elapsed = self.ui_animation_anchor.elapsed().as_millis();
+        ((elapsed / interval as u128) % usize::MAX as u128) as usize
+    }
+
+    pub fn spinner_char(&self) -> Option<char> {
+        if !self.controller_settings.animations_enabled() {
+            return None;
+        }
+        const FRAMES: [char; 4] = ['|', '/', '-', '\\'];
+        Some(FRAMES[self.animation_phase() % FRAMES.len()])
+    }
+
+    pub fn settings_fields(&self) -> &'static [SettingsField] {
+        &SETTINGS_FIELDS
+    }
+
+    pub fn settings_selection_index(&self) -> usize {
+        self.settings_selection
+    }
+
+    pub fn current_settings_field(&self) -> SettingsField {
+        SETTINGS_FIELDS[self.settings_selection]
+    }
+
+    pub fn select_next_setting(&mut self) {
+        self.settings_selection = (self.settings_selection + 1) % self.settings_fields().len();
+    }
+
+    pub fn select_previous_setting(&mut self) {
+        if self.settings_selection == 0 {
+            self.settings_selection = self.settings_fields().len() - 1;
+        } else {
+            self.settings_selection -= 1;
+        }
+    }
+
+    pub fn adjust_setting(&mut self, direction: i32) {
+        match self.current_settings_field() {
+            SettingsField::AnimationsEnabled => {
+                self.controller_settings.toggle_animations();
+                let state = if self.controller_settings.animations_enabled() {
+                    "enabled"
+                } else {
+                    "disabled"
+                };
+                self.set_status(format!("Animations {state}"), StatusKind::Info);
+            }
+            SettingsField::AnimationSpeed => {
+                self.controller_settings.change_speed(direction);
+                self.set_status(
+                    format!(
+                        "Animation speed {}",
+                        self.controller_settings.animation_speed().label()
+                    ),
+                    StatusKind::Info,
+                );
+            }
+            SettingsField::AutoScrollTrainingLog => {
+                self.controller_settings.toggle_auto_scroll();
+                let state = if self.controller_settings.auto_scroll_training_log() {
+                    "enabled"
+                } else {
+                    "paused"
+                };
+                self.set_status(format!("Log auto-scroll {state}"), StatusKind::Info);
+                if self.controller_settings.auto_scroll_training_log() {
+                    self.training_output_scroll = 0;
+                }
+            }
+        }
+    }
+
+    pub fn toggle_current_setting(&mut self) {
+        self.adjust_setting(1);
+    }
+
+    pub fn settings_field_value(&self, field: SettingsField) -> String {
+        match field {
+            SettingsField::AnimationsEnabled => {
+                if self.controller_settings.animations_enabled() {
+                    "On".to_string()
+                } else {
+                    "Off".to_string()
+                }
+            }
+            SettingsField::AnimationSpeed => self
+                .controller_settings
+                .animation_speed()
+                .label()
+                .to_string(),
+            SettingsField::AutoScrollTrainingLog => {
+                if self.controller_settings.auto_scroll_training_log() {
+                    "On".to_string()
+                } else {
+                    "Off".to_string()
+                }
+            }
+        }
+    }
+
+    pub fn metrics_cycle_focus_next(&mut self) {
         self.metrics_focus = match self.metrics_focus {
             MetricsFocus::History => MetricsFocus::Policies,
             MetricsFocus::Policies => MetricsFocus::History,
             MetricsFocus::Chart => MetricsFocus::History,
-            MetricsFocus::Summary => MetricsFocus::History
+            MetricsFocus::Summary => MetricsFocus::History,
         };
 
         // self.metrics_focus = match self.metrics_focus {
@@ -1705,9 +1056,8 @@ impl App {
             MetricsFocus::History => MetricsFocus::Policies,
             MetricsFocus::Policies => MetricsFocus::History,
             MetricsFocus::Chart => MetricsFocus::History,
-            MetricsFocus::Summary => MetricsFocus::History
+            MetricsFocus::Summary => MetricsFocus::History,
         };
-
 
         // self.metrics_focus = match self.metrics_focus {
         //     MetricsFocus::History => MetricsFocus::Chart,
@@ -1725,45 +1075,31 @@ impl App {
         self.metrics_policies_scroll
     }
 
-    pub fn clamp_metrics_summary_scroll(&mut self, total_lines: usize, visible_lines: usize) {
-        let max_scroll = total_lines.saturating_sub(visible_lines);
-        self.metrics_summary_scroll = self.metrics_summary_scroll.min(max_scroll);
-    }
-
-    pub fn clamp_metrics_policies_scroll(&mut self, total_items: usize, visible_items: usize) {
-        let max_scroll = total_items.saturating_sub(visible_items);
-        self.metrics_policies_scroll = self.metrics_policies_scroll.min(max_scroll);
-    }
-
-    pub fn clamp_metrics_policies_horizontal_scroll(&mut self, total_policies: usize, visible_policies: usize) {
-        let max_scroll = total_policies.saturating_sub(visible_policies);
-        self.metrics_policies_horizontal_scroll = self.metrics_policies_horizontal_scroll.min(max_scroll);
-    }
-
     pub fn clamp_all_metrics_scrolls(&mut self) {
         // This gets called from the event loop to ensure scroll values stay reasonable
         // Individual panels will still do their own clamping, but this prevents
         // scroll values from growing too large when content changes
-        
+
         // We can't know the exact bounds without the UI context, but we can
         // at least ensure they don't grow unbounded. The UI will apply final clamping.
-        
+
         // Summary scroll - arbitrary max to prevent extreme values
         if self.metrics_summary_scroll > 1000 {
             self.metrics_summary_scroll = 100;
         }
-        
+
         // Policies scroll - same logic
         if self.metrics_policies_scroll > 1000 {
             self.metrics_policies_scroll = 100;
         }
-        
+
         // Horizontal scroll - limit to reasonable policy count
         if let Some(sample) = self.training_metrics.last() {
             let num_policies = sample.policies().len();
             if num_policies > 0 {
-                self.metrics_policies_horizontal_scroll = 
-                    self.metrics_policies_horizontal_scroll.min(num_policies.saturating_sub(1));
+                self.metrics_policies_horizontal_scroll = self
+                    .metrics_policies_horizontal_scroll
+                    .min(num_policies.saturating_sub(1));
             }
         }
     }
@@ -1820,11 +1156,13 @@ impl App {
     }
 
     pub fn metrics_scroll_policies_left(&mut self) {
-        self.metrics_policies_horizontal_scroll = self.metrics_policies_horizontal_scroll.saturating_sub(1);
+        self.metrics_policies_horizontal_scroll =
+            self.metrics_policies_horizontal_scroll.saturating_sub(1);
     }
 
     pub fn metrics_scroll_policies_right(&mut self) {
-        self.metrics_policies_horizontal_scroll = self.metrics_policies_horizontal_scroll.saturating_add(1);
+        self.metrics_policies_horizontal_scroll =
+            self.metrics_policies_horizontal_scroll.saturating_add(1);
     }
 
     pub fn export_output(&self) -> &[String] {
@@ -4913,6 +4251,10 @@ impl App {
             self.training_output_scroll = 0;
             return;
         }
+        if self.controller_settings.auto_scroll_training_log() {
+            self.training_output_scroll = 0;
+            return;
+        }
         let max_offset = self.training_output.len().saturating_sub(1);
         if self.training_output_scroll > max_offset {
             self.training_output_scroll = max_offset;
@@ -4961,8 +4303,8 @@ impl App {
             total_duration
         };
 
-        sample.time_total_s = Some(total_duration);
-        sample.time_this_iter_s = Some(iter_duration);
+        sample.set_time_total_s(total_duration);
+        sample.set_time_this_iter_s(iter_duration);
 
         self.metric_last_sample_time = Some(now);
         let previous_offset = self.metrics_history_index;

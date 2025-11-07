@@ -1,5 +1,5 @@
 mod app;
-mod project;
+mod domain;
 mod ui;
 
 use std::io::{self, Stdout};
@@ -153,8 +153,9 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
             }
             KeyCode::Enter => {
                 // Toggle chart/policies swap when Policies or Chart is focused
-                if app.metrics_focus() == app::MetricsFocus::Policies 
-                    || app.metrics_focus() == app::MetricsFocus::Chart {
+                if app.metrics_focus() == app::MetricsFocus::Policies
+                    || app.metrics_focus() == app::MetricsFocus::Chart
+                {
                     app.metrics_toggle_policies_expanded();
                 }
             }
@@ -270,6 +271,15 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
             }
             KeyCode::PageUp => app.scroll_export_output_up(10),
             KeyCode::PageDown => app.scroll_export_output_down(10),
+            _ => {}
+        }
+    } else if app.active_tab().id == TabId::Settings {
+        match key {
+            KeyCode::Down | KeyCode::Char('j') => app.select_next_setting(),
+            KeyCode::Up | KeyCode::Char('k') => app.select_previous_setting(),
+            KeyCode::Left | KeyCode::Char('h') => app.adjust_setting(-1),
+            KeyCode::Right | KeyCode::Char('l') => app.adjust_setting(1),
+            KeyCode::Enter | KeyCode::Char(' ') => app.toggle_current_setting(),
             _ => {}
         }
     }

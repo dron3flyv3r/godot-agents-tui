@@ -5,127 +5,34 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Axis, Block, Borders, Chart, Dataset, GraphType, List, ListItem, ListState, Paragraph, Tabs,
+    Axis, Block, Borders, Chart, Clear, Dataset, GraphType, List, ListItem, ListState, Paragraph,
     Wrap,
 };
 use ratatui::Frame;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
     App, ConfigField, FileBrowserEntry, FileBrowserKind, FileBrowserState, InputMode, MetricSample,
     MetricsFocus, StatusKind, TabId,
 };
 
-/// Smart alphanumeric sorting for policy names like "policy_1", "policy_10", "policy_2"
-/// Splits strings into alphabetic and numeric parts, then sorts accordingly
-pub fn alphanumeric_sort_key(s: &str) -> Vec<(String, u64)> {
-    let mut parts = Vec::new();
-    let mut current_alpha = String::new();
-    let mut current_num = String::new();
-    
-    for ch in s.chars() {
-        if ch.is_ascii_digit() {
-            if !current_alpha.is_empty() {
-                parts.push((current_alpha.clone(), 0));
-                current_alpha.clear();
-            }
-            current_num.push(ch);
-        } else {
-            if !current_num.is_empty() {
-                let num: u64 = current_num.parse().unwrap_or(0);
-                parts.push((String::new(), num));
-                current_num.clear();
-            }
-            current_alpha.push(ch);
-        }
+use super::utils::alphanumeric_sort_key;
+
+fn focused_border_color(app: &App, focused: bool) -> Color {
+    if !focused {
+        return Color::DarkGray;
     }
-    
-    // Push remaining parts
-    if !current_alpha.is_empty() {
-        parts.push((current_alpha, 0));
+    if !app.animations_enabled() {
+        return Color::Cyan;
     }
-    if !current_num.is_empty() {
-        let num: u64 = current_num.parse().unwrap_or(0);
-        parts.push((String::new(), num));
-    }
-    
-    parts
-}
-
-pub fn render(frame: &mut Frame<'_>, app: &App) {
-    // Render help overlay if visible
-    if app.is_help_visible() {
-        render_help_overlay(frame, app);
-        return;
-    }
-
-    // Render confirm quit dialog
-    if app.input_mode() == InputMode::ConfirmQuit {
-        render_confirm_quit(frame, app);
-        return;
-    }
-
-    if matches!(
-        app.input_mode(),
-        InputMode::AdvancedConfig | InputMode::EditingAdvancedConfig
-    ) {
-        render_advanced_config(frame, app);
-        return;
-    }
-
-    // Render file browser if active
-    if app.input_mode() == InputMode::BrowsingFiles {
-        render_file_browser(frame, app);
-        return;
-    }
-
-    let [header_area, content_area] = split_layout(frame.area());
-    render_tabs(frame, header_area, app);
-    render_content(frame, content_area, app);
-}
-
-fn split_layout(area: Rect) -> [Rect; 2] {
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
-        .split(area);
-    [layout[0], layout[1]]
-}
-
-fn render_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let titles = app
-        .tabs()
-        .iter()
-        .map(|tab| {
-            Line::from(Span::styled(
-                format!(" {} ", tab.title),
-                Style::default().fg(Color::Cyan),
-            ))
-        })
-        .collect::<Vec<_>>();
-
-    let tabs = Tabs::new(titles)
-        .highlight_style(
-            Style::default()
-                .fg(Color::White)
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
-        .select(app.active_index());
-
-    frame.render_widget(tabs, area);
-}
-
-fn render_content(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    match app.active_tab().id {
-        TabId::Home => render_home(frame, area, app),
-        TabId::Train => render_train(frame, area, app),
-        TabId::Metrics => render_metrics(frame, area, app),
-        TabId::Export => render_export(frame, area, app),
-        tab => render_placeholder(frame, area, tab, app),
+    if app.animation_phase() % 2 == 0 {
+        Color::Cyan
+    } else {
+        Color::LightCyan
     }
 }
 
-fn render_home(frame: &mut Frame<'_>, area: Rect, app: &App) {
+pub fn render_home(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let constraints = if area.height >= 16 {
         [
             Constraint::Length(4),
@@ -181,10 +88,12 @@ fn render_active_project(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_python_environment(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let block = Block::default().borders(Borders::ALL).title("Python Environment");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Python Environment");
 
     let mut lines = Vec::new();
-    
+
     // Check Stable Baselines 3
     let sb3_status = match app.python_sb3_available() {
         Some(true) => ("✓", Color::LightGreen),
@@ -192,7 +101,12 @@ fn render_python_environment(frame: &mut Frame<'_>, area: Rect, app: &App) {
         None => ("?", Color::Yellow),
     };
     lines.push(Line::from(vec![
-        Span::styled(sb3_status.0, Style::default().fg(sb3_status.1).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            sb3_status.0,
+            Style::default()
+                .fg(sb3_status.1)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" "),
         Span::styled("Stable Baselines 3", Style::default().fg(Color::White)),
     ]));
@@ -204,7 +118,12 @@ fn render_python_environment(frame: &mut Frame<'_>, area: Rect, app: &App) {
         None => ("?", Color::Yellow),
     };
     lines.push(Line::from(vec![
-        Span::styled(ray_status.0, Style::default().fg(ray_status.1).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            ray_status.0,
+            Style::default()
+                .fg(ray_status.1)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" "),
         Span::styled("Ray/RLlib", Style::default().fg(Color::White)),
     ]));
@@ -332,7 +251,13 @@ fn render_home_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         InputMode::Normal => {
             if let Some(status) = app.status() {
                 let style = status_style(status.kind);
-                lines.push(Line::from(Span::styled(status.text.clone(), style)));
+                let mut text = status.text.clone();
+                if app.is_training_running() || app.is_export_running() {
+                    if let Some(spinner) = app.spinner_char() {
+                        text = format!("{spinner} {text}");
+                    }
+                }
+                lines.push(Line::from(Span::styled(text, style)));
             }
 
             let instruction = if area.width < 48 {
@@ -361,7 +286,7 @@ fn render_home_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_train(frame: &mut Frame<'_>, area: Rect, app: &App) {
+pub fn render_train(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let constraints = if area.height >= 16 {
         [
             Constraint::Length(8),
@@ -529,6 +454,7 @@ fn render_training_config(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_training_output(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    frame.render_widget(Clear, area);
     let output_block = Block::default()
         .borders(Borders::ALL)
         .title("Training Output");
@@ -556,7 +482,7 @@ fn render_training_output(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_metrics(frame: &mut Frame<'_>, area: Rect, app: &App) {
+pub fn render_metrics(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if app.training_metrics_history().is_empty() {
         let placeholder =
             Paragraph::new("No metrics yet. Start a training run to see live updates.")
@@ -609,10 +535,7 @@ fn render_metrics_medium(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Chart/Policies on top (swap based on expanded), two columns below
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(55),
-            Constraint::Percentage(45),
-        ])
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(area);
 
     // Swap chart and policies positions based on expanded state
@@ -625,10 +548,7 @@ fn render_metrics_medium(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Bottom: Two columns - Summary and History+Chart/Policies stacked
     let bottom_columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(50),
-            Constraint::Percentage(50),
-        ])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(rows[1]);
 
     render_metrics_summary(frame, bottom_columns[0], app);
@@ -636,14 +556,11 @@ fn render_metrics_medium(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Right side: History on top, Chart or Policies below (opposite of top)
     let right_stack = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(50),
-            Constraint::Percentage(50),
-        ])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(bottom_columns[1]);
 
     render_metrics_history(frame, right_stack[0], app);
-    
+
     // Show the opposite in the bottom-right
     if app.metrics_policies_expanded() {
         // Policies are expanded at top, show chart at bottom
@@ -658,10 +575,7 @@ fn render_metrics_large(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Original three-column layout for large screens
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(60),
-            Constraint::Percentage(40),
-        ])
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(area);
 
     // Swap chart and policies positions based on expanded state
@@ -683,7 +597,7 @@ fn render_metrics_large(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     render_metrics_history(frame, bottom_columns[0], app);
     render_metrics_summary(frame, bottom_columns[1], app);
-    
+
     // Show the opposite in the bottom-right
     if app.metrics_policies_expanded() {
         // Policies are expanded at top, show chart at bottom
@@ -708,7 +622,7 @@ fn render_metrics_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let sample = app
         .selected_metric_sample()
         .or_else(|| app.latest_training_metric());
-    
+
     if let Some(sample) = sample {
         let selection_index = app.metrics_history_selected_index();
         let position_text = if selection_index == 0 {
@@ -720,13 +634,15 @@ fn render_metrics_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let mut lines = Vec::new();
         let available_width = area.width.saturating_sub(4) as usize; // Account for borders and padding
         let available_height = area.height.saturating_sub(2) as usize; // Account for borders
-        
+
         // Header with position - always on one line - Selected: <position>  Iter: <iteration>  Checkpoint: <number>
         lines.push(Line::from(vec![
             Span::styled("Selected: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 position_text,
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
             Span::styled("Iter: ", Style::default().fg(Color::DarkGray)),
@@ -793,7 +709,9 @@ fn render_metrics_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Span::styled("Reward: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 format_option_f64(sample.episode_reward_mean()),
-                Style::default().fg(Color::LightMagenta).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::LightMagenta)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]));
         lines.push(Line::from(vec![
@@ -854,9 +772,10 @@ fn render_metrics_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
         // Only show detailed steps if we have enough vertical space
         if available_height >= 12 {
             // Environment steps - split into two lines for clarity
-            lines.push(Line::from(vec![
-                Span::styled("Env steps: ", Style::default().fg(Color::DarkGray)),
-            ]));
+            lines.push(Line::from(vec![Span::styled(
+                "Env steps: ",
+                Style::default().fg(Color::DarkGray),
+            )]));
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(
@@ -872,9 +791,10 @@ fn render_metrics_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ]));
 
             // Agent steps - split into two lines for clarity
-            lines.push(Line::from(vec![
-                Span::styled("Agent steps: ", Style::default().fg(Color::DarkGray)),
-            ]));
+            lines.push(Line::from(vec![Span::styled(
+                "Agent steps: ",
+                Style::default().fg(Color::DarkGray),
+            )]));
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(
@@ -915,12 +835,18 @@ fn render_metrics_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
         // Apply scroll offset with bounds checking
         let total_lines = lines.len();
         let visible_lines = available_height;
-        let scroll_offset = app.metrics_summary_scroll().min(total_lines.saturating_sub(visible_lines));
+        let scroll_offset = app
+            .metrics_summary_scroll()
+            .min(total_lines.saturating_sub(visible_lines));
         let lines_to_show: Vec<_> = lines.into_iter().skip(scroll_offset).collect();
 
         // Highlight border if this panel is focused
         let is_focused = app.metrics_focus() == MetricsFocus::Summary;
-        let border_color = if is_focused { Color::Cyan } else { Color::DarkGray };
+        let border_color = if is_focused {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        };
         let title = if is_focused {
             "Key Metrics [FOCUSED - ↑/↓ to scroll, Tab to switch]"
         } else {
@@ -940,16 +866,13 @@ fn render_metrics_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
         );
     } else {
         let placeholder = Paragraph::new("No metrics captured yet.")
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Key Metrics"),
-            )
+            .block(Block::default().borders(Borders::ALL).title("Key Metrics"))
             .alignment(Alignment::Center)
             .style(Style::default().fg(Color::DarkGray));
         frame.render_widget(placeholder, area);
     }
-}fn render_metrics_history(frame: &mut Frame<'_>, area: Rect, app: &App) {
+}
+fn render_metrics_history(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let history = app.training_metrics_history();
     let available_rows = area.height.saturating_sub(2) as usize;
     if available_rows == 0 {
@@ -965,16 +888,17 @@ fn render_metrics_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let end = (start + available_rows).min(total);
 
     let mut items = Vec::new();
+    let max_width = area.width.saturating_sub(4) as usize;
     for sample in history.iter().rev().skip(start).take(end - start) {
-        items.push(ListItem::new(metric_history_line(sample)));
+        items.push(ListItem::new(metric_history_line(sample, max_width)));
     }
 
     let mut state = ListState::default();
-    state.select(Some(selected - start));
+    state.select(Some(selected.saturating_sub(start)));
 
     // Highlight border if this panel is focused
     let is_focused = app.metrics_focus() == MetricsFocus::History;
-    let border_color = if is_focused { Color::Cyan } else { Color::DarkGray };
+    let border_color = focused_border_color(app, is_focused);
     let title = if is_focused {
         "History (newest first) [FOCUSED - Tab to switch]"
     } else {
@@ -1000,13 +924,13 @@ fn render_metrics_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Highlight border if this panel is focused
     let is_focused = app.metrics_focus() == MetricsFocus::Chart;
-    let border_color = if is_focused { Color::Cyan } else { Color::DarkGray };
+    let border_color = focused_border_color(app, is_focused);
     let title = if is_focused {
         "Metric Chart [FOCUSED - Enter to view policies, Tab to switch]"
     } else {
         "Metric Chart [Enter to view policies]"
     };
-    
+
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
@@ -1105,7 +1029,7 @@ fn render_multi_series_chart(
     block: Block<'_>,
 ) {
     let multi_data = app.chart_multi_series_data(metric_option);
-    
+
     if multi_data.is_empty() {
         let placeholder = Paragraph::new("No data for overlay chart yet.")
             .block(block)
@@ -1142,7 +1066,7 @@ fn render_multi_series_chart(
         x_min = 0.0;
         x_max = 1.0;
     }
-    
+
     if (y_max - y_min).abs() < 1e-6 {
         let delta = (y_max.abs().max(1.0)) * 0.1;
         y_min -= delta;
@@ -1200,10 +1124,7 @@ fn render_multi_series_chart(
     };
 
     let y_axis = Axis::default()
-        .title(Span::styled(
-            y_label,
-            Style::default().fg(Color::DarkGray),
-        ))
+        .title(Span::styled(y_label, Style::default().fg(Color::DarkGray)))
         .bounds([y_min, y_max]);
 
     let chart = Chart::new(datasets)
@@ -1239,13 +1160,17 @@ fn render_metrics_chart_info(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Span::styled("Metric: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 metric_label,
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
             Span::styled("Value: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 value,
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
             Span::styled("Policy: ", Style::default().fg(Color::DarkGray)),
@@ -1257,13 +1182,17 @@ fn render_metrics_chart_info(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Span::styled("Metric: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 metric_label,
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
             Span::styled("Value: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 value,
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]));
         lines.push(Line::from(vec![
@@ -1337,7 +1266,7 @@ fn render_metrics_policies(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let available_width = area.width.saturating_sub(4) as usize; // Account for borders
     let available_height = area.height.saturating_sub(2) as usize; // Account for borders
-    
+
     // Collect and sort policies using smart alphanumeric sorting
     let mut policies: Vec<_> = sample.policies().iter().collect();
     policies.sort_by(|a, b| {
@@ -1345,7 +1274,7 @@ fn render_metrics_policies(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let key_b = alphanumeric_sort_key(b.0);
         key_a.cmp(&key_b)
     });
-    
+
     let mut items = Vec::new();
 
     for (policy_id, metrics) in policies {
@@ -1373,7 +1302,9 @@ fn render_metrics_policies(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Span::styled("Reward μ: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 format_option_f64(metrics.reward_mean()),
-                Style::default().fg(Color::LightMagenta).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::LightMagenta)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]));
 
@@ -1434,12 +1365,12 @@ fn render_metrics_policies(frame: &mut Frame<'_>, area: Rect, app: &App) {
         } else {
             5 // Normal space, show up to 5 stats per policy
         };
-        
+
         if !metrics.learner_stats().is_empty() {
             // Show most important learner stats on separate lines for readability
             let important_stats = ["total_loss", "policy_loss", "vf_loss", "kl", "entropy"];
             let mut shown = 0;
-            
+
             for stat_name in &important_stats {
                 if shown >= max_learner_stats {
                     break;
@@ -1451,10 +1382,7 @@ fn render_metrics_policies(frame: &mut Frame<'_>, area: Rect, app: &App) {
                             format!("{}: ", stat_name),
                             Style::default().fg(Color::DarkGray),
                         ),
-                        Span::styled(
-                            format!("{:.4}", value),
-                            Style::default().fg(Color::White),
-                        ),
+                        Span::styled(format!("{:.4}", value), Style::default().fg(Color::White)),
                     ]));
                     shown += 1;
                     if shown >= 3 && available_width < 30 {
@@ -1463,7 +1391,7 @@ fn render_metrics_policies(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     }
                 }
             }
-            
+
             // Show count of remaining stats if any
             let remaining = metrics.learner_stats().len().saturating_sub(shown);
             if remaining > 0 {
@@ -1490,12 +1418,18 @@ fn render_metrics_policies(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Apply scroll offset with bounds checking
     let total_items = items.len();
     let visible_items = available_height.saturating_sub(2); // Account for borders
-    let scroll_offset = app.metrics_policies_scroll().min(total_items.saturating_sub(visible_items.max(1)));
+    let scroll_offset = app
+        .metrics_policies_scroll()
+        .min(total_items.saturating_sub(visible_items.max(1)));
     let items_to_show: Vec<_> = items.into_iter().skip(scroll_offset).collect();
 
     // Highlight border if this panel is focused
     let is_focused = app.metrics_focus() == MetricsFocus::Policies;
-    let border_color = if is_focused { Color::Cyan } else { Color::DarkGray };
+    let border_color = if is_focused {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
     let title = if is_focused {
         "Policies [FOCUSED - ↑/↓ to scroll, Enter to expand, Tab to switch]"
     } else {
@@ -1515,31 +1449,35 @@ fn render_metrics_policies_expanded(frame: &mut Frame<'_>, area: Rect, app: &App
     let sample = if let Some(sample) = app.selected_metric_sample() {
         sample
     } else {
-        let placeholder = Paragraph::new("Policy metrics will appear once available.\n\nPress Enter to return to chart view.")
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Expanded Policies View")
-                    .border_style(Style::default().fg(Color::Cyan)),
-            )
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(Color::DarkGray))
-            .wrap(Wrap { trim: true });
+        let placeholder = Paragraph::new(
+            "Policy metrics will appear once available.\n\nPress Enter to return to chart view.",
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Expanded Policies View")
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(Color::DarkGray))
+        .wrap(Wrap { trim: true });
         frame.render_widget(placeholder, area);
         return;
     };
 
     if sample.policies().is_empty() {
-        let placeholder = Paragraph::new("Policy metrics will appear once available.\n\nPress Enter to return to chart view.")
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Expanded Policies View")
-                    .border_style(Style::default().fg(Color::Cyan)),
-            )
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(Color::DarkGray))
-            .wrap(Wrap { trim: true });
+        let placeholder = Paragraph::new(
+            "Policy metrics will appear once available.\n\nPress Enter to return to chart view.",
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Expanded Policies View")
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(Color::DarkGray))
+        .wrap(Wrap { trim: true });
         frame.render_widget(placeholder, area);
         return;
     }
@@ -1551,7 +1489,7 @@ fn render_metrics_policies_expanded(frame: &mut Frame<'_>, area: Rect, app: &App
         let key_b = alphanumeric_sort_key(b.0);
         key_a.cmp(&key_b)
     });
-    
+
     let num_policies = policies.len();
     let h_scroll = app.metrics_policies_horizontal_scroll();
     let v_scroll = app.metrics_policies_scroll();
@@ -1560,7 +1498,7 @@ fn render_metrics_policies_expanded(frame: &mut Frame<'_>, area: Rect, app: &App
     let available_width = area.width.saturating_sub(2); // Account for outer borders
     let min_policy_width = 35; // Minimum width per policy column
     let policies_per_screen = (available_width / min_policy_width).max(1) as usize;
-    
+
     // Determine which policies to show based on horizontal scroll (with bounds checking)
     let start_idx = h_scroll.min(num_policies.saturating_sub(1));
     let end_idx = (start_idx + policies_per_screen).min(num_policies);
@@ -1600,7 +1538,9 @@ fn render_metrics_policies_expanded(frame: &mut Frame<'_>, area: Rect, app: &App
         .split(inner_area);
 
     // Render each policy in its own column
-    for (idx, ((policy_id, metrics), chunk)) in visible_policies.iter().zip(chunks.iter()).enumerate() {
+    for (idx, ((policy_id, metrics), chunk)) in
+        visible_policies.iter().zip(chunks.iter()).enumerate()
+    {
         render_single_policy_detailed(frame, *chunk, policy_id, metrics, v_scroll, idx == 0);
     }
 }
@@ -1614,7 +1554,7 @@ fn render_single_policy_detailed(
     is_first: bool,
 ) {
     let mut lines = Vec::new();
-    
+
     // Policy name as header
     lines.push(Line::from(vec![Span::styled(
         policy_id.to_string(),
@@ -1627,13 +1567,17 @@ fn render_single_policy_detailed(
     // Reward statistics
     lines.push(Line::from(vec![Span::styled(
         "Rewards:",
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
     )]));
     lines.push(Line::from(vec![
         Span::raw("  Mean: "),
         Span::styled(
             format_option_f64(metrics.reward_mean()),
-            Style::default().fg(Color::LightMagenta).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
         ),
     ]));
     lines.push(Line::from(vec![
@@ -1655,7 +1599,9 @@ fn render_single_policy_detailed(
     // Episode statistics
     lines.push(Line::from(vec![Span::styled(
         "Episodes:",
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
     )]));
     lines.push(Line::from(vec![
         Span::raw("  Len μ: "),
@@ -1677,20 +1623,16 @@ fn render_single_policy_detailed(
     if !metrics.learner_stats().is_empty() {
         lines.push(Line::from(vec![Span::styled(
             "Learner Stats:",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )]));
-        
+
         for (key, value) in metrics.learner_stats() {
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(
-                    format!("{}: ", key),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(
-                    format!("{:.6}", value),
-                    Style::default().fg(Color::White),
-                ),
+                Span::styled(format!("{}: ", key), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{:.6}", value), Style::default().fg(Color::White)),
             ]));
         }
         lines.push(Line::from(""));
@@ -1700,20 +1642,16 @@ fn render_single_policy_detailed(
     if !metrics.custom_metrics().is_empty() {
         lines.push(Line::from(vec![Span::styled(
             "Custom Metrics:",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )]));
-        
+
         for (key, value) in metrics.custom_metrics() {
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(
-                    format!("{}: ", key),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(
-                    format!("{:.4}", value),
-                    Style::default().fg(Color::White),
-                ),
+                Span::styled(format!("{}: ", key), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{:.4}", value), Style::default().fg(Color::White)),
             ]));
         }
     }
@@ -1743,98 +1681,93 @@ fn render_single_policy_detailed(
     frame.render_widget(paragraph, area);
 }
 
-fn metric_history_line(sample: &MetricSample) -> Line<'static> {
-    // the time is in ISO 8601 format, e.g., "2023-10-05T14:48:00Z" extract only the hh:mm:ss part
+fn metric_history_line(sample: &MetricSample, max_width: usize) -> Line<'static> {
     let timestamp = sample.timestamp().unwrap_or("—").to_string();
-    let timestamp = timestamp.split("T").nth(1).unwrap_or("—").split("Z").nth(0).unwrap_or("—");
+    let timestamp = timestamp
+        .split("T")
+        .nth(1)
+        .unwrap_or("—")
+        .split("Z")
+        .nth(0)
+        .unwrap_or("—");
     let timestamp = timestamp.split(":").take(3).collect::<Vec<_>>().join(":");
     let timestamp = timestamp.split(".").nth(0).unwrap_or("—");
-    let mut spans = Vec::new();
-    spans.push(Span::styled(
-        format!("{} ", timestamp),
+
+    let mut segments: Vec<(String, Style)> = Vec::new();
+    segments.push((
+        format!("{timestamp} "),
         Style::default().fg(Color::DarkGray),
     ));
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(
+    segments.push(("  ".to_string(), Style::default()));
+    segments.push((
         format!("iter {}", format_option_u64(sample.training_iteration())),
         Style::default().fg(Color::Cyan),
     ));
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(
+    segments.push(("  ".to_string(), Style::default()));
+    segments.push((
         format!("steps {}", format_option_u64(sample.timesteps_total())),
         Style::default().fg(Color::LightGreen),
     ));
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(
+    segments.push(("  ".to_string(), Style::default()));
+    segments.push((
         format!("reward {}", format_option_f64(sample.episode_reward_mean())),
         Style::default().fg(Color::LightMagenta),
     ));
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(
+    segments.push(("  ".to_string(), Style::default()));
+    segments.push((
         format!("len {}", format_option_f64(sample.episode_len_mean())),
         Style::default().fg(Color::LightBlue),
     ));
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(
-        format!("Δt {}", format_option_duration(sample.time_this_iter_s())),
-        Style::default().fg(Color::DarkGray),
-    ));
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(
-        format!("env {}", format_option_u64(sample.env_steps_this_iter())),
-        Style::default().fg(Color::White),
-    ));
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(
-        format!("ckpts {}", format_option_u64(sample.checkpoints())),
-        Style::default().fg(Color::Yellow),
-    ));
+    segments.push(("  ".to_string(), Style::default()));
+    if let Some(env_steps) = sample.env_steps_this_iter() {
+        segments.push((
+            format!("env {}", env_steps),
+            Style::default().fg(Color::LightYellow),
+        ));
+    }
+
+    let spans = truncate_segments(segments, max_width);
     Line::from(spans)
 }
 
-fn summarize_custom_metrics(
-    metrics: &BTreeMap<String, f64>,
-    limit: usize,
-) -> Option<Line<'static>> {
-    if metrics.is_empty() {
-        return None;
+fn truncate_segments(segments: Vec<(String, Style)>, max_width: usize) -> Vec<Span<'static>> {
+    if max_width == 0 {
+        return Vec::new();
     }
-
-    let mut spans = vec![Span::styled(
-        "Custom: ",
-        Style::default().fg(Color::DarkGray),
-    )];
-    for (idx, (key, value)) in metrics.iter().take(limit).enumerate() {
-        if idx > 0 {
-            spans.push(Span::raw("  "));
+    let mut collected = Vec::new();
+    let mut width = 0usize;
+    for (text, style) in segments {
+        let remaining = max_width.saturating_sub(width);
+        if remaining == 0 {
+            break;
         }
-        spans.push(Span::styled(
-            format!("{key} "),
-            Style::default().fg(Color::DarkGray),
-        ));
-        spans.push(Span::styled(
-            format!("{value:.3}"),
-            Style::default().fg(Color::White),
-        ));
+        let full_width = UnicodeWidthStr::width(text.as_str());
+        if full_width <= remaining {
+            collected.push(Span::styled(text, style));
+            width += full_width;
+        } else {
+            let mut partial = String::new();
+            let mut partial_width = 0usize;
+            for ch in text.chars() {
+                let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if partial_width + ch_width > remaining {
+                    break;
+                }
+                partial.push(ch);
+                partial_width += ch_width;
+            }
+            if !partial.is_empty() {
+                collected.push(Span::styled(partial, style));
+            }
+            break;
+        }
     }
-    if metrics.len() > limit {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled("…", Style::default().fg(Color::DarkGray)));
-    }
-
-    Some(Line::from(spans))
-}
-
-fn format_option_rate(value: Option<f64>, suffix: &str) -> String {
-    value
-        .filter(|v| v.is_finite())
-        .map(|v| format!("{:.2}{suffix}", v))
-        .unwrap_or_else(|| "—".to_string())
+    collected
 }
 
 fn format_option_u64(value: Option<u64>) -> String {
     value
-        .map(|v| format!("{}", v))
+        .map(|v| v.to_string())
         .unwrap_or_else(|| "—".to_string())
 }
 
@@ -1842,6 +1775,12 @@ fn format_option_f64(value: Option<f64>) -> String {
     value
         .map(|v| format!("{:.3}", v))
         .unwrap_or_else(|| "—".to_string())
+}
+
+fn format_option_rate(value: Option<f64>, suffix: &str) -> String {
+    value
+        .map(|v| format!("{v:.2}{suffix}"))
+        .unwrap_or_else(|| format!("—{suffix}"))
 }
 
 fn format_option_duration(value: Option<f64>) -> String {
@@ -1878,6 +1817,33 @@ fn format_duration(seconds: f64) -> String {
     }
 }
 
+fn summarize_custom_metrics(
+    metrics: &BTreeMap<String, f64>,
+    max_items: usize,
+) -> Option<Line<'static>> {
+    if metrics.is_empty() {
+        return None;
+    }
+    let mut spans = Vec::new();
+    for (index, (key, value)) in metrics.iter().take(max_items).enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(
+            format!("{key}: {value:.2}"),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    let remaining = metrics.len().saturating_sub(max_items);
+    if remaining > 0 {
+        spans.push(Span::styled(
+            format!(" +{remaining} more"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    Some(Line::from(spans))
+}
+
 fn render_training_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let instructions = if app.is_training_running() {
         "Training running… press 'c' to cancel"
@@ -1895,14 +1861,22 @@ fn render_training_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
     };
 
-    let status_text = app.status().map(|s| s.text.as_str()).unwrap_or("Ready");
+    let mut status_text = app
+        .status()
+        .map(|s| s.text.clone())
+        .unwrap_or_else(|| "Ready".to_string());
+    if app.is_training_running() || app.is_export_running() {
+        if let Some(spinner) = app.spinner_char() {
+            status_text = format!("{spinner} {status_text}");
+        }
+    }
     let status_style = app
         .status()
         .map(|s| status_style(s.kind))
         .unwrap_or_else(|| Style::default().fg(Color::DarkGray));
 
     let lines = vec![
-        Line::from(Span::styled(status_text.to_string(), status_style)),
+        Line::from(Span::styled(status_text, status_style)),
         Line::from(Span::styled(
             instructions,
             Style::default().fg(Color::DarkGray),
@@ -1917,7 +1891,7 @@ fn render_training_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(status_paragraph, area);
 }
 
-fn render_export(frame: &mut Frame<'_>, area: Rect, app: &App) {
+pub fn render_export(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let constraints = if area.height >= 16 {
         [
             Constraint::Length(7),
@@ -2199,8 +2173,78 @@ fn render_export_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     frame.render_widget(paragraph, area);
 }
+pub fn render_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(6),
+            Constraint::Length(5),
+            Constraint::Length(3),
+        ])
+        .split(area);
 
-fn render_placeholder(frame: &mut Frame<'_>, area: Rect, tab: TabId, app: &App) {
+    let items: Vec<ListItem> = app
+        .settings_fields()
+        .iter()
+        .map(|field| {
+            ListItem::new(vec![
+                Line::from(vec![
+                    Span::styled(
+                        field.label(),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(
+                        app.settings_field_value(*field),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(Span::styled(
+                    field.description(),
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ])
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    state.select(Some(app.settings_selection_index()));
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Controller Settings"),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("› ");
+    frame.render_stateful_widget(list, layout[0], &mut state);
+
+    let selected_field = app.current_settings_field();
+    let desc = Paragraph::new(vec![Line::from(Span::styled(
+        selected_field.description(),
+        Style::default().fg(Color::Gray),
+    ))])
+    .block(Block::default().borders(Borders::ALL).title("Details"))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(desc, layout[1]);
+
+    let instructions = Paragraph::new(vec![Line::from(Span::styled(
+        "↑/↓ select • ←/→ adjust • Space/Enter toggle",
+        Style::default().fg(Color::DarkGray),
+    ))])
+    .block(Block::default().borders(Borders::ALL).title("Controls"));
+    frame.render_widget(instructions, layout[2]);
+}
+
+pub fn render_placeholder(frame: &mut Frame<'_>, area: Rect, tab: TabId, app: &App) {
     let block = Block::default().borders(Borders::ALL).title(app[tab].title);
 
     let message = match tab {
@@ -2228,7 +2272,7 @@ fn status_style(kind: StatusKind) -> Style {
     }
 }
 
-fn render_help_overlay(frame: &mut Frame<'_>, _app: &App) {
+pub fn render_help_overlay(frame: &mut Frame<'_>, _app: &App) {
     let area = frame.area();
 
     // Create a centered box
@@ -2351,7 +2395,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, _app: &App) {
     frame.render_widget(paragraph, help_area);
 }
 
-fn render_confirm_quit(frame: &mut Frame<'_>, _app: &App) {
+pub fn render_confirm_quit(frame: &mut Frame<'_>, _app: &App) {
     let area = frame.area();
 
     let dialog_width = 50;
@@ -2392,7 +2436,7 @@ fn render_confirm_quit(frame: &mut Frame<'_>, _app: &App) {
     frame.render_widget(paragraph, dialog_area);
 }
 
-fn render_file_browser(frame: &mut Frame<'_>, app: &App) {
+pub fn render_file_browser(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
 
     let vertical_margin = area.height / 8;
@@ -2404,14 +2448,29 @@ fn render_file_browser(frame: &mut Frame<'_>, app: &App) {
         height: area.height.saturating_sub(vertical_margin * 2),
     };
 
+    let status = app.status();
+    let mut constraints = vec![Constraint::Length(3), Constraint::Min(5)];
+    if status.is_some() {
+        constraints.push(Constraint::Length(3));
+    }
+    constraints.push(Constraint::Length(3));
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(5),
-            Constraint::Length(3),
-        ])
+        .constraints(constraints)
         .split(browser_area);
+
+    let path_chunk = chunks[0];
+    let list_chunk = chunks[1];
+    let mut next_chunk = 2;
+    let status_chunk = if status.is_some() {
+        let area = chunks[next_chunk];
+        next_chunk += 1;
+        Some(area)
+    } else {
+        None
+    };
+    let instructions_chunk = chunks[next_chunk];
 
     // Path display
     let path_text = format!(" Current: {} ", app.file_browser_path().display());
@@ -2423,7 +2482,7 @@ fn render_file_browser(frame: &mut Frame<'_>, app: &App) {
     let path_para = Paragraph::new(path_text)
         .block(path_block)
         .style(Style::default().fg(Color::White));
-    frame.render_widget(path_para, chunks[0]);
+    frame.render_widget(path_para, path_chunk);
 
     // File list
     let items: Vec<ListItem> = app
@@ -2468,7 +2527,36 @@ fn render_file_browser(frame: &mut Frame<'_>, app: &App) {
     {
         state.select(Some(app.file_browser_selected()));
     }
-    frame.render_stateful_widget(list, chunks[1], &mut state);
+    frame.render_stateful_widget(list, list_chunk, &mut state);
+
+    if let (Some(status_area), Some(status)) = (status_chunk, status) {
+        let (label, color) = match status.kind {
+            StatusKind::Info => ("INFO", Color::Cyan),
+            StatusKind::Success => ("OK", Color::Green),
+            StatusKind::Warning => ("WARN", Color::Yellow),
+            StatusKind::Error => ("ERR", Color::Red),
+        };
+
+        let status_text = vec![Line::from(vec![
+            Span::styled(
+                format!("{label}: "),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(status.text.as_str(), Style::default().fg(color)),
+        ])];
+
+        let status_block = Block::default()
+            .borders(Borders::ALL)
+            .title("Status")
+            .title_alignment(Alignment::Center)
+            .border_style(Style::default().fg(color));
+        frame.render_widget(
+            Paragraph::new(status_text)
+                .block(status_block)
+                .alignment(Alignment::Left),
+            status_area,
+        );
+    }
 
     // Instructions
     let mut instructions: Vec<Line> = Vec::new();
@@ -2539,14 +2627,32 @@ fn render_file_browser(frame: &mut Frame<'_>, app: &App) {
             )));
         }
     }
+
+    if let Some(status) = app.status() {
+        instructions.push(Line::default());
+        let (label, color) = match status.kind {
+            StatusKind::Info => ("INFO", Color::Cyan),
+            StatusKind::Success => ("OK", Color::Green),
+            StatusKind::Warning => ("WARN", Color::Yellow),
+            StatusKind::Error => ("ERR", Color::Red),
+        };
+        instructions.push(Line::from(vec![
+            Span::styled(
+                format!("{label}: "),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(status.text.as_str(), Style::default().fg(color)),
+        ]));
+    }
+
     let inst_block = Block::default().borders(Borders::ALL);
     let inst_para = Paragraph::new(instructions)
         .block(inst_block)
         .alignment(Alignment::Left);
-    frame.render_widget(inst_para, chunks[2]);
+    frame.render_widget(inst_para, instructions_chunk);
 }
 
-fn render_advanced_config(frame: &mut Frame<'_>, app: &App) {
+pub fn render_advanced_config(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
 
     let vertical_margin = area.height / 8;
