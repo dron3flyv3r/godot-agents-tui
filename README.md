@@ -86,6 +86,28 @@ cargo run --release
 
 The compiled binary will be in `target/release/controller-mk2`.
 
+To bake a specific Python interpreter/virtualenv path into the binary, set `CONTROLLER_PYTHON_BIN` before building (and optionally `CONTROLLER_SCRIPTS_ROOT` so the controller can locate the bundled Python scripts even when run from other directories):
+
+```bash
+CONTROLLER_PYTHON_BIN="$PWD/.venv/bin/python" \
+CONTROLLER_SCRIPTS_ROOT="$PWD" \
+cargo build --release
+```
+
+At runtime you can still override these by exporting `CONTROLLER_PYTHON_BIN` or `CONTROLLER_SCRIPTS_ROOT`, but if they are unset the embedded values will be used automatically. The provided `scripts/install.sh` looks for `.venv/bin/python` in the repository and embeds it when present, and it always embeds the repository root as the script directory so the installed binary can find `check_py_env.py`, training scripts, etc., even when launched from elsewhere.
+
+To use the controller from any project directory, either install it with Cargo:
+
+```bash
+cargo install --path .
+```
+
+which places the binary in `~/.cargo/bin`, or copy/symlink the release build into a directory that is already on your `PATH`, for example:
+
+```bash
+install -Dm755 target/release/controller-mk2 ~/.local/bin/controller-mk2
+```
+
 ## Quick Start
 
 1. **Activate Python environment**:
@@ -100,8 +122,8 @@ The compiled binary will be in `target/release/controller-mk2`.
 
 3. **Create a new project** (Home tab):
    - Press `n` to create a new project
-   - Enter a project name
-   - Press Enter to confirm
+   - Enter a project name and press Enter
+   - Choose the project directory (defaults to a unique folder under `$PROJECTS_ROOT`); the controller will create/manage a `.rlcontroller/` config folder plus a `logs/` subfolder inside it and run all scripts relative to that project directory.
 
 4. **Configure training** (Train tab):
    - Press `2` or navigate to the Train tab
@@ -110,8 +132,9 @@ The compiled binary will be in `target/release/controller-mk2`.
    - Press `t` to start training
 
 5. **Monitor progress** (Metrics tab):
-   - Press `3` to view real-time training metrics
-   - Watch reward curves and other statistics
+- Press `3` to view real-time training metrics
+- Watch reward curves and other statistics
+- Press `c` in the Metrics tab to load saved run overlays and compare multiple runs on the same chart
 
 6. **Export models** (Export tab):
    - Press `4` to access export options
@@ -134,15 +157,16 @@ The Home tab is your project management hub.
 
 **Key Bindings:**
 - `n` - Create a new project
-- `d` - Delete selected project
 - `Enter` - Select/activate a project
-- `p` - Check Python environment status
+- `p` - Re-check Python environment status
+
+When you press `n`, the controller first prompts for a project name and then for the project directory. The default is a unique folder under `$PROJECTS_ROOT`, but you can point it at any writable location (e.g., your game repo). The controller manages a `.rlcontroller/` hidden folder for its JSON configs plus a `logs/` subfolder inside that directory and runs all scripts relative to it.
 
 **Features:**
 - View and manage all projects
 - See active project details
 - Monitor Python environment status (SB3 and RLlib availability)
-- Projects are stored in `projects/` directory
+- Every project remembers its name, the log directory you chose, and the parent directory that becomes the working directory whenever the project is active
 
 ### Train Tab
 
@@ -157,7 +181,7 @@ Configure and execute training runs.
 - `d` - Run demo (test output streaming)
 
 **Configuration Fields:**
-- **Environment Path**: Path to your Godot game binary (required)
+- **Environment Path**: Path to your Godot game binary (absolute or relative to the project directory, required)
 - **Timesteps**: Number of training steps (default: 1,000,000)
 - **Experiment Name**: Name for this training run
 
@@ -191,6 +215,8 @@ Real-time visualization of training progress.
 - `Left/Right` - Switch between metric categories
 - `p` - Cycle through policies (multi-agent)
 - `f` - Toggle focus mode (custom metrics, learner stats, etc.)
+- `c` - Load a saved run overlay for comparison (pick from `.rlcontroller/runs/`)
+- `C` - Clear all overlays
 
 **Displayed Metrics:**
 - Episode rewards (mean, min, max)
@@ -205,6 +231,7 @@ Real-time visualization of training progress.
 - Reward progression over time
 - Episode length trends
 - Up to 2000 samples retained in history
+- Every time a training run finishes, the controller stores its metrics as a JSON file under `.rlcontroller/runs/`. Use `c` to pick any saved run and overlay it on the current chart, then press `C` to clear overlays when you're done comparing.
 
 ### Export Tab
 
@@ -238,7 +265,7 @@ Convert trained models to ONNX format for Godot integration.
 
 ### Project Configuration Files
 
-Each project in `projects/<project-name>/` contains:
+Each project directory (located under `$PROJECTS_ROOT` by default) contains:
 
 1. **`project.json`**: Basic project metadata
    ```json
@@ -265,7 +292,7 @@ Each project in `projects/<project-name>/` contains:
 
 ### Global Configuration
 
-- **`projects/index.json`**: List of all projects with last used timestamps
+- **`$PROJECTS_ROOT/index.json`**: List of all projects with last used timestamps
 - Projects are automatically indexed when created or accessed
 
 ## Training Scripts
@@ -365,26 +392,43 @@ python convert_rllib_to_onnx.py checkpoint_000008 \
    model.load_model("res://models/policy.onnx")
    
    var obs = get_observation()
-   var action = model.run_inference([obs])
-   ```
+    var action = model.run_inference([obs])
+    ```
+
+## Project Storage
+
+- By default the controller stores its index (not the logs themselves) under:
+  1. The directory specified by `CONTROLLER_PROJECTS_ROOT` (if set)
+  2. `$XDG_DATA_HOME/godot_rl_controller/projects`
+  3. `$HOME/.local/share/godot_rl_controller/projects`
+- A single `index.json` inside that directory tracks every project (name + log path), so you can launch the controller from any working directory and still see the same list.
+- When you create a project you are prompted for the project directory. Press Enter to accept the default (a slugged folder under `$PROJECTS_ROOT`) or point at any writable location. The controller creates/uses a `.rlcontroller/` folder (for `project.json`, `training_config.json`, `export_config.json`, etc.) plus a `logs/` subdirectory within it for SB3/RLlib runs, and treats that project directory as the working directory for scripts and pickers.
+- Because each project points at explicit paths, you can move or back up individual log folders without touching the controller binary—just recreate the project entry if you relocate the logs.
+- Export `CONTROLLER_PROJECTS_ROOT=/path/to/dir` before launching if you want to move the entire project library somewhere else (e.g., another drive).
 
 ## Project Structure
 
 ```
-agents/
+$PROJECTS_ROOT/
+└── index.json            # Project index (names + project directories)
+
+<project-dir>/            # Directory you selected/created for the project
+├── .rlcontroller/
+│   ├── project.json
+│   ├── training_config.json
+│   ├── export_config.json
+│   └── runs/
+│       └── <timestamp>_<experiment>.json
+├── logs/
+│   ├── sb3/…             # SB3 runs
+│   └── rllib/…           # RLlib runs
+└── rllib_config.yaml
+
+agents/                   # Controller workspace (this repository)
 ├── src/
 │   ├── main.rs           # Application entry point
-│   ├── app.rs            # Core application logic
-│   ├── ui.rs             # TUI rendering
-│   └── project.rs        # Project management
-├── projects/             # Project storage
-│   ├── index.json        # Project index
-│   └── <project-name>/
-│       ├── project.json
-│       ├── training_config.json
-│       ├── rllib_config.yaml
-│       ├── export_config.json
-│       └── logs/         # Training outputs
+│   ├── app/…             # Core application logic
+│   └── ui/…              # Rendering and widgets
 ├── logs/                 # Global logs
 ├── stable_baselines3_training_script.py
 ├── rllib_training_script.py
@@ -497,7 +541,7 @@ This project is licensed under the MIT License.
 For questions and issues:
 - Check the documentation in `docs/`
 - Review the training guide: `TRAINING_GUIDE.md`
-- Examine example projects in `projects/`
+- Examine example projects inside `$PROJECTS_ROOT`
 
 ---
 

@@ -85,6 +85,7 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
             KeyCode::Up | KeyCode::Char('k') => app.select_previous_project(),
             KeyCode::Enter => app.set_active_project()?,
             KeyCode::Char('n') => app.start_project_creation(),
+            KeyCode::Char('p') | KeyCode::Char('P') => app.refresh_python_environment(),
             KeyCode::Char('r') | KeyCode::Char('R') => app.force_refresh_projects()?,
             _ => {}
         }
@@ -210,6 +211,21 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
             }
             KeyCode::Char('.') | KeyCode::Char('>') => {
                 app.cycle_chart_metric_next();
+            }
+            KeyCode::Char('c') => {
+                app.start_run_overlay_browser()?;
+            }
+            KeyCode::Char('C') => {
+                app.clear_run_overlays();
+            }
+            KeyCode::Char('o') => {
+                app.toggle_selected_overlay_view();
+            }
+            KeyCode::Char('O') => {
+                app.cycle_saved_run_overlay(1);
+            }
+            KeyCode::Char('v') | KeyCode::Char('V') => {
+                app.clear_archived_run_view();
             }
             _ => {}
         }

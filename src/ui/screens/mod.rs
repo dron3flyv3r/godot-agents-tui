@@ -71,7 +71,12 @@ fn render_active_project(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let (title, detail) = if let Some(project) = app.active_project() {
         (
             "Active Project",
-            format!("{}\n{}", project.name, project.path.display()),
+            format!(
+                "{}\nRoot: {}\nLogs: {}",
+                project.name,
+                project.root_path.display(),
+                project.logs_path.display()
+            ),
         )
     } else {
         ("Active Project", "No project selected".to_string())
@@ -128,6 +133,13 @@ fn render_python_environment(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::styled("Ray/RLlib", Style::default().fg(Color::White)),
     ]));
 
+    if app.python_check_hint_visible() {
+        lines.push(Line::from(Span::styled(
+            "Press 'p' to run the library check",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
     let paragraph = Paragraph::new(lines)
         .block(block)
         .alignment(Alignment::Left);
@@ -147,13 +159,13 @@ fn render_project_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
-    let active_path = app.active_project().map(|p| &p.path);
+    let active_path = app.active_project().map(|p| &p.logs_path);
     let items: Vec<ListItem> = app
         .projects()
         .iter()
         .map(|project| {
             let mut spans = Vec::new();
-            if active_path.map_or(false, |path| path == &project.path) {
+            if active_path.map_or(false, |path| path == &project.logs_path) {
                 spans.push(Span::styled("● ", Style::default().fg(Color::LightGreen)));
             } else {
                 spans.push(Span::raw("  "));
@@ -187,20 +199,18 @@ fn render_home_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     match app.input_mode() {
         InputMode::CreatingProject => {
-            let mut spans = Vec::new();
-            spans.push(Span::styled(
-                "New project name: ",
-                Style::default().fg(Color::LightBlue),
-            ));
-            spans.push(Span::styled(
-                format!("{}_", app.project_name_buffer()),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            lines.push(Line::from(spans));
+            lines.push(Line::from(vec![
+                Span::styled("Project name: ", Style::default().fg(Color::LightBlue)),
+                Span::styled(
+                    format!("{}_", app.project_name_buffer()),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+
             lines.push(Line::from(Span::styled(
-                "Enter to confirm • Esc to cancel",
+                "Enter to choose logs directory • Esc to cancel",
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -832,6 +842,22 @@ fn render_metrics_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
             }
         }
 
+        if let Some(logs) = app.metrics_log_lines() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled(
+                "Saved Run Logs (↑/↓ to scroll, press 'v' to return to live)",
+                Style::default()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            )]));
+            for log_line in logs {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("  {log_line}"),
+                    Style::default().fg(Color::Gray),
+                )]));
+            }
+        }
+
         // Apply scroll offset with bounds checking
         let total_lines = lines.len();
         let visible_lines = available_height;
@@ -899,11 +925,14 @@ fn render_metrics_history(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Highlight border if this panel is focused
     let is_focused = app.metrics_focus() == MetricsFocus::History;
     let border_color = focused_border_color(app, is_focused);
-    let title = if is_focused {
-        "History (newest first) [FOCUSED - Tab to switch]"
+    let mut title = if is_focused {
+        "History (newest first) [FOCUSED - Tab to switch]".to_string()
     } else {
-        "History (newest first)"
+        "History (newest first)".to_string()
     };
+    if app.is_viewing_saved_run() {
+        title.push_str(" • saved run");
+    }
 
     let list = List::new(items)
         .block(
@@ -925,100 +954,131 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Highlight border if this panel is focused
     let is_focused = app.metrics_focus() == MetricsFocus::Chart;
     let border_color = focused_border_color(app, is_focused);
-    let title = if is_focused {
-        "Metric Chart [FOCUSED - Enter to view policies, Tab to switch]"
+    let mut title = if is_focused {
+        "Metric Chart [FOCUSED - Enter to view policies, Tab to switch]".to_string()
     } else {
-        "Metric Chart [Enter to view policies]"
+        "Metric Chart [Enter to view policies]".to_string()
     };
+    if let Some(label) = app.viewed_run_label() {
+        title.push_str(&format!(" • Saved run: {label}"));
+    }
 
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
         .border_style(Style::default().fg(border_color));
 
-    // Check if this is a multi-series chart
-    if let Some(metric_option) = app.current_chart_metric() {
-        use crate::app::ChartMetricKind;
-        match metric_option.kind() {
-            ChartMetricKind::AllPoliciesRewardMean
-            | ChartMetricKind::AllPoliciesEpisodeLenMean
-            | ChartMetricKind::AllPoliciesLearnerStat(_) => {
-                // Render multi-series overlay chart
-                render_multi_series_chart(frame, area, app, &metric_option, block);
-                return;
-            }
-            _ => {
-                // Continue with single-series chart rendering below
-            }
+    let Some(metric_option) = app.current_chart_metric() else {
+        let placeholder = Paragraph::new("No metric selected.")
+            .block(block)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(placeholder, area);
+        return;
+    };
+
+    use crate::app::ChartMetricKind;
+    match metric_option.kind() {
+        ChartMetricKind::AllPoliciesRewardMean
+        | ChartMetricKind::AllPoliciesEpisodeLenMean
+        | ChartMetricKind::AllPoliciesLearnerStat(_) => {
+            render_multi_series_chart(frame, area, app, &metric_option, block);
+            return;
         }
+        _ => {}
     }
 
-    // Single-series chart rendering (existing code)
-    let chart_data = app.chart_data((area.width as usize).saturating_mul(4));
+    let max_points = (area.width as usize).saturating_mul(4);
+    let chart_data = app.chart_data(max_points);
+    let overlay_series = app.overlay_chart_series(&metric_option, max_points);
 
-    if let Some(chart_data) = chart_data {
-        let mut y_min = f64::INFINITY;
-        let mut y_max = f64::NEG_INFINITY;
-        for &(_, value) in &chart_data.points {
-            if value.is_finite() {
-                y_min = y_min.min(value);
-                y_max = y_max.max(value);
-            }
-        }
-        if !y_min.is_finite() || !y_max.is_finite() {
-            y_min = 0.0;
-            y_max = 1.0;
-        }
-        if (y_max - y_min).abs() < 1e-6 {
-            let delta = (y_max.abs().max(1.0)) * 0.1;
-            y_min -= delta;
-            y_max += delta;
-        }
-
-        let x_min = chart_data.points.first().map(|(x, _)| *x).unwrap_or(0.0);
-        let mut x_max = chart_data
-            .points
-            .last()
-            .map(|(x, _)| *x)
-            .unwrap_or(x_min + 1.0);
-        if (x_max - x_min).abs() < 1e-3 {
-            x_max = x_min + 1.0;
-        }
-
-        let dataset = Dataset::default()
-            .name(chart_data.label.clone())
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::default().fg(Color::Cyan))
-            .data(&chart_data.points);
-
-        let x_axis = Axis::default()
-            .title(Span::styled(
-                "Iteration",
-                Style::default().fg(Color::DarkGray),
-            ))
-            .bounds([x_min, x_max]);
-
-        let y_axis = Axis::default()
-            .title(Span::styled(
-                chart_data.label.clone(),
-                Style::default().fg(Color::DarkGray),
-            ))
-            .bounds([y_min, y_max]);
-
-        let chart = Chart::new(vec![dataset])
-            .block(block)
-            .x_axis(x_axis)
-            .y_axis(y_axis);
-
-        frame.render_widget(chart, area);
-    } else {
+    if chart_data.is_none() && overlay_series.is_empty() {
         let placeholder = Paragraph::new("No data for the selected metric yet.")
             .block(block)
             .alignment(Alignment::Center)
             .style(Style::default().fg(Color::DarkGray));
         frame.render_widget(placeholder, area);
+        return;
     }
+
+    let mut datasets = Vec::new();
+    let mut y_min = f64::INFINITY;
+    let mut y_max = f64::NEG_INFINITY;
+    let mut x_min = f64::INFINITY;
+    let mut x_max = f64::NEG_INFINITY;
+
+    let mut update_bounds = |points: &[(f64, f64)]| {
+        for &(x, y) in points {
+            if y.is_finite() {
+                y_min = y_min.min(y);
+                y_max = y_max.max(y);
+            }
+            x_min = x_min.min(x);
+            x_max = x_max.max(x);
+        }
+    };
+
+    if let Some(chart_data) = &chart_data {
+        update_bounds(&chart_data.points);
+        datasets.push(
+            Dataset::default()
+                .name(chart_data.label.clone())
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(Color::Cyan))
+                .data(&chart_data.points),
+        );
+    }
+
+    for series in &overlay_series {
+        update_bounds(&series.points);
+        datasets.push(
+            Dataset::default()
+                .name(series.label.clone())
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(series.color))
+                .data(&series.points),
+        );
+    }
+
+    if !y_min.is_finite() || !y_max.is_finite() {
+        y_min = 0.0;
+        y_max = 1.0;
+    }
+    if (y_max - y_min).abs() < 1e-6 {
+        let delta = (y_max.abs().max(1.0)) * 0.1;
+        y_min -= delta;
+        y_max += delta;
+    }
+    if !x_min.is_finite() || !x_max.is_finite() {
+        x_min = 0.0;
+        x_max = 1.0;
+    }
+    if (x_max - x_min).abs() < 1e-3 {
+        x_max = x_min + 1.0;
+    }
+
+    let x_axis = Axis::default()
+        .title(Span::styled(
+            "Iteration",
+            Style::default().fg(Color::DarkGray),
+        ))
+        .bounds([x_min, x_max]);
+
+    let y_axis = Axis::default()
+        .title(Span::styled(
+            metric_option.label(),
+            Style::default().fg(Color::DarkGray),
+        ))
+        .bounds([y_min, y_max]);
+
+    let chart = Chart::new(datasets)
+        .block(block)
+        .x_axis(x_axis)
+        .y_axis(y_axis);
+
+    frame.render_widget(chart, area);
 }
 
 fn render_multi_series_chart(
@@ -1220,6 +1280,22 @@ fn render_metrics_chart_info(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )]));
     }
 
+    if app.has_saved_run_overlays() {
+        if let Some(label) = app.selected_overlay_label() {
+            lines.push(Line::from(vec![Span::styled(
+                format!("Selected run: {label} — 'o' view / 'O' cycle"),
+                Style::default().fg(Color::LightCyan),
+            )]));
+        }
+    }
+
+    if let Some(hint) = app.metrics_source_hint() {
+        lines.push(Line::from(vec![Span::styled(
+            hint,
+            Style::default().fg(Color::LightMagenta),
+        )]));
+    }
+
     let paragraph = Paragraph::new(lines)
         .block(
             Block::default()
@@ -1278,6 +1354,7 @@ fn render_metrics_policies(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut items = Vec::new();
 
     for (policy_id, metrics) in policies {
+        let comparison = app.policy_comparison(policy_id);
         let mut lines = Vec::new();
         let header_style = if highlighted_policy
             .as_deref()
@@ -1354,6 +1431,15 @@ fn render_metrics_policies(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     Style::default().fg(Color::White),
                 ),
             ]));
+        }
+
+        if let Some(comp) = comparison.as_ref() {
+            if let Some(line) = render_compact_policy_delta("Δ Reward μ: ", comp.reward_mean) {
+                lines.push(line);
+            }
+            if let Some(line) = render_compact_policy_delta("Δ Ep len: ", comp.episode_len_mean) {
+                lines.push(line);
+            }
         }
 
         // Learner stats - show key metrics, wrap intelligently
@@ -1541,7 +1627,7 @@ fn render_metrics_policies_expanded(frame: &mut Frame<'_>, area: Rect, app: &App
     for (idx, ((policy_id, metrics), chunk)) in
         visible_policies.iter().zip(chunks.iter()).enumerate()
     {
-        render_single_policy_detailed(frame, *chunk, policy_id, metrics, v_scroll, idx == 0);
+        render_single_policy_detailed(frame, *chunk, policy_id, metrics, v_scroll, idx == 0, app);
     }
 }
 
@@ -1552,6 +1638,7 @@ fn render_single_policy_detailed(
     metrics: &crate::app::PolicyMetrics,
     scroll_offset: usize,
     is_first: bool,
+    app: &App,
 ) {
     let mut lines = Vec::new();
 
@@ -1653,6 +1740,31 @@ fn render_single_policy_detailed(
                 Span::styled(format!("{}: ", key), Style::default().fg(Color::DarkGray)),
                 Span::styled(format!("{:.4}", value), Style::default().fg(Color::White)),
             ]));
+        }
+    }
+
+    if let Some(comp) = app.policy_comparison(policy_id) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            format!("Comparison vs {}", comp.baseline_label),
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        if let Some(line) = render_expanded_policy_delta("Reward μ", comp.reward_mean) {
+            lines.push(line);
+        }
+        if let Some(line) = render_expanded_policy_delta("Reward min", comp.reward_min) {
+            lines.push(line);
+        }
+        if let Some(line) = render_expanded_policy_delta("Reward max", comp.reward_max) {
+            lines.push(line);
+        }
+        if let Some(line) = render_expanded_policy_delta("Ep len μ", comp.episode_len_mean) {
+            lines.push(line);
+        }
+        if let Some(line) = render_expanded_policy_delta_u64("Completed", comp.completed_episodes) {
+            lines.push(line);
         }
     }
 
@@ -1788,6 +1900,77 @@ fn format_option_duration(value: Option<f64>) -> String {
         .filter(|v| v.is_finite())
         .map(|seconds| format_duration(seconds.max(0.0)))
         .unwrap_or_else(|| "—".to_string())
+}
+
+fn render_compact_policy_delta(
+    label: &'static str,
+    pair: Option<(f64, f64)>,
+) -> Option<Line<'static>> {
+    pair.map(move |(live, baseline)| {
+        Line::from(vec![
+            Span::styled(label, Style::default().fg(Color::DarkGray)),
+            delta_span(live - baseline),
+        ])
+    })
+}
+
+fn render_expanded_policy_delta(
+    label: &'static str,
+    pair: Option<(f64, f64)>,
+) -> Option<Line<'static>> {
+    pair.map(move |(live, baseline)| {
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("{label}: "), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{baseline:.3}"), Style::default().fg(Color::Gray)),
+            Span::raw(" → "),
+            Span::styled(format!("{live:.3}"), Style::default().fg(Color::LightGreen)),
+            Span::raw(" (Δ "),
+            delta_span(live - baseline),
+            Span::raw(")"),
+        ])
+    })
+}
+
+fn render_expanded_policy_delta_u64(
+    label: &'static str,
+    pair: Option<(u64, u64)>,
+) -> Option<Line<'static>> {
+    pair.map(move |(live, baseline)| {
+        let delta = live as i64 - baseline as i64;
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("{label}: "), Style::default().fg(Color::DarkGray)),
+            Span::styled(baseline.to_string(), Style::default().fg(Color::Gray)),
+            Span::raw(" → "),
+            Span::styled(live.to_string(), Style::default().fg(Color::LightGreen)),
+            Span::raw(" (Δ "),
+            delta_span_u64(delta),
+            Span::raw(")"),
+        ])
+    })
+}
+
+fn delta_span(delta: f64) -> Span<'static> {
+    let color = if delta > 1e-6 {
+        Color::LightGreen
+    } else if delta < -1e-6 {
+        Color::LightRed
+    } else {
+        Color::Gray
+    };
+    Span::styled(format!("{delta:+.3}"), Style::default().fg(color))
+}
+
+fn delta_span_u64(delta: i64) -> Span<'static> {
+    let color = if delta > 0 {
+        Color::LightGreen
+    } else if delta < 0 {
+        Color::LightRed
+    } else {
+        Color::Gray
+    };
+    Span::styled(format!("{delta:+}"), Style::default().fg(color))
 }
 
 fn format_duration(seconds: f64) -> String {
@@ -2272,7 +2455,7 @@ fn status_style(kind: StatusKind) -> Style {
     }
 }
 
-pub fn render_help_overlay(frame: &mut Frame<'_>, _app: &App) {
+pub fn render_help_overlay(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
 
     // Create a centered box
@@ -2285,101 +2468,34 @@ pub fn render_help_overlay(frame: &mut Frame<'_>, _app: &App) {
         height: area.height.saturating_sub(vertical_margin * 2),
     };
 
-    let help_text = vec![
-        Line::from(Span::styled(
-            "KEYBOARD SHORTCUTS",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Global:",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::UNDERLINED),
-        )),
-        Line::from("  h / F1     - Show this help"),
-        Line::from("  q / Esc    - Quit (with confirmation)"),
-        Line::from("  Left/Right - Navigate tabs"),
-        Line::from("  1-5        - Jump to tab"),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Home Tab:",
+    let mut help_text = Vec::new();
+    help_text.push(Line::from(Span::styled(
+        "KEYBOARD SHORTCUTS",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    help_text.push(Line::from(""));
+
+    for (title, entries) in build_help_sections(app) {
+        help_text.push(Line::from(Span::styled(
+            title,
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::UNDERLINED),
-        )),
-        Line::from("  Up/Down / j/k - Navigate projects"),
-        Line::from("  Enter         - Activate project"),
-        Line::from("  n             - Create new project"),
-        Line::from("  r             - Refresh project list"),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Train Tab:",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::UNDERLINED),
-        )),
-        Line::from("  t - Start training (validates first)"),
-        Line::from("  d - Run demo training"),
-        Line::from("  m - Toggle training mode (Single/Multi)"),
-        Line::from("  g - Generate RLlib config"),
-        Line::from("  c - Cancel running training"),
-        Line::from("  Up/Down / j/k - Scroll training output"),
-        Line::from("  PgUp/PgDn      - Fast scroll training output"),
-        Line::from("  p/s/n - Edit basic fields"),
-        Line::from("  a - Open advanced settings panel"),
-        Line::from("  Esc/q - Close advanced settings panel"),
-        Line::from("  b - Browse files for env path"),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Metrics Tab:",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::UNDERLINED),
-        )),
-        Line::from("  Tab / Shift+Tab - Cycle focus between panels"),
-        Line::from("  Enter          - Swap Chart/Policies positions"),
-        Line::from("  Up/Down / j/k  - Navigate/scroll focused panel"),
-        Line::from("  PgUp/PgDn      - Fast navigate/scroll"),
-        Line::from("  Home/End       - Jump to latest/oldest in History"),
-        Line::from("  Left/Right     - Scroll policies horizontally (when expanded)"),
-        Line::from("  , / <          - Previous chart metric"),
-        Line::from("  . / >          - Next chart metric"),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Export Tab:",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::UNDERLINED),
-        )),
-        Line::from("  x - Start export"),
-        Line::from("  c - Cancel export"),
-        Line::from("  m - Toggle export mode"),
-        Line::from("  Enter - Edit/toggle option"),
-        Line::from("  Tab / o - Switch between options and output"),
-        Line::from("  Up/Down / j/k - Navigate options or scroll output"),
-        Line::from("  PgUp/PgDn - Fast scroll output"),
-        Line::from(""),
-        Line::from(Span::styled(
-            "File Browser:",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::UNDERLINED),
-        )),
-        Line::from("  Up/Down / j/k  - Navigate"),
-        Line::from("  Enter          - Select file / Enter directory"),
-        Line::from("  Backspace / h  - Go up one directory"),
-        Line::from("  Esc            - Cancel"),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Press any key to close",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        )),
-    ];
+        )));
+        for entry in entries {
+            help_text.push(Line::from(entry));
+        }
+        help_text.push(Line::from(""));
+    }
+
+    help_text.push(Line::from(Span::styled(
+        "Press h / F1 / Esc to close",
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+    )));
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -2393,6 +2509,111 @@ pub fn render_help_overlay(frame: &mut Frame<'_>, _app: &App) {
         .wrap(Wrap { trim: false });
 
     frame.render_widget(paragraph, help_area);
+}
+
+fn build_help_sections(app: &App) -> Vec<(String, Vec<String>)> {
+    let mut sections = Vec::new();
+    sections.push((
+        "Global".to_string(),
+        vec![
+            "h / F1   Toggle this help overlay".to_string(),
+            "q / Esc  Quit (when idle) or back out of dialogs".to_string(),
+            "1-5      Jump to Home, Train, Metrics, Export, Settings".to_string(),
+        ],
+    ));
+
+    let tab_section = match app.active_tab().id {
+        TabId::Home => ("Home tab".to_string(), home_help_lines()),
+        TabId::Train => ("Train tab".to_string(), train_help_lines()),
+        TabId::Metrics => ("Metrics tab".to_string(), metrics_help_lines(app)),
+        TabId::Export => ("Export tab".to_string(), export_help_lines()),
+        TabId::Settings => ("Settings tab".to_string(), settings_help_lines()),
+    };
+    sections.push(tab_section);
+
+    sections.push((
+        "File browser (when open)".to_string(),
+        file_browser_help_lines(),
+    ));
+
+    sections
+}
+
+fn home_help_lines() -> Vec<String> {
+    vec![
+        "Up/Down / j/k  Select a project".to_string(),
+        "Enter          Activate the highlighted project".to_string(),
+        "n              Create a new project".to_string(),
+        "r              Refresh the project list".to_string(),
+        "p              Check Python dependencies".to_string(),
+    ]
+}
+
+fn train_help_lines() -> Vec<String> {
+    vec![
+        "t              Start training (after validation)".to_string(),
+        "d              Launch demo training".to_string(),
+        "c              Cancel the running training process".to_string(),
+        "m              Toggle Single-Agent / Multi-Agent mode".to_string(),
+        "g              Generate an RLlib config template".to_string(),
+        "p / s / n      Edit env path, timesteps, or experiment name".to_string(),
+        "a              Open advanced settings (Esc to close)".to_string(),
+        "b              Browse for the environment path".to_string(),
+        "Up/Down / j/k  Scroll training output".to_string(),
+        "PgUp/PgDn      Fast-scroll training output".to_string(),
+    ]
+}
+
+fn metrics_help_lines(app: &App) -> Vec<String> {
+    let mut lines = vec![
+        "Tab / Shift+Tab  Move focus between History, Summary, Policies, Chart".to_string(),
+        "Enter            Expand/collapse the policies panel".to_string(),
+        "Up/Down / j/k    Scroll the focused panel (History navigates entries)".to_string(),
+        "PgUp/PgDn        Fast scroll or jump 10 items".to_string(),
+        "Home / End       Jump to newest / oldest metric".to_string(),
+        "Left / Right     Scroll expanded policies horizontally".to_string(),
+        ", / .            Cycle the active chart metric".to_string(),
+        "c                Load a saved run overlay from disk".to_string(),
+        "C                Clear all overlays".to_string(),
+        "o                Toggle viewing the selected saved run".to_string(),
+        "O                Cycle through loaded runs".to_string(),
+        "v                Return to live metrics when viewing a run".to_string(),
+    ];
+    if app.has_saved_run_overlays() {
+        if let Some(label) = app.selected_overlay_label() {
+            lines.push(format!("Selected saved run: {label}"));
+        }
+    }
+    lines
+}
+
+fn export_help_lines() -> Vec<String> {
+    vec![
+        "x              Start the export process".to_string(),
+        "c              Cancel the running export".to_string(),
+        "m              Toggle export mode (SB3 / RLlib)".to_string(),
+        "Tab / o        Switch focus between options and output log".to_string(),
+        "Enter          Edit or toggle the selected option".to_string(),
+        "Up/Down / j/k  Navigate options or scroll output".to_string(),
+        "PgUp/PgDn      Fast-scroll the export log".to_string(),
+    ]
+}
+
+fn settings_help_lines() -> Vec<String> {
+    vec![
+        "Up/Down / j/k  Move between settings".to_string(),
+        "Left/Right     Adjust the highlighted setting".to_string(),
+        "Enter / Space  Toggle the selected option".to_string(),
+    ]
+}
+
+fn file_browser_help_lines() -> Vec<String> {
+    vec![
+        "Up/Down / j/k  Highlight entries".to_string(),
+        "Enter          Select file or descend into directory".to_string(),
+        "Backspace / h  Go up to the parent directory".to_string(),
+        "Esc            Cancel file selection".to_string(),
+    ]
 }
 
 pub fn render_confirm_quit(frame: &mut Frame<'_>, _app: &App) {

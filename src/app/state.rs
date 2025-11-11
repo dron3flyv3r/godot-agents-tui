@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use color_eyre::{
     eyre::{bail, WrapErr},
@@ -18,13 +18,28 @@ use super::config::{
 };
 use super::file_browser::{FileBrowserEntry, FileBrowserKind, FileBrowserState, FileBrowserTarget};
 use super::metrics::{ChartData, ChartMetricKind, ChartMetricOption, MetricSample};
+use super::runs::{self, SavedRun};
+use crate::domain::projects::PROJECT_CONFIG_DIR;
 use crate::domain::{ProjectInfo, ProjectManager};
-use serde_json::Value;
+use ratatui::style::Color;
+use serde_json::{self, Value};
 
-const TRAINING_BUFFER_LIMIT: usize = 500;
-const EXPORT_BUFFER_LIMIT: usize = 500;
+const TRAINING_BUFFER_LIMIT: usize = 512;
+const EXPORT_BUFFER_LIMIT: usize = 512;
 const METRIC_PREFIX: &str = "@METRIC ";
-const TRAINING_METRIC_HISTORY_LIMIT: usize = 2000;
+const TRAINING_METRIC_HISTORY_LIMIT: usize = 2048;
+const EMBEDDED_PYTHON_BIN: Option<&str> = option_env!("CONTROLLER_PYTHON_BIN");
+const EMBEDDED_SCRIPT_ROOT: Option<&str> = option_env!("CONTROLLER_SCRIPTS_ROOT");
+const PROJECT_LOCATION_MAX_LEN: usize = 4096;
+const MAX_RUN_OVERLAYS: usize = 4;
+const OVERLAY_COLORS: [Color; 6] = [
+    Color::LightMagenta,
+    Color::LightGreen,
+    Color::LightYellow,
+    Color::LightBlue,
+    Color::LightRed,
+    Color::White,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabId {
@@ -55,6 +70,83 @@ pub struct StatusMessage {
     pub kind: StatusKind,
 }
 
+#[derive(Debug, Clone)]
+struct RunOverlay {
+    id: String,
+    label: String,
+    color: Color,
+    path: PathBuf,
+    run: SavedRun,
+}
+
+impl RunOverlay {
+    fn metrics(&self) -> &[MetricSample] {
+        &self.run.metrics
+    }
+
+    fn sample_matching(&self, iteration: Option<u64>) -> Option<&MetricSample> {
+        if let Some(iter) = iteration {
+            if let Some(sample) = self
+                .run
+                .metrics
+                .iter()
+                .find(|sample| sample.training_iteration() == Some(iter))
+            {
+                return Some(sample);
+            }
+        }
+        self.run.metrics.last()
+    }
+
+    fn label(&self) -> &str {
+        &self.label
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ArchivedRunView {
+    run: SavedRun,
+    path: PathBuf,
+    label: String,
+}
+
+impl ArchivedRunView {
+    fn new(run: SavedRun, path: PathBuf) -> Self {
+        let label = format!("{} [{}]", run.experiment_name, run.training_mode);
+        Self { run, path, label }
+    }
+
+    fn metrics(&self) -> &[MetricSample] {
+        &self.run.metrics
+    }
+
+    fn logs(&self) -> &[String] {
+        &self.run.training_output
+    }
+
+    fn id(&self) -> &str {
+        &self.run.id
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PolicyComparisonData {
+    pub baseline_label: String,
+    pub reward_mean: Option<(f64, f64)>,
+    pub reward_min: Option<(f64, f64)>,
+    pub reward_max: Option<(f64, f64)>,
+    pub episode_len_mean: Option<(f64, f64)>,
+    pub completed_episodes: Option<(u64, u64)>,
+}
+
+impl PolicyComparisonData {}
+#[derive(Debug, Clone)]
+pub struct ChartOverlaySeries {
+    pub label: String,
+    pub color: Color,
+    pub points: Vec<(f64, f64)>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
     Normal,
@@ -66,6 +158,12 @@ pub enum InputMode {
     Help,
     ConfirmQuit,
     EditingExport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectCreationStage {
+    Name,
+    Location,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,6 +323,8 @@ pub struct App {
 
     input_mode: InputMode,
     project_name_buffer: String,
+    project_location_buffer: String,
+    project_creation_stage: ProjectCreationStage,
     config_edit_buffer: String,
     active_config_field: Option<ConfigField>,
     config_return_mode: Option<InputMode>,
@@ -249,6 +349,11 @@ pub struct App {
     training_cancel: Option<Sender<()>>,
     training_running: bool,
     training_metrics: Vec<MetricSample>,
+    saved_run_overlays: Vec<RunOverlay>,
+    selected_overlay_index: Option<usize>,
+    archived_run_view: Option<ArchivedRunView>,
+    overlay_color_cursor: usize,
+    current_run_start: Option<SystemTime>,
     metrics_history_index: usize,
     metrics_chart_index: usize,
     metrics_focus: MetricsFocus,
@@ -277,6 +382,7 @@ pub struct App {
     // Python environment check results
     python_sb3_available: Option<bool>,
     python_ray_available: Option<bool>,
+    python_check_user_triggered: bool,
 
     controller_settings: ControllerSettings,
     settings_selection: usize,
@@ -322,6 +428,8 @@ impl App {
             selected_project: 0,
             input_mode: InputMode::Normal,
             project_name_buffer: String::new(),
+            project_location_buffer: String::new(),
+            project_creation_stage: ProjectCreationStage::Name,
             config_edit_buffer: String::new(),
             active_config_field: None,
             config_return_mode: None,
@@ -347,6 +455,11 @@ impl App {
             training_running: false,
             training_cancel: None,
             training_metrics: Vec::new(),
+            saved_run_overlays: Vec::new(),
+            selected_overlay_index: None,
+            archived_run_view: None,
+            overlay_color_cursor: 0,
+            current_run_start: None,
             metrics_history_index: 0,
             metrics_chart_index: 0,
             metrics_focus: MetricsFocus::History,
@@ -374,6 +487,7 @@ impl App {
 
             python_sb3_available: None,
             python_ray_available: None,
+            python_check_user_triggered: false,
 
             controller_settings: ControllerSettings::default(),
             settings_selection: 0,
@@ -450,16 +564,31 @@ impl App {
         self.python_ray_available
     }
 
+    pub fn python_check_hint_visible(&self) -> bool {
+        !self.python_check_user_triggered
+    }
+
+    pub fn refresh_python_environment(&mut self) {
+        self.python_check_user_triggered = true;
+        self.set_status("Checking Python environment...", StatusKind::Info);
+        self.check_python_environment();
+    }
+
     fn check_python_environment(&mut self) {
         let python_cmd = determine_python_command();
-        let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let base_dir = controller_scripts_root()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
 
         let check_script = match find_script(&base_dir, "check_py_env.py") {
             Ok(script) => script,
-            Err(_) => {
-                // Script not found, mark as unknown
+            Err(err) => {
                 self.python_sb3_available = None;
                 self.python_ray_available = None;
+                self.set_status(
+                    format!("Python check script not found: {err}"),
+                    StatusKind::Warning,
+                );
                 return;
             }
         };
@@ -508,6 +637,139 @@ impl App {
         &self.training_output
     }
 
+    pub fn metrics_log_lines(&self) -> Option<&[String]> {
+        self.archived_run_view.as_ref().map(|view| view.logs())
+    }
+
+    pub fn is_viewing_saved_run(&self) -> bool {
+        self.archived_run_view.is_some()
+    }
+
+    pub fn viewed_run_label(&self) -> Option<&str> {
+        self.archived_run_view
+            .as_ref()
+            .map(|view| view.label.as_str())
+    }
+
+    pub fn metrics_source_hint(&self) -> Option<String> {
+        self.archived_run_view.as_ref().map(|view| {
+            let file = view
+                .path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("unknown");
+            format!(
+                "Viewing saved run: {} (file: {}) — press 'v' or 'o' to return, 'O' to switch runs",
+                view.label, file
+            )
+        })
+    }
+
+    pub fn has_saved_run_overlays(&self) -> bool {
+        !self.saved_run_overlays.is_empty()
+    }
+
+    pub fn selected_overlay_label(&self) -> Option<&str> {
+        self.selected_overlay().map(|overlay| overlay.label())
+    }
+
+    fn selected_overlay(&self) -> Option<&RunOverlay> {
+        self.selected_overlay_index
+            .and_then(|idx| self.saved_run_overlays.get(idx))
+            .or_else(|| self.saved_run_overlays.first())
+    }
+
+    fn selected_overlay_sample(&self) -> Option<&MetricSample> {
+        let overlay = self.selected_overlay()?;
+        let target_iteration = self
+            .selected_metric_sample()
+            .and_then(|sample| sample.training_iteration());
+        overlay.sample_matching(target_iteration)
+    }
+
+    fn live_sample_for_iteration(&self, iteration: Option<u64>) -> Option<&MetricSample> {
+        if self.training_metrics.is_empty() {
+            return None;
+        }
+        if let Some(iter) = iteration {
+            if let Some(sample) = self
+                .training_metrics
+                .iter()
+                .rev()
+                .find(|sample| sample.training_iteration() == Some(iter))
+            {
+                return Some(sample);
+            }
+        }
+        self.training_metrics.last()
+    }
+
+    fn normalize_selected_overlay_index(&mut self) {
+        if let Some(idx) = self.selected_overlay_index {
+            if self.saved_run_overlays.is_empty() {
+                self.selected_overlay_index = None;
+            } else if idx >= self.saved_run_overlays.len() {
+                self.selected_overlay_index = Some(self.saved_run_overlays.len() - 1);
+            }
+        } else if !self.saved_run_overlays.is_empty() {
+            self.selected_overlay_index = Some(self.saved_run_overlays.len() - 1);
+        }
+    }
+
+    fn handle_overlay_evicted(&mut self, removed: &RunOverlay) {
+        if let Some(idx) = self.selected_overlay_index {
+            if idx == 0 {
+                self.selected_overlay_index = None;
+            } else {
+                self.selected_overlay_index = Some(idx - 1);
+            }
+        }
+        if self.archived_run_view.as_ref().map(|view| view.id()) == Some(removed.id.as_str()) {
+            self.drop_archived_run_view();
+        }
+        self.normalize_selected_overlay_index();
+    }
+
+    pub fn toggle_selected_overlay_view(&mut self) {
+        if self.archived_run_view.is_some() {
+            self.clear_archived_run_view();
+            return;
+        }
+        if self.saved_run_overlays.is_empty() {
+            self.set_status("Load a saved run first", StatusKind::Warning);
+            return;
+        }
+        self.normalize_selected_overlay_index();
+        if let Some(idx) = self.selected_overlay_index {
+            if let Some(overlay) = self.saved_run_overlays.get(idx) {
+                self.set_archived_run_view(overlay.run.clone(), overlay.path.clone());
+            }
+        }
+    }
+
+    pub fn cycle_saved_run_overlay(&mut self, direction: i32) {
+        if self.saved_run_overlays.is_empty() {
+            self.set_status("No saved run overlays loaded yet", StatusKind::Info);
+            return;
+        }
+        let len = self.saved_run_overlays.len() as i32;
+        let current = self
+            .selected_overlay_index
+            .unwrap_or(0)
+            .min(self.saved_run_overlays.len().saturating_sub(1)) as i32;
+        let next_idx = (current + direction).rem_euclid(len) as usize;
+        self.selected_overlay_index = Some(next_idx);
+        if let Some(overlay) = self.saved_run_overlays.get(next_idx) {
+            let label = overlay.label().to_string();
+            let run = overlay.run.clone();
+            let path = overlay.path.clone();
+            self.set_status(format!("Selected run overlay: {label}"), StatusKind::Info);
+            if self.archived_run_view.is_some() {
+                self.set_archived_run_view(run, path);
+            }
+        }
+    }
+
     pub fn training_output_scroll(&self) -> usize {
         self.training_output_scroll
     }
@@ -536,28 +798,73 @@ impl App {
         self.training_output_scroll = 0;
     }
 
+    fn drop_archived_run_view(&mut self) -> bool {
+        if self.archived_run_view.take().is_some() {
+            self.metrics_history_index = 0;
+            self.metrics_summary_scroll = 0;
+            self.metrics_policies_scroll = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn clear_archived_run_view(&mut self) {
+        if self.drop_archived_run_view() {
+            self.set_status("Returned to live metrics", StatusKind::Info);
+        }
+    }
+
+    fn should_activate_archived_run_view(&self) -> bool {
+        !self.training_running && self.training_metrics.is_empty()
+    }
+
+    fn set_archived_run_view(&mut self, run: SavedRun, path: PathBuf) {
+        self.drop_archived_run_view();
+        let view = ArchivedRunView::new(run, path);
+        if let Some(idx) = self
+            .saved_run_overlays
+            .iter()
+            .position(|overlay| overlay.id == view.id())
+        {
+            self.selected_overlay_index = Some(idx);
+        }
+        let label = view.label.clone();
+        self.archived_run_view = Some(view);
+        self.set_status(
+            format!("Viewing saved run metrics: {label}"),
+            StatusKind::Info,
+        );
+    }
+
     pub fn training_metrics_history(&self) -> &[MetricSample] {
-        &self.training_metrics
+        if let Some(view) = &self.archived_run_view {
+            view.metrics()
+        } else {
+            &self.training_metrics
+        }
     }
 
     pub fn metrics_history_selected_index(&self) -> usize {
-        if self.training_metrics.is_empty() {
+        let history = self.training_metrics_history();
+        if history.is_empty() {
             0
         } else {
             self.metrics_history_index
-                .min(self.training_metrics.len().saturating_sub(1))
+                .min(history.len().saturating_sub(1))
         }
     }
 
     pub fn metrics_sample_at(&self, offset_from_latest: usize) -> Option<&MetricSample> {
-        if self.training_metrics.is_empty() {
+        let history = self.training_metrics_history();
+        if history.is_empty() {
             return None;
         }
-        let len = self.training_metrics.len();
+        let len = history.len();
         if offset_from_latest >= len {
             None
         } else {
-            self.training_metrics.get(len - 1 - offset_from_latest)
+            history.get(len - 1 - offset_from_latest)
         }
     }
 
@@ -573,8 +880,11 @@ impl App {
     }
 
     pub fn metrics_history_move_older(&mut self) {
-        if self.metrics_history_index + 1 < self.training_metrics.len() {
+        let len = self.training_metrics_history().len();
+        if self.metrics_history_index + 1 < len {
             self.metrics_history_index += 1;
+        } else if len > 0 {
+            self.metrics_history_index = len - 1;
         }
     }
 
@@ -587,10 +897,11 @@ impl App {
     }
 
     pub fn metrics_history_page_older(&mut self, count: usize) {
-        if self.training_metrics.is_empty() {
+        let history = self.training_metrics_history();
+        if history.is_empty() {
             return;
         }
-        let max_index = self.training_metrics.len() - 1;
+        let max_index = history.len() - 1;
         let new_index = self.metrics_history_index.saturating_add(count);
         self.metrics_history_index = new_index.min(max_index);
     }
@@ -600,8 +911,9 @@ impl App {
     }
 
     pub fn metrics_history_to_oldest(&mut self) {
-        if !self.training_metrics.is_empty() {
-            self.metrics_history_index = self.training_metrics.len() - 1;
+        let history = self.training_metrics_history();
+        if !history.is_empty() {
+            self.metrics_history_index = history.len() - 1;
         }
     }
 
@@ -740,15 +1052,16 @@ impl App {
 
     pub fn chart_data(&self, max_points: usize) -> Option<ChartData> {
         let metric = self.current_chart_metric()?;
-        if self.training_metrics.is_empty() {
+        let samples = self.training_metrics_history();
+        if samples.is_empty() {
             return None;
         }
 
-        let len = self.training_metrics.len();
+        let len = samples.len();
         let start = len.saturating_sub(max_points);
         let mut points = Vec::new();
 
-        for (idx, sample) in self.training_metrics.iter().enumerate().skip(start) {
+        for (idx, sample) in samples.iter().enumerate().skip(start) {
             if let Some(value) = App::chart_value_for_sample(sample, &metric) {
                 let x = sample
                     .training_iteration()
@@ -914,6 +1227,43 @@ impl App {
             }
             // Non-overlay types return empty
             _ => Vec::new(),
+        }
+    }
+
+    pub fn policy_comparison(&self, policy_id: &str) -> Option<PolicyComparisonData> {
+        let overlay_sample = self.selected_overlay_sample()?;
+        let overlay_metrics = overlay_sample.policies().get(policy_id)?;
+        let live_sample = self.live_sample_for_iteration(overlay_sample.training_iteration())?;
+        let live_metrics = live_sample.policies().get(policy_id)?;
+        let baseline_label = self.selected_overlay_label()?.to_string();
+
+        Some(PolicyComparisonData {
+            baseline_label,
+            reward_mean: Self::pair_f64(live_metrics.reward_mean(), overlay_metrics.reward_mean()),
+            reward_min: Self::pair_f64(live_metrics.reward_min(), overlay_metrics.reward_min()),
+            reward_max: Self::pair_f64(live_metrics.reward_max(), overlay_metrics.reward_max()),
+            episode_len_mean: Self::pair_f64(
+                live_metrics.episode_len_mean(),
+                overlay_metrics.episode_len_mean(),
+            ),
+            completed_episodes: Self::pair_u64(
+                live_metrics.completed_episodes(),
+                overlay_metrics.completed_episodes(),
+            ),
+        })
+    }
+
+    fn pair_f64(live: Option<f64>, baseline: Option<f64>) -> Option<(f64, f64)> {
+        match (live, baseline) {
+            (Some(a), Some(b)) => Some((a, b)),
+            _ => None,
+        }
+    }
+
+    fn pair_u64(live: Option<u64>, baseline: Option<u64>) -> Option<(u64, u64)> {
+        match (live, baseline) {
+            (Some(a), Some(b)) => Some((a, b)),
+            _ => None,
         }
     }
 
@@ -1094,7 +1444,7 @@ impl App {
         }
 
         // Horizontal scroll - limit to reasonable policy count
-        if let Some(sample) = self.training_metrics.last() {
+        if let Some(sample) = self.training_metrics_history().last() {
             let num_policies = sample.policies().len();
             if num_policies > 0 {
                 self.metrics_policies_horizontal_scroll = self
@@ -1198,7 +1548,7 @@ impl App {
     }
 
     pub fn latest_training_metric(&self) -> Option<&MetricSample> {
-        self.training_metrics.last()
+        self.training_metrics_history().last()
     }
 
     pub fn is_training_running(&self) -> bool {
@@ -2620,6 +2970,11 @@ impl App {
 
     fn persist_training_config(&mut self) -> Result<()> {
         if let Some(path) = self.training_config_path() {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).wrap_err_with(|| {
+                    format!("failed to create config directory {}", parent.display())
+                })?;
+            }
             let json = serde_json::to_string_pretty(&self.training_config).wrap_err_with(|| {
                 format!("failed to serialize training config for {}", path.display())
             })?;
@@ -2631,9 +2986,12 @@ impl App {
     }
 
     fn training_config_path(&self) -> Option<PathBuf> {
-        self.active_project
-            .as_ref()
-            .map(|project| project.path.join(TRAINING_CONFIG_FILENAME))
+        self.active_project.as_ref().map(|project| {
+            project
+                .root_path
+                .join(PROJECT_CONFIG_DIR)
+                .join(TRAINING_CONFIG_FILENAME)
+        })
     }
 
     fn load_training_config_for_active_project(&mut self) -> bool {
@@ -2683,6 +3041,14 @@ impl App {
 
     fn persist_export_state(&mut self) -> Result<()> {
         if let Some(path) = self.export_config_path() {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).wrap_err_with(|| {
+                    format!(
+                        "failed to create export config directory {}",
+                        parent.display()
+                    )
+                })?;
+            }
             let state = ExportState {
                 mode: self.export_mode,
                 config: self.export_config.clone(),
@@ -2697,9 +3063,12 @@ impl App {
     }
 
     fn export_config_path(&self) -> Option<PathBuf> {
-        self.active_project
-            .as_ref()
-            .map(|project| project.path.join(EXPORT_CONFIG_FILENAME))
+        self.active_project.as_ref().map(|project| {
+            project
+                .root_path
+                .join(PROJECT_CONFIG_DIR)
+                .join(EXPORT_CONFIG_FILENAME)
+        })
     }
 
     fn load_export_state_for_active_project(&mut self) -> bool {
@@ -2913,12 +3282,12 @@ impl App {
     }
 
     fn determine_browser_start_path(&self, target: &FileBrowserTarget) -> PathBuf {
-        let project_root = self
-            .active_project
-            .as_ref()
-            .map(|project| project.path.clone())
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("/"));
+        let (project_root, project_logs) = if let Some(project) = &self.active_project {
+            (project.root_path.clone(), project.logs_path.clone())
+        } else {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+            (cwd.clone(), cwd.join("logs"))
+        };
 
         match target {
             FileBrowserTarget::Config(ConfigField::EnvPath) => self
@@ -2953,11 +3322,32 @@ impl App {
             }
             FileBrowserTarget::Export(ExportField::RllibCheckpointPath) => self
                 .resolve_existing_path(&self.export_config.rllib_checkpoint_path)
-                .unwrap_or_else(|| project_root.join("logs")),
+                .unwrap_or_else(|| project_logs.clone()),
             FileBrowserTarget::Export(ExportField::RllibOutputDir) => self
                 .resolve_existing_path(&self.export_config.rllib_output_dir)
                 .unwrap_or_else(|| project_root.join("onnx_exports")),
             FileBrowserTarget::Export(_) => project_root.clone(),
+            FileBrowserTarget::ProjectLocation => {
+                let raw = self.project_location_buffer.trim();
+                let mut candidate = if raw.is_empty() {
+                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
+                } else {
+                    PathBuf::from(raw)
+                };
+                if !candidate.exists() {
+                    if let Some(parent) = candidate.parent() {
+                        candidate = parent.to_path_buf();
+                    } else {
+                        candidate = PathBuf::from("/");
+                    }
+                }
+                candidate
+            }
+            FileBrowserTarget::SavedRun => self
+                .active_project
+                .as_ref()
+                .map(|project| project.runs_dir())
+                .unwrap_or_else(|| project_root.clone()),
         }
     }
 
@@ -2969,7 +3359,7 @@ impl App {
         if path.is_absolute() {
             Some(path)
         } else if let Some(project) = &self.active_project {
-            Some(project.path.join(path))
+            Some(project.root_path.join(path))
         } else {
             std::env::current_dir().ok().map(|cwd| cwd.join(path))
         }
@@ -3285,6 +3675,24 @@ impl App {
 
     fn apply_browser_selection(&mut self, path: PathBuf) {
         match self.file_browser_target {
+            Some(FileBrowserTarget::ProjectLocation) => {
+                self.cancel_file_browser();
+                self.input_mode = InputMode::CreatingProject;
+                if let Err(error) = self.finish_project_location_selection(path) {
+                    self.set_status(
+                        format!("Failed to set project location: {error}"),
+                        StatusKind::Error,
+                    );
+                }
+                return;
+            }
+            Some(FileBrowserTarget::SavedRun) => {
+                self.cancel_file_browser();
+                if let Err(error) = self.load_run_overlay_from_path(path.clone()) {
+                    self.set_status(format!("Failed to load run: {error}"), StatusKind::Error);
+                }
+                return;
+            }
             Some(FileBrowserTarget::Config(field)) => {
                 let stored_value = self.stringify_for_storage(&path);
                 if let Err(error) = self.apply_config_browser_selection(field, stored_value) {
@@ -3364,7 +3772,7 @@ impl App {
 
     fn stringify_for_storage(&self, path: &Path) -> String {
         if let Some(project) = &self.active_project {
-            if let Ok(relative) = path.strip_prefix(&project.path) {
+            if let Ok(relative) = path.strip_prefix(&project.root_path) {
                 return relative.to_string_lossy().to_string();
             }
         }
@@ -3377,7 +3785,7 @@ impl App {
         }
 
         if let Some(project) = &self.active_project {
-            return project.path.join(path).to_string_lossy().to_string();
+            return project.root_path.join(path).to_string_lossy().to_string();
         }
 
         if let Ok(cwd) = std::env::current_dir() {
@@ -3462,7 +3870,14 @@ impl App {
             bail!("Environment path is required");
         }
 
-        let env_path = PathBuf::from(&self.training_config.env_path);
+        let project_root = &self.active_project.as_ref().unwrap().root_path;
+        let env_path_input = self.training_config.env_path.trim();
+        let env_path = PathBuf::from(env_path_input);
+        let env_path = if env_path.is_absolute() {
+            env_path
+        } else {
+            project_root.join(env_path)
+        };
         if !env_path.exists() {
             bail!("Environment path does not exist: {}", env_path.display());
         }
@@ -3480,7 +3895,6 @@ impl App {
         }
 
         if self.training_config.mode == TrainingMode::MultiAgent {
-            let project_root = &self.active_project.as_ref().unwrap().path;
             let config_path = project_root.join(&self.training_config.rllib_config_file);
             if !config_path.exists() {
                 bail!(
@@ -3529,7 +3943,9 @@ impl App {
 
     pub fn generate_rllib_config(&mut self) -> Result<()> {
         if let Some(project) = &self.active_project {
-            let config_path = project.path.join(&self.training_config.rllib_config_file);
+            let config_path = project
+                .root_path
+                .join(&self.training_config.rllib_config_file);
             let existed = config_path.exists();
             match write_rllib_config(&config_path, &self.training_config) {
                 Ok(()) => {
@@ -3568,57 +3984,114 @@ impl App {
 
     pub fn start_project_creation(&mut self) {
         self.input_mode = InputMode::CreatingProject;
+        self.project_creation_stage = ProjectCreationStage::Name;
         self.project_name_buffer.clear();
+        self.project_location_buffer.clear();
         self.set_status("Enter a name for the new project", StatusKind::Info);
     }
 
     pub fn cancel_project_creation(&mut self) {
         self.input_mode = InputMode::Normal;
         self.project_name_buffer.clear();
+        self.project_location_buffer.clear();
+        self.project_creation_stage = ProjectCreationStage::Name;
         self.clear_status();
     }
 
     pub fn push_project_name_char(&mut self, ch: char) {
-        if self.project_name_buffer.len() >= 48 {
-            return;
+        match self.project_creation_stage {
+            ProjectCreationStage::Name => {
+                if self.project_name_buffer.len() >= 48 {
+                    return;
+                }
+                if ch.is_control() {
+                    return;
+                }
+                self.project_name_buffer.push(ch);
+            }
+            ProjectCreationStage::Location => self.push_project_location_char(ch),
         }
-        if ch.is_control() {
-            return;
-        }
-        self.project_name_buffer.push(ch);
     }
 
     pub fn pop_project_name_char(&mut self) {
-        self.project_name_buffer.pop();
+        match self.project_creation_stage {
+            ProjectCreationStage::Name => {
+                self.project_name_buffer.pop();
+            }
+            ProjectCreationStage::Location => {
+                self.project_location_buffer.pop();
+            }
+        }
+    }
+
+    fn push_project_location_char(&mut self, ch: char) {
+        if ch.is_control() {
+            return;
+        }
+        if self.project_location_buffer.len() >= PROJECT_LOCATION_MAX_LEN {
+            return;
+        }
+        self.project_location_buffer.push(ch);
     }
 
     pub fn confirm_project_creation(&mut self) -> Result<()> {
-        let name = self.project_name_buffer.trim();
-        if name.is_empty() {
-            self.set_status("Project name cannot be empty", StatusKind::Warning);
-            return Ok(());
-        }
-
-        match self.project_manager.create_project(name) {
-            Ok(info) => {
-                self.set_status(
-                    format!("Project '{}' created", info.name),
-                    StatusKind::Success,
-                );
-                self.input_mode = InputMode::Normal;
-                self.project_name_buffer.clear();
-                self.refresh_projects(Some(info.path.clone()))?;
-                self.set_active_project_by_path(&info.path)?;
+        match self.project_creation_stage {
+            ProjectCreationStage::Name => {
+                let name = self.project_name_buffer.trim().to_string();
+                if name.is_empty() {
+                    self.set_status("Project name cannot be empty", StatusKind::Warning);
+                    return Ok(());
+                }
+                self.begin_project_location_selection(&name)?;
+                Ok(())
             }
-            Err(error) => {
-                self.set_status(
-                    format!("Failed to create project: {error}"),
-                    StatusKind::Error,
-                );
+            ProjectCreationStage::Location => {
+                let name = self.project_name_buffer.trim();
+                if name.is_empty() {
+                    self.set_status("Project name cannot be empty", StatusKind::Warning);
+                    self.project_creation_stage = ProjectCreationStage::Name;
+                    return Ok(());
+                }
+                let project_dir = match self.determine_project_directory(name) {
+                    Ok(dir) => dir,
+                    Err(error) => {
+                        self.set_status(
+                            format!("Failed to resolve project location: {error}"),
+                            StatusKind::Error,
+                        );
+                        return Ok(());
+                    }
+                };
+                match self
+                    .project_manager
+                    .register_project(name, project_dir.clone())
+                {
+                    Ok(info) => {
+                        self.set_status(
+                            format!(
+                                "Project '{}' created (logs at {})",
+                                info.name,
+                                info.logs_path.display()
+                            ),
+                            StatusKind::Success,
+                        );
+                        self.input_mode = InputMode::Normal;
+                        self.project_name_buffer.clear();
+                        self.project_location_buffer = project_dir.to_string_lossy().to_string();
+                        self.project_creation_stage = ProjectCreationStage::Name;
+                        self.refresh_projects(Some(info.logs_path.clone()))?;
+                        self.set_active_project_by_path(&info.logs_path)?;
+                    }
+                    Err(error) => {
+                        self.set_status(
+                            format!("Failed to create project: {error}"),
+                            StatusKind::Error,
+                        );
+                    }
+                }
+                Ok(())
             }
         }
-
-        Ok(())
     }
 
     pub fn select_next_project(&mut self) {
@@ -3646,11 +4119,140 @@ impl App {
         Ok(())
     }
 
+    fn begin_project_location_selection(&mut self, name: &str) -> Result<()> {
+        if self.project_location_buffer.trim().is_empty() {
+            self.project_location_buffer = self
+                .default_project_directory_for_name(name)
+                .to_string_lossy()
+                .to_string();
+        }
+        self.project_creation_stage = ProjectCreationStage::Location;
+        self.set_status(
+            "Select the directory where logs should be stored",
+            StatusKind::Info,
+        );
+        self.start_project_location_browser();
+        Ok(())
+    }
+
+    fn start_project_location_browser(&mut self) {
+        let kind = FileBrowserKind::Directory {
+            allow_create: true,
+            require_checkpoints: false,
+        };
+        self.start_file_browser(FileBrowserTarget::ProjectLocation, kind, None);
+    }
+
+    fn finish_project_location_selection(&mut self, path: PathBuf) -> Result<()> {
+        self.project_location_buffer = path.to_string_lossy().to_string();
+        self.project_creation_stage = ProjectCreationStage::Location;
+        self.input_mode = InputMode::CreatingProject;
+        self.confirm_project_creation()
+    }
+
+    fn load_run_overlay_from_path(&mut self, path: PathBuf) -> Result<()> {
+        let saved_run = runs::load_saved_run(&path)?;
+        self.push_overlay_from_run(&saved_run, path.clone())?;
+
+        if self.should_activate_archived_run_view() {
+            self.set_archived_run_view(saved_run, path);
+        } else {
+            let newly_added = self.saved_run_overlays.len().saturating_sub(1);
+            self.selected_overlay_index = Some(newly_added);
+            if let Some(overlay) = self.saved_run_overlays.get(newly_added) {
+                self.set_status(
+                    format!(
+                        "Loaded overlay: {} — press 'o' to inspect or 'O' to switch runs",
+                        overlay.label()
+                    ),
+                    StatusKind::Success,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn push_overlay_from_run(&mut self, saved_run: &SavedRun, path: PathBuf) -> Result<()> {
+        if self
+            .saved_run_overlays
+            .iter()
+            .any(|overlay| overlay.id == saved_run.id || overlay.path == path)
+        {
+            bail!("Run already loaded as overlay");
+        }
+
+        let color = self.next_overlay_color();
+        let label = format!(
+            "{} [{}]",
+            saved_run.experiment_name, saved_run.training_mode
+        );
+
+        if self.saved_run_overlays.len() >= MAX_RUN_OVERLAYS {
+            if let Some(removed) = self.saved_run_overlays.get(0).cloned() {
+                self.saved_run_overlays.remove(0);
+                self.handle_overlay_evicted(&removed);
+            }
+        }
+
+        self.saved_run_overlays.push(RunOverlay {
+            id: saved_run.id.clone(),
+            label: label.clone(),
+            color,
+            path,
+            run: saved_run.clone(),
+        });
+        Ok(())
+    }
+
+    pub fn overlay_chart_series(
+        &self,
+        option: &ChartMetricOption,
+        max_points: usize,
+    ) -> Vec<ChartOverlaySeries> {
+        match option.kind() {
+            ChartMetricKind::AllPoliciesRewardMean
+            | ChartMetricKind::AllPoliciesEpisodeLenMean
+            | ChartMetricKind::AllPoliciesLearnerStat(_) => return Vec::new(),
+            _ => {}
+        }
+
+        let mut overlays = Vec::new();
+        for overlay in &self.saved_run_overlays {
+            let metrics = overlay.metrics();
+            let len = metrics.len();
+            let start = len.saturating_sub(max_points);
+            let mut points = Vec::new();
+            for (idx, sample) in metrics.iter().enumerate().skip(start) {
+                if let Some(value) = App::chart_value_for_sample(sample, option) {
+                    let x = sample
+                        .training_iteration()
+                        .map(|iter| iter as f64)
+                        .unwrap_or_else(|| idx as f64);
+                    points.push((x, value));
+                }
+            }
+            if !points.is_empty() {
+                overlays.push(ChartOverlaySeries {
+                    label: overlay.label.clone(),
+                    color: overlay.color,
+                    points,
+                });
+            }
+        }
+        overlays
+    }
+
+    fn next_overlay_color(&mut self) -> Color {
+        let color = OVERLAY_COLORS[self.overlay_color_cursor % OVERLAY_COLORS.len()];
+        self.overlay_color_cursor = (self.overlay_color_cursor + 1) % OVERLAY_COLORS.len();
+        color
+    }
+
     fn set_active_project_by_path(&mut self, path: &PathBuf) -> Result<()> {
         if let Some(project) = self
             .projects
             .iter()
-            .find(|info| &info.path == path)
+            .find(|info| &info.logs_path == path)
             .cloned()
         {
             self.set_active_project_inner(project)?;
@@ -3660,10 +4262,23 @@ impl App {
 
     fn set_active_project_inner(&mut self, project: ProjectInfo) -> Result<()> {
         self.project_manager.mark_as_used(&project)?;
+        if let Err(err) = std::env::set_current_dir(&project.root_path) {
+            self.set_status(
+                format!(
+                    "Failed to switch to project directory {}: {err}",
+                    project.root_path.display()
+                ),
+                StatusKind::Warning,
+            );
+        }
+        self.saved_run_overlays.clear();
+        self.selected_overlay_index = None;
+        self.overlay_color_cursor = 0;
+        self.drop_archived_run_view();
         self.active_project = Some(project.clone());
         let training_error = self.load_training_config_for_active_project();
         let export_error = self.load_export_state_for_active_project();
-        self.refresh_projects(Some(project.path.clone()))?;
+        self.refresh_projects(Some(project.logs_path.clone()))?;
         if !training_error && !export_error {
             self.set_status(
                 format!("Active project: {}", project.name),
@@ -3674,7 +4289,7 @@ impl App {
     }
 
     pub fn force_refresh_projects(&mut self) -> Result<()> {
-        self.refresh_projects(self.active_project.as_ref().map(|p| p.path.clone()))
+        self.refresh_projects(self.active_project.as_ref().map(|p| p.logs_path.clone()))
     }
 
     pub fn start_training(&mut self) -> Result<()> {
@@ -3692,10 +4307,12 @@ impl App {
             return Ok(());
         }
 
+        self.drop_archived_run_view();
         self.training_receiver = None;
         self.training_cancel = None;
         self.training_running = true;
         self.training_metrics.clear();
+        self.current_run_start = Some(SystemTime::now());
         self.metrics_history_index = 0;
         self.metrics_chart_index = 0;
         let now = Instant::now();
@@ -3718,14 +4335,19 @@ impl App {
         self.training_cancel = Some(cancel_tx);
 
         let command = determine_python_command();
-        let cwd = self.active_project.as_ref().unwrap().path.clone();
+        let project = self.active_project.as_ref().unwrap();
+        let cwd = project.root_path.clone();
 
         let (script_path, args) = match self.training_config.mode {
             TrainingMode::SingleAgent => {
                 let script = find_script(&cwd, "stable_baselines3_training_script.py")?;
+                let sb3_logs = project.logs_path.join("sb3");
+                fs::create_dir_all(&sb3_logs).wrap_err_with(|| {
+                    format!("failed to create SB3 log directory {}", sb3_logs.display())
+                })?;
                 let mut args = vec![
                     format!("--env_path={}", self.training_config.env_path),
-                    format!("--experiment_dir=logs/sb3"),
+                    format!("--experiment_dir={}", sb3_logs.to_string_lossy()),
                     format!("--experiment_name={}", self.training_config.experiment_name),
                     format!("--timesteps={}", self.training_config.timesteps),
                     format!("--speedup={}", self.training_config.sb3_speedup),
@@ -3738,9 +4360,16 @@ impl App {
             }
             TrainingMode::MultiAgent => {
                 let script = find_script(&cwd, "rllib_training_script.py")?;
+                let rllib_logs = project.logs_path.join("rllib");
+                fs::create_dir_all(&rllib_logs).wrap_err_with(|| {
+                    format!(
+                        "failed to create RLlib log directory {}",
+                        rllib_logs.display()
+                    )
+                })?;
                 let mut args = vec![
                     format!("--config_file={}", self.training_config.rllib_config_file),
-                    format!("--experiment_dir=logs/rllib"),
+                    format!("--experiment_dir={}", rllib_logs.to_string_lossy()),
                 ];
                 if !self.training_config.rllib_resume_from.trim().is_empty() {
                     args.push(format!(
@@ -3782,6 +4411,7 @@ impl App {
         self.training_cancel = None;
         self.training_running = true;
         self.training_metrics.clear();
+        self.current_run_start = Some(SystemTime::now());
         self.metrics_history_index = 0;
         self.metrics_chart_index = 0;
         let now = Instant::now();
@@ -3797,7 +4427,8 @@ impl App {
 
         let command = determine_python_command();
         let cwd = std::env::current_dir().wrap_err("failed to determine current directory")?;
-        let mut script_path = cwd.join("demo.py");
+        // use this script path: /home/kasper/GameProjects/agents/demo.py
+        let mut script_path: std::path::PathBuf = "/home/kasper/GameProjects/agents/demo.py".into();
         let mut workdir = cwd.clone();
 
         if !script_path.exists() {
@@ -3833,6 +4464,50 @@ impl App {
         }
     }
 
+    pub fn start_run_overlay_browser(&mut self) -> Result<()> {
+        let project = match self.active_project.as_ref() {
+            Some(project) => project,
+            None => {
+                self.set_status("Select a project first", StatusKind::Warning);
+                return Ok(());
+            }
+        };
+
+        fs::create_dir_all(project.runs_dir()).wrap_err_with(|| {
+            format!(
+                "failed to prepare runs directory {}",
+                project.runs_dir().display()
+            )
+        })?;
+
+        self.start_file_browser(
+            FileBrowserTarget::SavedRun,
+            FileBrowserKind::ExistingFile {
+                extensions: vec!["json".into()],
+            },
+            None,
+        );
+        self.set_status("Select a saved run to inspect or overlay", StatusKind::Info);
+        Ok(())
+    }
+
+    pub fn clear_run_overlays(&mut self) {
+        if self.saved_run_overlays.is_empty() {
+            self.set_status("No overlays to clear", StatusKind::Info);
+            return;
+        }
+        let had_view = self.drop_archived_run_view();
+        self.saved_run_overlays.clear();
+        self.selected_overlay_index = None;
+        self.overlay_color_cursor = 0;
+        let message = if had_view {
+            "Cleared run overlays and returned to live metrics"
+        } else {
+            "Cleared run overlays"
+        };
+        self.set_status(message.to_string(), StatusKind::Info);
+    }
+
     pub fn start_export(&mut self) -> Result<()> {
         if self.export_running {
             self.set_status(
@@ -3857,7 +4532,7 @@ impl App {
         self.export_output.clear();
 
         let command = determine_python_command();
-        let workdir = project.path.clone();
+        let workdir = project.root_path.clone();
         let (tx, rx) = mpsc::channel();
         self.export_receiver = Some(rx);
         let (cancel_tx, cancel_rx) = mpsc::channel();
@@ -3912,7 +4587,7 @@ impl App {
             })?;
         }
 
-        let script_path = find_script(&project.path, "convert_sb3_to_onnx.py")?;
+        let script_path = find_script(&project.root_path, "convert_sb3_to_onnx.py")?;
 
         let mut args = Vec::new();
         args.push(model_path.to_string_lossy().to_string());
@@ -3960,7 +4635,7 @@ impl App {
         }
 
         let output_dir = if self.export_config.rllib_output_dir.trim().is_empty() {
-            project.path.join("onnx_exports")
+            project.root_path.join("onnx_exports")
         } else {
             self.resolve_project_path(project, self.export_config.rllib_output_dir.trim())
         };
@@ -3968,7 +4643,7 @@ impl App {
             format!("failed to create export directory {}", output_dir.display())
         })?;
 
-        let script_path = find_script(&project.path, "convert_rllib_to_onnx.py")?;
+        let script_path = find_script(&project.root_path, "convert_rllib_to_onnx.py")?;
 
         let mut args = Vec::new();
         args.push(checkpoint_path.to_string_lossy().to_string());
@@ -4035,6 +4710,24 @@ impl App {
         Ok(())
     }
 
+    fn determine_project_directory(&self, name: &str) -> Result<PathBuf> {
+        let trimmed = self.project_location_buffer.trim();
+        let mut path = if trimmed.is_empty() {
+            self.default_project_directory_for_name(name)
+        } else {
+            PathBuf::from(trimmed)
+        };
+        if !path.is_absolute() {
+            let cwd = std::env::current_dir().wrap_err("failed to determine current directory")?;
+            path = cwd.join(path);
+        }
+        Ok(path)
+    }
+
+    fn default_project_directory_for_name(&self, name: &str) -> PathBuf {
+        self.project_manager.default_project_dir_for(name)
+    }
+
     fn ensure_rllib_checkpoint_number_exists(&self, path: &Path, number: u32) -> Result<()> {
         let padded_name = format!("checkpoint_{number:06}");
         let padded_path = path.join(&padded_name);
@@ -4089,8 +4782,74 @@ impl App {
         if path.is_absolute() {
             path
         } else {
-            project.path.join(path)
+            project.root_path.join(path)
         }
+    }
+
+    fn persist_completed_run(&mut self) {
+        let Some(project) = self.active_project.as_ref() else {
+            return;
+        };
+        if self.training_metrics.is_empty() {
+            return;
+        }
+
+        let runs_dir = project.runs_dir();
+        if let Err(error) = fs::create_dir_all(&runs_dir) {
+            self.set_status(
+                format!("Failed to prepare runs directory: {error}"),
+                StatusKind::Error,
+            );
+            return;
+        }
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let slug = slugify_name(&self.training_config.experiment_name);
+        let mut file_name = format!("{timestamp}_{slug}.json");
+        let mut counter = 1;
+        let mut path = runs_dir.join(&file_name);
+        while path.exists() {
+            file_name = format!("{timestamp}_{slug}_{counter}.json");
+            path = runs_dir.join(&file_name);
+            counter += 1;
+        }
+
+        let duration_seconds = self
+            .current_run_start
+            .and_then(|start| SystemTime::now().duration_since(start).ok())
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+
+        let run = SavedRun::new(
+            file_name.clone(),
+            project.name.clone(),
+            self.training_config.experiment_name.clone(),
+            match self.training_config.mode {
+                TrainingMode::SingleAgent => "SB3".to_string(),
+                TrainingMode::MultiAgent => "RLlib".to_string(),
+            },
+            timestamp,
+            duration_seconds,
+            self.training_metrics.clone(),
+            self.training_output.clone(),
+        );
+
+        match runs::save_saved_run(&path, &run) {
+            Ok(()) => {
+                self.set_status(
+                    format!("Saved run metrics to {}", path.display()),
+                    StatusKind::Success,
+                );
+            }
+            Err(error) => {
+                self.set_status(format!("Failed to save run: {error}"), StatusKind::Error);
+            }
+        }
+
+        self.current_run_start = None;
     }
 
     fn append_export_line(&mut self, line: impl Into<String>) {
@@ -4177,6 +4936,9 @@ impl App {
             self.training_running = false;
             self.training_receiver = None;
             self.training_cancel = None;
+            if finished && !disconnected {
+                self.persist_completed_run();
+            }
             if disconnected {
                 self.set_status(
                     "Training task disconnected unexpectedly.",
@@ -4221,7 +4983,7 @@ impl App {
     fn refresh_projects(&mut self, prefer_path: Option<PathBuf>) -> Result<()> {
         self.projects = self.project_manager.list_projects()?;
         if let Some(path) = prefer_path {
-            if let Some(index) = self.projects.iter().position(|info| info.path == path) {
+            if let Some(index) = self.projects.iter().position(|info| info.logs_path == path) {
                 self.selected_project = index;
             }
         }
@@ -4384,18 +5146,82 @@ impl Index<TabId> for App {
 }
 
 fn default_projects_root() -> Result<PathBuf> {
-    let mut root = std::env::current_dir().wrap_err("failed to determine current directory")?;
+    if let Ok(custom) = std::env::var("CONTROLLER_PROJECTS_ROOT") {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            return Ok(PathBuf::from(trimmed));
+        }
+    }
+
+    if let Ok(xdg_data_home) = std::env::var("XDG_DATA_HOME") {
+        let mut root = PathBuf::from(xdg_data_home);
+        root.push("godot_rl_controller");
+        root.push("projects");
+        return Ok(root);
+    }
+
+    let home = std::env::var("HOME").wrap_err("HOME not set; cannot determine projects root")?;
+    let mut root = PathBuf::from(home);
+    root.push(".local");
+    root.push("share");
+    root.push("godot_rl_controller");
     root.push("projects");
     Ok(root)
 }
 
 fn determine_python_command() -> String {
+    if let Ok(cmd) = std::env::var("CONTROLLER_PYTHON_BIN") {
+        if !cmd.trim().is_empty() {
+            return cmd;
+        }
+    }
+    if let Some(cmd) = EMBEDDED_PYTHON_BIN {
+        if !cmd.trim().is_empty() {
+            return cmd.to_string();
+        }
+    }
+
     std::env::var("PYTHON")
         .or_else(|_| std::env::var("PYTHON3"))
         .unwrap_or_else(|_| "python3".to_string())
 }
 
-fn find_script(base_dir: &PathBuf, script_name: &str) -> Result<PathBuf> {
+fn slugify_name(name: &str) -> String {
+    let mut slug = String::new();
+    let mut previous_dash = false;
+
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            previous_dash = false;
+        } else if ch.is_whitespace() || matches!(ch, '-' | '_' | '.') {
+            if !previous_dash && !slug.is_empty() {
+                slug.push('-');
+                previous_dash = true;
+            }
+        }
+    }
+
+    if slug.is_empty() {
+        "run".to_string()
+    } else {
+        slug.trim_matches('-').to_string()
+    }
+}
+
+fn controller_scripts_root() -> Option<PathBuf> {
+    if let Ok(value) = std::env::var("CONTROLLER_SCRIPTS_ROOT") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+    EMBEDDED_SCRIPT_ROOT
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+fn find_script(base_dir: &Path, script_name: &str) -> Result<PathBuf> {
     // First check in the project directory
     let project_script = base_dir.join(script_name);
     if project_script.exists() {
@@ -4409,6 +5235,13 @@ fn find_script(base_dir: &PathBuf, script_name: &str) -> Result<PathBuf> {
             if root_script.exists() {
                 return Ok(root_script);
             }
+        }
+    }
+
+    if let Some(root) = controller_scripts_root() {
+        let embedded = root.join(script_name);
+        if embedded.exists() {
+            return Ok(embedded);
         }
     }
 

@@ -6,6 +6,8 @@ use super::config::{ConfigField, ExportField};
 pub enum FileBrowserTarget {
     Config(ConfigField),
     Export(ExportField),
+    ProjectLocation,
+    SavedRun,
 }
 
 #[derive(Debug, Clone)]

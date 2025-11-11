@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PolicyMetrics {
     reward_mean: Option<f64>,
     reward_min: Option<f64>,
@@ -43,7 +44,7 @@ impl PolicyMetrics {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricSample {
     timestamp: Option<String>,
     training_iteration: Option<u64>,
