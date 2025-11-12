@@ -19,6 +19,7 @@ A powerful TUI (Terminal User Interface) application for managing reinforcement 
 - 💻 **Interactive TUI**: Intuitive keyboard-driven interface built with Ratatui
 - 🐍 **Python Integration**: Seamless integration with Python training scripts
 - 📈 **Advanced Configuration**: Extensive hyperparameter tuning options for both frameworks
+- 🧪 **Live Simulator Tab**: Launch the included Python simulator script to fire random actions at your Godot environment (single- or multi-agent) and verify observations/actions without writing custom harnesses. The controller streams simulator events and per-agent action tables directly into the TUI, with auto-restart and robust cancellation safeguards.
 
 ## Table of Contents
 
@@ -28,6 +29,7 @@ A powerful TUI (Terminal User Interface) application for managing reinforcement 
   - [Home Tab](#home-tab)
   - [Train Tab](#train-tab)
   - [Metrics Tab](#metrics-tab)
+  - [Simulator Tab](#simulator-tab)
   - [Export Tab](#export-tab)
 - [Configuration](#configuration)
 - [Training Scripts](#training-scripts)
@@ -147,6 +149,7 @@ install -Dm755 target/release/controller-mk2 ~/.local/bin/controller-mk2
 
 - **Arrow Keys** or **Tab**: Navigate between UI elements
 - **Number Keys (1-4)**: Jump directly to tabs
+  - `1` Home • `2` Train • `3` Metrics • `4` Simulator • `5` Export • `6` Settings
 - **Enter**: Select/Confirm
 - **Esc** or **q**: Quit (with confirmation)
 - **?**: Show help overlay
@@ -232,6 +235,31 @@ Real-time visualization of training progress.
 - Episode length trends
 - Up to 2000 samples retained in history
 - Every time a training run finishes, the controller stores its metrics as a JSON file under `.rlcontroller/runs/`. Use `c` to pick any saved run and overlay it on the current chart, then press `C` to clear overlays when you're done comparing.
+
+### Simulator Tab
+
+Spin up the bundled `simulator.py` to drive random actions against your Godot build and confirm that observations, actions, and networking behave before kicking off a training run.
+
+**Key Bindings:**
+- `s` / `c` — Start / cancel the simulator (cancellation sends SIGINT first, then force-kills after 10s if the env is hung)
+- `m` — Toggle single vs. multi-agent mode (auto restarts use the same mode)
+- `p` — Pick an env binary (optional; multi-agent in-editor connections work without a path)
+- `y` — Copy the Train tab’s env path into the simulator config
+- `w` — Toggle headless vs. windowed runs
+- `a` — Toggle auto-restart when the env closes unexpectedly
+- `t` — Toggle verbose Python tracebacks in the event feed
+- `[` / `]` — Decrease / increase step delay (seconds between env steps)
+- `-` / `=` — Decrease / increase restart delay (seconds before reconnecting)
+- `f` / `Tab` — Switch focus between the status/event log and the per-agent action table
+- `v` — Toggle compact action view (auto-enables when dozens of agents stream data)
+- Arrow keys / PgUp / PgDn scroll whichever pane is focused
+
+**What You See:**
+- Status banner summarizing mode, env path (or “in-editor”), auto-restart settings, and live connection attempts
+- Event log (`@SIM_EVENT` lines) that shows connection retries, warnings, and Python tracebacks
+- Action table (`@SIM_ACTION` lines) that lists episode/step, agent/policy IDs, latest sampled action, reward, and termination flags; newest entries appear at the top so you can watch the stream in real time
+
+The simulator script reconnects automatically if you restart the Godot env and reports errors directly in the tab, making it easy to validate multi-agent wiring or custom observation spaces without touching the training scripts.
 
 ### Export Tab
 

@@ -8,6 +8,7 @@ pub enum FileBrowserTarget {
     Export(ExportField),
     ProjectLocation,
     SavedRun,
+    SimulatorEnvPath,
 }
 
 #[derive(Debug, Clone)]

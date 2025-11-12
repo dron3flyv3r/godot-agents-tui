@@ -72,8 +72,9 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
         KeyCode::Char('1') => app.activate(TabId::Home),
         KeyCode::Char('2') => app.activate(TabId::Train),
         KeyCode::Char('3') => app.activate(TabId::Metrics),
-        KeyCode::Char('4') => app.activate(TabId::Export),
-        KeyCode::Char('5') => app.activate(TabId::Settings),
+        KeyCode::Char('4') => app.activate(TabId::Simulator),
+        KeyCode::Char('5') => app.activate(TabId::Export),
+        KeyCode::Char('6') => app.activate(TabId::Settings),
         KeyCode::Home => app.activate(TabId::Home),
         KeyCode::End => app.activate(TabId::Settings),
         _ => {}
@@ -227,6 +228,34 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
             KeyCode::Char('v') | KeyCode::Char('V') => {
                 app.clear_archived_run_view();
             }
+            _ => {}
+        }
+    } else if app.active_tab().id == TabId::Simulator {
+        match key {
+            KeyCode::Char('s') | KeyCode::Char('S') => app.start_simulator()?,
+            KeyCode::Char('c') | KeyCode::Char('C') => app.cancel_simulator(),
+            KeyCode::Char('m') | KeyCode::Char('M') => app.toggle_simulator_mode(),
+            KeyCode::Char('w') | KeyCode::Char('W') => app.toggle_simulator_show_window(),
+            KeyCode::Char('a') | KeyCode::Char('A') => app.toggle_simulator_auto_restart(),
+            KeyCode::Char('t') | KeyCode::Char('T') => app.toggle_simulator_tracebacks(),
+            KeyCode::Char('p') | KeyCode::Char('P') => app.start_simulator_file_browser(),
+            KeyCode::Char('y') | KeyCode::Char('Y') => app.simulator_use_training_env_path(),
+            KeyCode::Char('f') | KeyCode::Char('F') | KeyCode::Tab => {
+                app.cycle_simulator_focus();
+            }
+            KeyCode::Char('v') | KeyCode::Char('V') => app.toggle_simulator_compact_view(),
+            KeyCode::Char('[') => app.adjust_simulator_step_delay(-0.05),
+            KeyCode::Char(']') => app.adjust_simulator_step_delay(0.05),
+            KeyCode::Char('-') => app.adjust_simulator_restart_delay(-0.5),
+            KeyCode::Char('=') => app.adjust_simulator_restart_delay(0.5),
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
+                app.simulator_scroll_up(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+                app.simulator_scroll_down(1);
+            }
+            KeyCode::PageUp => app.simulator_scroll_up(10),
+            KeyCode::PageDown => app.simulator_scroll_down(10),
             _ => {}
         }
     } else if app.active_tab().id == TabId::Export {

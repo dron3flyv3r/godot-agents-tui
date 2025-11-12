@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use color_eyre::{
     eyre::{bail, WrapErr},
@@ -27,7 +27,14 @@ use serde_json::{self, Value};
 const TRAINING_BUFFER_LIMIT: usize = 512;
 const EXPORT_BUFFER_LIMIT: usize = 512;
 const METRIC_PREFIX: &str = "@METRIC ";
+const SIM_EVENT_PREFIX: &str = "@SIM_EVENT ";
+const SIM_ACTION_PREFIX: &str = "@SIM_ACTION ";
 const TRAINING_METRIC_HISTORY_LIMIT: usize = 2048;
+const SIM_EVENT_BUFFER_LIMIT: usize = 512;
+const SIM_ACTION_AUTO_COMPACT_THRESHOLD: usize = 20;
+const SIM_ACTION_VALUE_MAX_LEN: usize = 48;
+const SIM_INFO_VALUE_MAX_LEN: usize = 64;
+const SIM_ACTION_HISTORY_LIMIT: usize = 512;
 const EMBEDDED_PYTHON_BIN: Option<&str> = option_env!("CONTROLLER_PYTHON_BIN");
 const EMBEDDED_SCRIPT_ROOT: Option<&str> = option_env!("CONTROLLER_SCRIPTS_ROOT");
 const PROJECT_LOCATION_MAX_LEN: usize = 4096;
@@ -46,6 +53,7 @@ pub enum TabId {
     Home,
     Train,
     Metrics,
+    Simulator,
     Export,
     Settings,
 }
@@ -172,6 +180,124 @@ pub enum MetricsFocus {
     Summary,
     Policies,
     Chart,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimulatorFocus {
+    Events,
+    Actions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimulatorMode {
+    Single,
+    Multi,
+}
+
+impl SimulatorMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            SimulatorMode::Single => "Single-Agent",
+            SimulatorMode::Multi => "Multi-Agent",
+        }
+    }
+
+    fn arg(self) -> &'static str {
+        match self {
+            SimulatorMode::Single => "single",
+            SimulatorMode::Multi => "multi",
+        }
+    }
+
+    fn toggle(&mut self) {
+        *self = match self {
+            SimulatorMode::Single => SimulatorMode::Multi,
+            SimulatorMode::Multi => SimulatorMode::Single,
+        };
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SimulatorConfig {
+    pub mode: SimulatorMode,
+    pub env_path: String,
+    pub show_window: bool,
+    pub step_delay: f64,
+    pub restart_delay: f64,
+    pub max_episodes: Option<u32>,
+    pub max_steps: Option<u32>,
+    pub auto_restart: bool,
+    pub log_tracebacks: bool,
+}
+
+impl Default for SimulatorConfig {
+    fn default() -> Self {
+        Self {
+            mode: SimulatorMode::Single,
+            env_path: String::new(),
+            show_window: false,
+            step_delay: 0.0,
+            restart_delay: 2.0,
+            max_episodes: None,
+            max_steps: None,
+            auto_restart: true,
+            log_tracebacks: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimulatorEventSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+pub struct SimulatorEventEntry {
+    pub timestamp: Option<String>,
+    pub kind: String,
+    pub message: String,
+    pub severity: SimulatorEventSeverity,
+}
+
+#[derive(Debug, Clone)]
+pub struct SimulatorAgentRow {
+    pub episode: Option<u64>,
+    pub step: Option<u64>,
+    pub agent_id: String,
+    pub policy: Option<String>,
+    pub action: String,
+    pub reward: Option<f64>,
+    pub terminated: bool,
+    pub truncated: bool,
+    pub info: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SimulatorActionMeta {
+    episode: Option<u64>,
+    step: Option<u64>,
+    mode: SimulatorMode,
+    total_agents: usize,
+}
+
+impl SimulatorActionMeta {
+    pub fn episode(self) -> Option<u64> {
+        self.episode
+    }
+
+    pub fn step(self) -> Option<u64> {
+        self.step
+    }
+
+    pub fn mode(self) -> SimulatorMode {
+        self.mode
+    }
+
+    pub fn total_agents(self) -> usize {
+        self.total_agents
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,6 +437,13 @@ enum ExportEvent {
     Finished(Option<i32>),
 }
 
+#[derive(Debug)]
+enum SimulatorEvent {
+    Line(String),
+    Error(String),
+    Finished(Option<i32>),
+}
+
 pub struct App {
     tabs: Vec<Tab>,
     active_tab_index: usize,
@@ -365,6 +498,20 @@ pub struct App {
     metric_timer_start: Option<Instant>,
     metric_last_sample_time: Option<Instant>,
 
+    simulator_config: SimulatorConfig,
+    simulator_running: bool,
+    simulator_receiver: Option<Receiver<SimulatorEvent>>,
+    simulator_cancel: Option<Sender<()>>,
+    simulator_event_log: Vec<SimulatorEventEntry>,
+    simulator_event_scroll: usize,
+    simulator_focus: SimulatorFocus,
+    simulator_actions: Vec<SimulatorAgentRow>,
+    simulator_actions_scroll: usize,
+    simulator_compact_view: bool,
+    simulator_compact_user_override: bool,
+    simulator_action_meta: Option<SimulatorActionMeta>,
+    simulator_status_line: Option<String>,
+
     export_mode: ExportMode,
     export_config: ExportConfig,
     export_focus: ExportFocus,
@@ -407,6 +554,10 @@ impl App {
             Tab {
                 title: "Metrics",
                 id: TabId::Metrics,
+            },
+            Tab {
+                title: "Simulator",
+                id: TabId::Simulator,
             },
             Tab {
                 title: "Export",
@@ -470,6 +621,19 @@ impl App {
             metrics_policies_horizontal_scroll: 0,
             metric_timer_start: None,
             metric_last_sample_time: None,
+            simulator_config: SimulatorConfig::default(),
+            simulator_running: false,
+            simulator_receiver: None,
+            simulator_cancel: None,
+            simulator_event_log: Vec::new(),
+            simulator_event_scroll: 0,
+            simulator_focus: SimulatorFocus::Events,
+            simulator_actions: Vec::new(),
+            simulator_actions_scroll: 0,
+            simulator_compact_view: false,
+            simulator_compact_user_override: false,
+            simulator_action_meta: None,
+            simulator_status_line: None,
 
             export_mode: ExportMode::StableBaselines3,
             export_config: ExportConfig::default(),
@@ -635,6 +799,46 @@ impl App {
 
     pub fn training_output(&self) -> &[String] {
         &self.training_output
+    }
+
+    pub fn simulator_config(&self) -> &SimulatorConfig {
+        &self.simulator_config
+    }
+
+    pub fn simulator_focus(&self) -> SimulatorFocus {
+        self.simulator_focus
+    }
+
+    pub fn simulator_events(&self) -> &[SimulatorEventEntry] {
+        &self.simulator_event_log
+    }
+
+    pub fn simulator_event_scroll(&self) -> usize {
+        self.simulator_event_scroll
+    }
+
+    pub fn simulator_actions(&self) -> &[SimulatorAgentRow] {
+        &self.simulator_actions
+    }
+
+    pub fn simulator_actions_scroll(&self) -> usize {
+        self.simulator_actions_scroll
+    }
+
+    pub fn simulator_action_meta(&self) -> Option<SimulatorActionMeta> {
+        self.simulator_action_meta
+    }
+
+    pub fn simulator_status_line(&self) -> Option<&str> {
+        self.simulator_status_line.as_deref()
+    }
+
+    pub fn simulator_compact_view(&self) -> bool {
+        self.simulator_compact_view
+    }
+
+    pub fn is_simulator_running(&self) -> bool {
+        self.simulator_running
     }
 
     pub fn metrics_log_lines(&self) -> Option<&[String]> {
@@ -1451,6 +1655,14 @@ impl App {
                     .metrics_policies_horizontal_scroll
                     .min(num_policies.saturating_sub(1));
             }
+        }
+
+        if self.simulator_event_scroll > self.simulator_event_log.len().saturating_sub(1) {
+            self.simulator_event_scroll = self.simulator_event_log.len().saturating_sub(1);
+        }
+
+        if self.simulator_actions_scroll > self.simulator_actions.len().saturating_sub(1) {
+            self.simulator_actions_scroll = self.simulator_actions.len().saturating_sub(1);
         }
     }
 
@@ -3327,6 +3539,9 @@ impl App {
                 .resolve_existing_path(&self.export_config.rllib_output_dir)
                 .unwrap_or_else(|| project_root.join("onnx_exports")),
             FileBrowserTarget::Export(_) => project_root.clone(),
+            FileBrowserTarget::SimulatorEnvPath => self
+                .resolve_existing_path(&self.simulator_config.env_path)
+                .unwrap_or_else(|| project_root.clone()),
             FileBrowserTarget::ProjectLocation => {
                 let raw = self.project_location_buffer.trim();
                 let mut candidate = if raw.is_empty() {
@@ -3716,6 +3931,11 @@ impl App {
                 }
                 self.set_status("Export option updated", StatusKind::Success);
                 self.rebuild_export_fields();
+            }
+            Some(FileBrowserTarget::SimulatorEnvPath) => {
+                let stored_value = self.stringify_for_storage(&path);
+                self.simulator_config.env_path = stored_value;
+                self.set_status("Simulator environment updated", StatusKind::Success);
             }
             None => {}
         }
@@ -4464,6 +4684,298 @@ impl App {
         }
     }
 
+    pub fn start_simulator(&mut self) -> Result<()> {
+        if self.simulator_running {
+            self.set_status(
+                "Simulator already running. Stop it before starting a new session.",
+                StatusKind::Warning,
+            );
+            return Ok(());
+        }
+
+        let project_root = match self.active_project.as_ref() {
+            Some(project) => project.root_path.clone(),
+            None => {
+                self.set_status("Select a project first", StatusKind::Warning);
+                return Ok(());
+            }
+        };
+
+        let command = determine_python_command();
+        let script_path = find_script(&project_root, "simulator.py")?;
+
+        let mut args = vec![format!("--mode={}", self.simulator_config.mode.arg())];
+
+        if let Some(path) = self.resolve_existing_path(&self.simulator_config.env_path) {
+            args.push(format!("--env-path={}", path.to_string_lossy()));
+        } else if !self.simulator_config.env_path.trim().is_empty() {
+            args.push(format!(
+                "--env-path={}",
+                self.simulator_config.env_path.trim()
+            ));
+        }
+
+        if self.simulator_config.show_window {
+            args.push("--show-window".to_string());
+        } else {
+            args.push("--headless".to_string());
+        }
+
+        if self.simulator_config.step_delay > 0.0 {
+            args.push(format!(
+                "--step-delay={:.4}",
+                self.simulator_config.step_delay.max(0.0)
+            ));
+        }
+
+        args.push(format!(
+            "--restart-delay={:.4}",
+            self.simulator_config.restart_delay.max(0.0)
+        ));
+
+        if let Some(max_steps) = self.simulator_config.max_steps {
+            if max_steps > 0 {
+                args.push(format!("--max-steps={max_steps}"));
+            }
+        }
+
+        if let Some(max_episodes) = self.simulator_config.max_episodes {
+            if max_episodes > 0 {
+                args.push(format!("--max-episodes={max_episodes}"));
+            }
+        }
+
+        if !self.simulator_config.auto_restart {
+            args.push("--no-auto-restart".to_string());
+        }
+
+        if self.simulator_config.log_tracebacks {
+            args.push("--log-tracebacks".to_string());
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let (cancel_tx, cancel_rx) = mpsc::channel();
+        self.simulator_receiver = Some(rx);
+        self.simulator_cancel = Some(cancel_tx);
+        self.simulator_running = true;
+        self.simulator_focus = SimulatorFocus::Events;
+        self.simulator_event_log.clear();
+        self.simulator_event_scroll = 0;
+        self.simulator_actions.clear();
+        self.simulator_actions_scroll = 0;
+        self.simulator_action_meta = None;
+        self.simulator_status_line = Some("Launching simulator...".to_string());
+        if !self.simulator_compact_user_override {
+            self.simulator_compact_view = false;
+        }
+
+        let display_cmd = format!(
+            "{} -u {} {}",
+            command,
+            script_path.display(),
+            args.join(" ")
+        );
+
+        self.append_simulator_event_entry(SimulatorEventEntry {
+            timestamp: None,
+            kind: "command".into(),
+            message: format!("$ {display_cmd}"),
+            severity: SimulatorEventSeverity::Info,
+        });
+
+        spawn_simulator_task(tx, command, script_path, args, project_root, cancel_rx);
+
+        self.set_status("Simulator starting...", StatusKind::Info);
+        Ok(())
+    }
+
+    pub fn cancel_simulator(&mut self) {
+        if let Some(cancel) = self.simulator_cancel.take() {
+            let _ = cancel.send(());
+            self.append_simulator_event_entry(SimulatorEventEntry {
+                timestamp: None,
+                kind: "status".into(),
+                message: "Cancellation requested...".to_string(),
+                severity: SimulatorEventSeverity::Warning,
+            });
+            self.set_status("Stopping simulator...", StatusKind::Info);
+        }
+    }
+
+    pub fn start_simulator_file_browser(&mut self) {
+        if self.simulator_running {
+            self.set_status(
+                "Stop the simulator before changing the environment path.",
+                StatusKind::Warning,
+            );
+            return;
+        }
+        let kind = FileBrowserKind::ExistingFile {
+            extensions: Vec::new(),
+        };
+        self.start_file_browser(FileBrowserTarget::SimulatorEnvPath, kind, None);
+    }
+
+    pub fn simulator_use_training_env_path(&mut self) {
+        if self.training_config.env_path.trim().is_empty() {
+            self.set_status("Training environment path is empty.", StatusKind::Warning);
+            return;
+        }
+        self.simulator_config.env_path = self.training_config.env_path.clone();
+        self.set_status(
+            "Simulator environment path synced with training config.",
+            StatusKind::Success,
+        );
+    }
+
+    pub fn toggle_simulator_mode(&mut self) {
+        if self.simulator_running {
+            self.set_status(
+                "Stop the simulator before changing the mode.",
+                StatusKind::Warning,
+            );
+            return;
+        }
+        self.simulator_config.mode.toggle();
+        self.set_status(
+            format!("Simulator mode: {}", self.simulator_config.mode.label()),
+            StatusKind::Info,
+        );
+    }
+
+    pub fn toggle_simulator_show_window(&mut self) {
+        if self.simulator_running {
+            self.set_status(
+                "Stop the simulator before toggling the window.",
+                StatusKind::Warning,
+            );
+            return;
+        }
+        self.simulator_config.show_window = !self.simulator_config.show_window;
+        self.set_status(
+            format!(
+                "Simulator window: {}",
+                if self.simulator_config.show_window {
+                    "Visible"
+                } else {
+                    "Headless"
+                }
+            ),
+            StatusKind::Info,
+        );
+    }
+
+    pub fn toggle_simulator_auto_restart(&mut self) {
+        if self.simulator_running {
+            self.set_status(
+                "Stop the simulator before toggling auto-restart.",
+                StatusKind::Warning,
+            );
+            return;
+        }
+        self.simulator_config.auto_restart = !self.simulator_config.auto_restart;
+        self.set_status(
+            format!(
+                "Simulator auto-restart: {}",
+                if self.simulator_config.auto_restart {
+                    "Enabled"
+                } else {
+                    "Disabled"
+                }
+            ),
+            StatusKind::Info,
+        );
+    }
+
+    pub fn toggle_simulator_tracebacks(&mut self) {
+        if self.simulator_running {
+            self.set_status(
+                "Stop the simulator before toggling tracebacks.",
+                StatusKind::Warning,
+            );
+            return;
+        }
+        self.simulator_config.log_tracebacks = !self.simulator_config.log_tracebacks;
+        self.set_status(
+            format!(
+                "Simulator tracebacks: {}",
+                if self.simulator_config.log_tracebacks {
+                    "Verbose"
+                } else {
+                    "Hidden"
+                }
+            ),
+            StatusKind::Info,
+        );
+    }
+
+    pub fn adjust_simulator_step_delay(&mut self, delta: f64) {
+        if self.simulator_running {
+            self.set_status(
+                "Stop the simulator before adjusting delays.",
+                StatusKind::Warning,
+            );
+            return;
+        }
+        self.simulator_config.step_delay = (self.simulator_config.step_delay + delta).max(0.0);
+        self.set_status(
+            format!("Step delay: {:.2}s", self.simulator_config.step_delay),
+            StatusKind::Info,
+        );
+    }
+
+    pub fn adjust_simulator_restart_delay(&mut self, delta: f64) {
+        if self.simulator_running {
+            self.set_status(
+                "Stop the simulator before adjusting delays.",
+                StatusKind::Warning,
+            );
+            return;
+        }
+        self.simulator_config.restart_delay =
+            (self.simulator_config.restart_delay + delta).max(0.0);
+        self.set_status(
+            format!("Restart delay: {:.2}s", self.simulator_config.restart_delay),
+            StatusKind::Info,
+        );
+    }
+
+    pub fn cycle_simulator_focus(&mut self) {
+        self.simulator_focus = match self.simulator_focus {
+            SimulatorFocus::Events => SimulatorFocus::Actions,
+            SimulatorFocus::Actions => SimulatorFocus::Events,
+        };
+    }
+
+    pub fn toggle_simulator_compact_view(&mut self) {
+        self.simulator_compact_view = !self.simulator_compact_view;
+        self.simulator_compact_user_override = true;
+    }
+
+    pub fn simulator_scroll_up(&mut self, amount: usize) {
+        match self.simulator_focus {
+            SimulatorFocus::Events => {
+                self.simulator_event_scroll = self.simulator_event_scroll.saturating_add(amount);
+            }
+            SimulatorFocus::Actions => {
+                self.simulator_actions_scroll =
+                    self.simulator_actions_scroll.saturating_add(amount);
+            }
+        }
+    }
+
+    pub fn simulator_scroll_down(&mut self, amount: usize) {
+        match self.simulator_focus {
+            SimulatorFocus::Events => {
+                self.simulator_event_scroll = self.simulator_event_scroll.saturating_sub(amount);
+            }
+            SimulatorFocus::Actions => {
+                self.simulator_actions_scroll =
+                    self.simulator_actions_scroll.saturating_sub(amount);
+            }
+        }
+    }
+
     pub fn start_run_overlay_browser(&mut self) -> Result<()> {
         let project = match self.active_project.as_ref() {
             Some(project) => project,
@@ -4875,6 +5387,8 @@ impl App {
     pub fn process_background_tasks(&mut self) {
         let mut events = Vec::new();
         let mut disconnected = false;
+        let mut simulator_events = Vec::new();
+        let mut simulator_disconnected = false;
         let mut export_events = Vec::new();
         let mut export_disconnected = false;
 
@@ -4889,6 +5403,23 @@ impl App {
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(rx) = self.simulator_receiver.as_ref() {
+            loop {
+                match rx.try_recv() {
+                    Ok(SimulatorEvent::Finished(code)) => {
+                        simulator_events.push(SimulatorEvent::Finished(code));
+                        break;
+                    }
+                    Ok(event) => simulator_events.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        simulator_disconnected = true;
                         break;
                     }
                 }
@@ -4944,6 +5475,57 @@ impl App {
                     "Training task disconnected unexpectedly.",
                     StatusKind::Warning,
                 );
+            }
+        }
+
+        let mut simulator_finished = false;
+        for event in simulator_events {
+            match event {
+                SimulatorEvent::Line(line) => self.handle_simulator_line(line),
+                SimulatorEvent::Error(message) => {
+                    self.append_simulator_event_entry(SimulatorEventEntry {
+                        timestamp: None,
+                        kind: "error".into(),
+                        message: message.clone(),
+                        severity: SimulatorEventSeverity::Error,
+                    });
+                    self.set_status(message, StatusKind::Error);
+                }
+                SimulatorEvent::Finished(code) => {
+                    simulator_finished = true;
+                    let message = match code {
+                        Some(0) => "Simulator finished cleanly.".to_string(),
+                        Some(code) => format!("Simulator exited with code {code}."),
+                        None => "Simulator finished.".to_string(),
+                    };
+                    self.append_simulator_event_entry(SimulatorEventEntry {
+                        timestamp: None,
+                        kind: "status".into(),
+                        message: message.clone(),
+                        severity: SimulatorEventSeverity::Info,
+                    });
+                    self.set_status(message, StatusKind::Info);
+                }
+            }
+        }
+        if simulator_finished || simulator_disconnected {
+            self.simulator_running = false;
+            self.simulator_receiver = None;
+            self.simulator_cancel = None;
+            if simulator_disconnected {
+                self.append_simulator_event_entry(SimulatorEventEntry {
+                    timestamp: None,
+                    kind: "warning".into(),
+                    message: "Simulator task disconnected unexpectedly.".to_string(),
+                    severity: SimulatorEventSeverity::Warning,
+                });
+                self.set_status(
+                    "Simulator task disconnected unexpectedly.",
+                    StatusKind::Warning,
+                );
+            }
+            if simulator_finished && !simulator_disconnected {
+                self.simulator_status_line = Some("Simulator idle.".to_string());
             }
         }
 
@@ -5085,6 +5667,220 @@ impl App {
         }
         self.ensure_chart_metric_index();
     }
+
+    fn append_simulator_event_entry(&mut self, entry: SimulatorEventEntry) {
+        self.simulator_status_line = Some(entry.message.clone());
+        self.simulator_event_log.push(entry);
+        if self.simulator_event_log.len() > SIM_EVENT_BUFFER_LIMIT {
+            let overflow = self.simulator_event_log.len() - SIM_EVENT_BUFFER_LIMIT;
+            self.simulator_event_log.drain(0..overflow);
+        }
+        if self.controller_settings.auto_scroll_training_log() {
+            self.simulator_event_scroll = 0;
+        } else {
+            self.clamp_simulator_event_scroll();
+        }
+    }
+
+    fn clamp_simulator_event_scroll(&mut self) {
+        if self.simulator_event_log.is_empty() {
+            self.simulator_event_scroll = 0;
+            return;
+        }
+        let max_offset = self.simulator_event_log.len().saturating_sub(1);
+        if self.simulator_event_scroll > max_offset {
+            self.simulator_event_scroll = max_offset;
+        }
+    }
+
+    fn handle_simulator_line(&mut self, line: String) {
+        if self.try_parse_simulator_action(&line) {
+            return;
+        }
+        if self.try_parse_simulator_event(&line) {
+            return;
+        }
+        self.append_simulator_event_entry(SimulatorEventEntry {
+            timestamp: None,
+            kind: "stdout".into(),
+            message: line,
+            severity: SimulatorEventSeverity::Info,
+        });
+    }
+
+    fn try_parse_simulator_event(&mut self, line: &str) -> bool {
+        let payload = match line.strip_prefix(SIM_EVENT_PREFIX) {
+            Some(payload) => payload,
+            None => return false,
+        };
+
+        if let Ok(value) = serde_json::from_str::<Value>(payload) {
+            let timestamp = value.get("timestamp").and_then(|ts| match ts {
+                Value::String(s) => Some(s.clone()),
+                Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            });
+            let kind = value
+                .get("kind")
+                .and_then(|k| k.as_str())
+                .unwrap_or("event")
+                .to_string();
+            let severity = match kind.as_str() {
+                "error" => SimulatorEventSeverity::Error,
+                "warning" => SimulatorEventSeverity::Warning,
+                _ => SimulatorEventSeverity::Info,
+            };
+            let message = value
+                .get("message")
+                .and_then(|msg| msg.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    if kind == "connected" {
+                        let attempt = value
+                            .get("attempt")
+                            .and_then(|a| a.as_u64())
+                            .map(|a| format!("attempt {a}"))
+                            .unwrap_or_else(|| "attempt unknown".to_string());
+                        let mode = value
+                            .get("mode")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("single");
+                        Some(format!("Connected ({attempt}, mode: {mode})"))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| payload.to_string());
+            self.append_simulator_event_entry(SimulatorEventEntry {
+                timestamp,
+                kind,
+                message,
+                severity,
+            });
+        }
+        true
+    }
+
+    fn try_parse_simulator_action(&mut self, line: &str) -> bool {
+        let payload = match line.strip_prefix(SIM_ACTION_PREFIX) {
+            Some(payload) => payload,
+            None => return false,
+        };
+
+        if let Ok(value) = serde_json::from_str::<Value>(payload) {
+            self.update_simulator_actions_from_payload(&value);
+        }
+        true
+    }
+
+    fn update_simulator_actions_from_payload(&mut self, value: &Value) {
+        let episode = value.get("episode").and_then(|v| v.as_u64());
+        let step = value.get("step").and_then(|v| v.as_u64());
+        let mode = value
+            .get("mode")
+            .and_then(|m| m.as_str())
+            .map(|m| {
+                if m.eq_ignore_ascii_case("multi") {
+                    SimulatorMode::Multi
+                } else {
+                    SimulatorMode::Single
+                }
+            })
+            .unwrap_or(self.simulator_config.mode);
+
+        let mut rows = Vec::new();
+        if let Some(agents) = value.get("agents").and_then(|a| a.as_array()) {
+            for agent in agents {
+                let agent_id = agent
+                    .get("agent")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("agent")
+                    .to_string();
+                let policy = agent
+                    .get("policy")
+                    .and_then(|p| p.as_str())
+                    .map(|p| p.to_string());
+                let action = format_action_value(
+                    agent.get("action").unwrap_or(&Value::Null),
+                    SIM_ACTION_VALUE_MAX_LEN,
+                );
+                let reward = agent.get("reward").and_then(|r| r.as_f64());
+                let terminated = agent
+                    .get("terminated")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let truncated = agent
+                    .get("truncated")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let info = agent
+                    .get("info")
+                    .filter(|info| !info.is_null())
+                    .map(|info| truncate_display_value(info, SIM_INFO_VALUE_MAX_LEN));
+                rows.push(SimulatorAgentRow {
+                    episode,
+                    step,
+                    agent_id,
+                    policy,
+                    action,
+                    reward,
+                    terminated,
+                    truncated,
+                    info,
+                });
+            }
+        }
+
+        rows.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+        let new_count = rows.len();
+        self.simulator_actions.extend(rows);
+        if self.simulator_actions.len() > SIM_ACTION_HISTORY_LIMIT {
+            let overflow = self.simulator_actions.len() - SIM_ACTION_HISTORY_LIMIT;
+            self.simulator_actions.drain(0..overflow);
+        }
+
+        if !self.simulator_compact_user_override {
+            if new_count > SIM_ACTION_AUTO_COMPACT_THRESHOLD {
+                self.simulator_compact_view = true;
+            } else {
+                self.simulator_compact_view = false;
+            }
+        }
+
+        if self.controller_settings.auto_scroll_training_log() {
+            self.simulator_actions_scroll = 0;
+        } else {
+            let max_offset = self.simulator_actions.len();
+            if self.simulator_actions_scroll > max_offset {
+                self.simulator_actions_scroll = max_offset;
+            }
+        }
+
+        self.simulator_action_meta = Some(SimulatorActionMeta {
+            episode,
+            step,
+            mode,
+            total_agents: new_count,
+        });
+
+        if let Some(meta) = self.simulator_action_meta {
+            let summary = match (meta.episode(), meta.step()) {
+                (Some(ep), Some(step)) => format!(
+                    "{} episode {} step {} ({} agents)",
+                    meta.mode().label(),
+                    ep,
+                    step,
+                    meta.total_agents()
+                ),
+                _ => format!(
+                    "{} action update ({} agents)",
+                    meta.mode().label(),
+                    meta.total_agents()
+                ),
+            };
+            self.simulator_status_line = Some(summary);
+        }
+    }
 }
 
 fn format_f64(value: f64) -> String {
@@ -5101,8 +5897,76 @@ fn format_f64(value: f64) -> String {
     string
 }
 
+fn truncate_display_value(value: &Value, limit: usize) -> String {
+    let raw = match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(num) => num
+            .as_f64()
+            .map(format_number_short)
+            .unwrap_or_else(|| num.to_string()),
+        Value::String(s) => s.clone(),
+        _ => serde_json::to_string(value).unwrap_or_else(|_| "<unserializable>".to_string()),
+    };
+    truncate_string(raw, limit)
+}
+
+fn format_action_value(value: &Value, limit: usize) -> String {
+    fn render(value: &Value) -> String {
+        match value {
+            Value::Null => "null".to_string(),
+            Value::Bool(b) => b.to_string(),
+            Value::Number(num) => num
+                .as_f64()
+                .map(format_number_short)
+                .unwrap_or_else(|| num.to_string()),
+            Value::String(s) => format!("\"{}\"", s),
+            Value::Array(items) => {
+                let parts = items.iter().map(render).collect::<Vec<_>>();
+                format!("[{}]", parts.join(", "))
+            }
+            Value::Object(map) => {
+                let parts = map
+                    .iter()
+                    .map(|(k, v)| format!("{}: {}", k, render(v)))
+                    .collect::<Vec<_>>();
+                format!("{{{}}}", parts.join(", "))
+            }
+        }
+    }
+
+    let rendered = render(value);
+    truncate_string(rendered, limit)
+}
+
+fn truncate_string(mut text: String, limit: usize) -> String {
+    if limit == 0 {
+        return String::new();
+    }
+    if text.len() > limit {
+        let cutoff = if limit > 3 { limit - 3 } else { limit };
+        text.truncate(cutoff);
+        text.push_str("...");
+    }
+    text
+}
+
 fn escape_single_quotes(input: &str) -> String {
     input.replace('\'', "''")
+}
+
+fn format_number_short(value: f64) -> String {
+    let mut string = format!("{value:.4}");
+    while string.contains('.') && string.ends_with('0') {
+        string.pop();
+    }
+    if string.ends_with('.') {
+        string.pop();
+    }
+    if string.is_empty() {
+        string.push('0');
+    }
+    string
 }
 
 fn format_usize_list(values: &[usize]) -> String {
@@ -5472,6 +6336,137 @@ fn spawn_training_task(
     });
 }
 
+fn spawn_simulator_task(
+    tx: Sender<SimulatorEvent>,
+    command: String,
+    script_path: PathBuf,
+    args: Vec<String>,
+    workdir: PathBuf,
+    cancel_rx: Receiver<()>,
+) {
+    thread::spawn(move || {
+        if !script_path.exists() {
+            let _ = tx.send(SimulatorEvent::Error(format!(
+                "Script not found: {}",
+                script_path.display()
+            )));
+            let _ = tx.send(SimulatorEvent::Finished(None));
+            return;
+        }
+
+        let mut cmd = Command::new(&command);
+        cmd.arg("-u")
+            .arg(&script_path)
+            .args(&args)
+            .current_dir(&workdir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = tx.send(SimulatorEvent::Error(format!(
+                    "Failed to start simulator command: {error}"
+                )));
+                let _ = tx.send(SimulatorEvent::Finished(None));
+                return;
+            }
+        };
+
+        let pid = child.id();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        if let Some(stdout) = stdout {
+            let tx_stdout = tx.clone();
+            thread::spawn(move || {
+                let reader = BufReader::new(stdout);
+                for line in reader.lines().flatten() {
+                    if tx_stdout.send(SimulatorEvent::Line(line)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        if let Some(stderr) = stderr {
+            let tx_stderr = tx.clone();
+            thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().flatten() {
+                    let formatted = format!("! {}", line);
+                    if tx_stderr.send(SimulatorEvent::Line(formatted)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        let mut cancel_requested = false;
+        let mut kill_deadline: Option<Instant> = None;
+
+        let status_result = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {}
+                Err(error) => break Err(error),
+            }
+
+            if !cancel_requested {
+                match cancel_rx.try_recv() {
+                    Ok(_) => {
+                        cancel_requested = true;
+                        kill_deadline = Some(Instant::now() + Duration::from_secs(10));
+                        let _ = tx.send(SimulatorEvent::Line(
+                            "Cancellation requested (sending Ctrl+C)...".into(),
+                        ));
+                        #[cfg(unix)]
+                        {
+                            use nix::sys::signal::{kill, Signal};
+                            use nix::unistd::Pid;
+                            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGINT);
+                        }
+                    }
+                    Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => {}
+                }
+            } else if let Some(deadline) = kill_deadline {
+                if Instant::now() >= deadline {
+                    let _ = tx.send(SimulatorEvent::Line(
+                        "Simulator unresponsive; forcing termination...".into(),
+                    ));
+                    if let Err(error) = child.kill() {
+                        let _ = tx.send(SimulatorEvent::Error(format!(
+                            "Failed to terminate simulator: {error}"
+                        )));
+                        break Err(error);
+                    } else {
+                        break child.wait();
+                    }
+                }
+            }
+
+            thread::sleep(Duration::from_millis(100));
+        };
+
+        match status_result {
+            Ok(status) => {
+                let code = status.code();
+                let message = match code {
+                    Some(code) => format!("Process exited with code {code}."),
+                    None => "Process terminated by signal.".to_string(),
+                };
+                let _ = tx.send(SimulatorEvent::Line(message));
+                let _ = tx.send(SimulatorEvent::Finished(code));
+            }
+            Err(error) => {
+                let _ = tx.send(SimulatorEvent::Error(format!(
+                    "Failed to wait for process: {error}"
+                )));
+                let _ = tx.send(SimulatorEvent::Finished(None));
+            }
+        }
+    });
+}
 fn write_rllib_config(path: &Path, config: &TrainingConfig) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)

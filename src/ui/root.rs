@@ -38,6 +38,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         TabId::Home => screens::render_home(frame, content_area, app),
         TabId::Train => screens::render_train(frame, content_area, app),
         TabId::Metrics => screens::render_metrics(frame, content_area, app),
+        TabId::Simulator => screens::render_simulator(frame, content_area, app),
         TabId::Export => screens::render_export(frame, content_area, app),
         TabId::Settings => screens::render_settings(frame, content_area, app),
         tab => screens::render_placeholder(frame, content_area, tab, app),

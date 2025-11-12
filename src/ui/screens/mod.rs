@@ -5,15 +5,15 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Axis, Block, Borders, Chart, Clear, Dataset, GraphType, List, ListItem, ListState, Paragraph,
-    Wrap,
+    Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, List, ListItem, ListState,
+    Paragraph, Row, Table, Wrap,
 };
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
     App, ConfigField, FileBrowserEntry, FileBrowserKind, FileBrowserState, InputMode, MetricSample,
-    MetricsFocus, StatusKind, TabId,
+    MetricsFocus, SimulatorFocus, StatusKind, TabId,
 };
 
 use super::utils::alphanumeric_sort_key;
@@ -518,6 +518,352 @@ pub fn render_metrics(frame: &mut Frame<'_>, area: Rect, app: &App) {
         // Large terminal - three column layout with chart on top
         render_metrics_large(frame, area, app);
     }
+}
+
+pub fn render_simulator(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let status_height = if area.height >= 16 { 7 } else { 5 };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(status_height), Constraint::Min(4)])
+        .split(area);
+
+    render_simulator_status(frame, chunks[0], app);
+
+    let feeds = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(chunks[1]);
+
+    render_simulator_events(frame, feeds[0], app);
+    render_simulator_actions(frame, feeds[1], app);
+}
+
+fn render_simulator_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let config = app.simulator_config();
+    let label_style = Style::default().fg(Color::DarkGray);
+    let running = app.is_simulator_running();
+    let mut lines = Vec::new();
+
+    let status_color = if running {
+        Color::LightGreen
+    } else {
+        Color::DarkGray
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled("Status: ", label_style),
+        Span::styled(
+            if running { "Running" } else { "Idle" },
+            Style::default()
+                .fg(status_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  Mode: ", label_style),
+        Span::styled(
+            config.mode.label(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  Window: ", label_style),
+        Span::styled(
+            if config.show_window {
+                "Visible"
+            } else {
+                "Headless"
+            },
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::styled("  Auto-Restart: ", label_style),
+        Span::styled(
+            if config.auto_restart { "On" } else { "Off" },
+            Style::default().fg(if config.auto_restart {
+                Color::LightGreen
+            } else {
+                Color::LightRed
+            }),
+        ),
+        Span::styled("  Tracebacks: ", label_style),
+        Span::styled(
+            if config.log_tracebacks {
+                "Verbose"
+            } else {
+                "Hidden"
+            },
+            Style::default().fg(Color::Gray),
+        ),
+    ]));
+
+    let env_display = if config.env_path.trim().is_empty() {
+        "<not set>"
+    } else {
+        config.env_path.trim()
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled("Env: ", label_style),
+        Span::styled(
+            env_display,
+            Style::default().fg(if config.env_path.trim().is_empty() {
+                Color::LightRed
+            } else {
+                Color::White
+            }),
+        ),
+        Span::styled("  Step Delay: ", label_style),
+        Span::styled(
+            format!("{:.2}s", config.step_delay),
+            Style::default().fg(Color::Gray),
+        ),
+        Span::styled("  Restart Delay: ", label_style),
+        Span::styled(
+            format!("{:.1}s", config.restart_delay),
+            Style::default().fg(Color::Gray),
+        ),
+        Span::styled("  Focus: ", label_style),
+        Span::styled(
+            match app.simulator_focus() {
+                SimulatorFocus::Events => "Events",
+                SimulatorFocus::Actions => "Actions",
+            },
+            Style::default().fg(Color::LightCyan),
+        ),
+    ]));
+
+    lines.push(Line::from(vec![
+        Span::styled("Controls: ", label_style),
+        Span::styled("s", Style::default().fg(Color::Yellow)),
+        Span::styled("tart ", label_style),
+        Span::styled("c", Style::default().fg(Color::Yellow)),
+        Span::styled("ancel ", label_style),
+        Span::styled("m", Style::default().fg(Color::Yellow)),
+        Span::styled("ode ", label_style),
+        Span::styled("w", Style::default().fg(Color::Yellow)),
+        Span::styled("indow ", label_style),
+        Span::styled("a", Style::default().fg(Color::Yellow)),
+        Span::styled("uto ", label_style),
+        Span::styled("t", Style::default().fg(Color::Yellow)),
+        Span::styled("racebacks  ", label_style),
+        Span::styled("p", Style::default().fg(Color::Yellow)),
+        Span::styled("ick env  ", label_style),
+        Span::styled("y", Style::default().fg(Color::Yellow)),
+        Span::styled(" sync  ", label_style),
+        Span::styled("f", Style::default().fg(Color::Yellow)),
+        Span::styled("/Tab focus  ", label_style),
+        Span::styled("v", Style::default().fg(Color::Yellow)),
+        Span::styled(" compact", label_style),
+    ]));
+
+    lines.push(Line::from(vec![
+        Span::styled("Delays: ", label_style),
+        Span::styled("[ / ]", Style::default().fg(Color::Yellow)),
+        Span::styled(" step  ", label_style),
+        Span::styled("- / =", Style::default().fg(Color::Yellow)),
+        Span::styled(" restart", label_style),
+    ]));
+
+    if let Some(latest) = app.simulator_status_line() {
+        lines.push(Line::from(vec![
+            Span::styled("Latest: ", label_style),
+            Span::styled(latest, Style::default().fg(Color::White)),
+        ]));
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Simulator Overview");
+    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
+    frame.render_widget(paragraph, area);
+}
+
+fn render_simulator_events(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let focus = matches!(app.simulator_focus(), SimulatorFocus::Events);
+    let border_style = Style::default().fg(focused_border_color(app, focus));
+    let title = if focus { "Events (focus)" } else { "Events" };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(border_style);
+
+    if app.simulator_events().is_empty() {
+        let placeholder = Paragraph::new(if app.is_simulator_running() {
+            "Awaiting simulator output..."
+        } else {
+            "Press 's' to launch the simulator."
+        })
+        .block(block)
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(placeholder, area);
+        return;
+    }
+
+    let mut lines = Vec::with_capacity(app.simulator_events().len());
+    for entry in app.simulator_events() {
+        let timestamp = entry.timestamp.as_deref().unwrap_or("-");
+        let severity_color = match entry.severity {
+            crate::app::SimulatorEventSeverity::Error => Color::LightRed,
+            crate::app::SimulatorEventSeverity::Warning => Color::Yellow,
+            crate::app::SimulatorEventSeverity::Info => Color::White,
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("[{timestamp}] "),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                format!("{:<8}", entry.kind),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(entry.message.clone(), Style::default().fg(severity_color)),
+        ]));
+    }
+
+    let mut paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+
+    let total_lines = app.simulator_events().len();
+    let visible_height = area.height.saturating_sub(2).max(1) as usize;
+    let max_offset = total_lines.saturating_sub(visible_height);
+    let offset = app.simulator_event_scroll().min(max_offset);
+    let first_line = total_lines.saturating_sub(visible_height + offset) as u16;
+    paragraph = paragraph.scroll((first_line, 0));
+
+    frame.render_widget(paragraph, area);
+}
+
+fn render_simulator_actions(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let focus = matches!(app.simulator_focus(), SimulatorFocus::Actions);
+    let border_style = Style::default().fg(focused_border_color(app, focus));
+    let rows = app.simulator_actions();
+
+    let meta = app.simulator_action_meta();
+
+    if rows.is_empty() {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title("Actions")
+            .border_style(border_style);
+        let placeholder = Paragraph::new(if app.is_simulator_running() {
+            "Waiting for agents to report actions..."
+        } else {
+            "Start the simulator to stream actions."
+        })
+        .block(block)
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(placeholder, area);
+        return;
+    }
+
+    let visible_height = area.height.saturating_sub(3).max(1) as usize;
+    let total_rows = rows.len();
+    let max_offset = total_rows.saturating_sub(visible_height);
+    let offset_from_bottom = app.simulator_actions_scroll().min(max_offset);
+    let mut visible_rows = Vec::new();
+    let mut idx = total_rows.saturating_sub(visible_height + offset_from_bottom);
+    while idx < total_rows {
+        visible_rows.push(&rows[idx]);
+        idx += 1;
+    }
+    visible_rows.reverse();
+
+    let mut table_rows = Vec::new();
+    for row in visible_rows.iter() {
+        let reward = row
+            .reward
+            .map(|r| format!("{r:.2}"))
+            .unwrap_or_else(|| "-".into());
+        let done = match (row.terminated, row.truncated) {
+            (true, true) => "term+trunc",
+            (true, false) => "term",
+            (false, true) => "trunc",
+            _ => "",
+        };
+
+        let mut cells = Vec::new();
+        let episode_text = row
+            .episode
+            .map(|ep| ep.to_string())
+            .unwrap_or_else(|| "-".into());
+        let step_text = row
+            .step
+            .map(|st| st.to_string())
+            .unwrap_or_else(|| "-".into());
+
+        cells.push(Cell::from(episode_text));
+        cells.push(Cell::from(step_text));
+        cells.push(Cell::from(row.agent_id.clone()));
+        if !app.simulator_compact_view() {
+            cells.push(Cell::from(row.policy.clone().unwrap_or_else(|| "-".into())));
+        }
+        cells.push(Cell::from(row.action.clone()));
+        cells.push(Cell::from(reward));
+        cells.push(Cell::from(done));
+        if !app.simulator_compact_view() {
+            cells.push(Cell::from(row.info.clone().unwrap_or_else(|| "".into())));
+        }
+
+        table_rows.push(Row::new(cells).style(Style::default().fg(Color::White)));
+    }
+
+    let header = if app.simulator_compact_view() {
+        Row::new(vec!["Ep", "Step", "Agent", "Action", "Reward", "Done"])
+    } else {
+        Row::new(vec![
+            "Ep", "Step", "Agent", "Policy", "Action", "Reward", "Done", "Info",
+        ])
+    }
+    .style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let widths: Vec<Constraint> = if app.simulator_compact_view() {
+        vec![
+            Constraint::Length(6),
+            Constraint::Length(6),
+            Constraint::Length(14),
+            Constraint::Min(18),
+            Constraint::Length(10),
+            Constraint::Length(10),
+        ]
+    } else {
+        vec![
+            Constraint::Length(6),
+            Constraint::Length(6),
+            Constraint::Length(12),
+            Constraint::Length(12),
+            Constraint::Min(18),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(18),
+        ]
+    };
+
+    let mut title = String::from(if focus { "Actions (focus)" } else { "Actions" });
+    title.push_str(&format!(
+        " • displaying {} of {} rows",
+        table_rows.len(),
+        rows.len()
+    ));
+    if let Some(meta) = meta {
+        title.push_str(&format!(" • {}", meta.mode().label()));
+        if let (Some(ep), Some(step)) = (meta.episode(), meta.step()) {
+            title.push_str(&format!(" • episode {ep} step {step}"));
+        }
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(border_style);
+
+    let table = Table::new(table_rows, widths).header(header).block(block);
+
+    frame.render_widget(table, area);
 }
 
 fn render_metrics_compact(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -2434,6 +2780,7 @@ pub fn render_placeholder(frame: &mut Frame<'_>, area: Rect, tab: TabId, app: &A
         TabId::Home => unreachable!(),
         TabId::Train => "Training configuration pending",
         TabId::Metrics => "Metrics view pending",
+        TabId::Simulator => "Simulator view pending",
         TabId::Export => unreachable!(),
         TabId::Settings => "Settings pending",
     };
@@ -2526,6 +2873,7 @@ fn build_help_sections(app: &App) -> Vec<(String, Vec<String>)> {
         TabId::Home => ("Home tab".to_string(), home_help_lines()),
         TabId::Train => ("Train tab".to_string(), train_help_lines()),
         TabId::Metrics => ("Metrics tab".to_string(), metrics_help_lines(app)),
+        TabId::Simulator => ("Simulator tab".to_string(), simulator_help_lines()),
         TabId::Export => ("Export tab".to_string(), export_help_lines()),
         TabId::Settings => ("Settings tab".to_string(), settings_help_lines()),
     };
@@ -2585,6 +2933,20 @@ fn metrics_help_lines(app: &App) -> Vec<String> {
         }
     }
     lines
+}
+
+fn simulator_help_lines() -> Vec<String> {
+    vec![
+        "s / c          Start or cancel the simulator script".to_string(),
+        "m / w / a      Toggle mode, window visibility, auto-restart".to_string(),
+        "t              Toggle verbose Python tracebacks".to_string(),
+        "p / y          Pick an environment binary or copy the training path".to_string(),
+        "f / Tab        Switch focus between Events and Actions panes".to_string(),
+        "v              Toggle compact agent table layout".to_string(),
+        "[ / ]          Decrease / increase the step delay".to_string(),
+        "- / =          Decrease / increase the restart delay".to_string(),
+        "Up/Down        Scroll the focused pane (PgUp/PgDn for speed)".to_string(),
+    ]
 }
 
 fn export_help_lines() -> Vec<String> {
