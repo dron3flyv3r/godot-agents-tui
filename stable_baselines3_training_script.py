@@ -18,6 +18,7 @@ from stable_baselines3.common.vec_env.vec_monitor import VecMonitor
 from godot_rl.core.utils import can_import
 from godot_rl.wrappers.onnx.stable_baselines_export import export_model_as_onnx
 from godot_rl.wrappers.stable_baselines_wrapper import StableBaselinesGodotEnv
+from custom_models import SUPPORTED_POLICY_TYPES, build_sb3_policy_kwargs
 
 # To download the env source and binary:
 # 1.  gdrl.env_from_hub -r edbeeching/godot_rl_BallChase
@@ -115,10 +116,40 @@ parser.add_argument(
     help="How many instances of the environment executable to " "launch - requires --env_path to be set if > 1.",
 )
 parser.add_argument(
+    "--policy-type",
+    default="mlp",
+    choices=SUPPORTED_POLICY_TYPES,
+    help="Select which custom policy backbone to use (mlp, cnn, lstm, or grn).",
+)
+parser.add_argument(
     "--policy-hidden-layers",
-    default="64,64",
+    default="256,256",
     type=str,
     help="Comma-separated list of hidden layer sizes applied to both policy and value networks.",
+)
+parser.add_argument(
+    "--cnn-channels",
+    default="32,64,64",
+    type=str,
+    help="Comma-separated list of convolution channels for CNN policies.",
+)
+parser.add_argument(
+    "--lstm-hidden-size",
+    default=256,
+    type=int,
+    help="Hidden size for LSTM-based policies.",
+)
+parser.add_argument(
+    "--lstm-num-layers",
+    default=1,
+    type=int,
+    help="Number of stacked LSTM layers for LSTM policies.",
+)
+parser.add_argument(
+    "--grn-hidden-size",
+    default=256,
+    type=int,
+    help="Hidden size for GRN policies.",
 )
 args, extras = parser.parse_known_args()
 
@@ -274,13 +305,27 @@ try:
 except ValueError as exc:
     parser.error(f"Invalid --policy-hidden-layers: {exc}")
 
+try:
+    cnn_channels = parse_hidden_layers(args.cnn_channels)
+except ValueError as exc:
+    parser.error(f"Invalid --cnn-channels: {exc}")
+
 
 if args.resume_model_path is None:
     learning_rate = 0.0003 if not args.linear_lr_schedule else linear_schedule(0.0003)
-    policy_kwargs = dict(
-        net_arch=[dict(pi=hidden_layers, vf=hidden_layers)]
+    policy_kwargs = build_sb3_policy_kwargs(
+        policy_type=args.policy_type,
+        mlp_layers=hidden_layers,
+        cnn_channels=cnn_channels,
+        lstm_hidden_size=args.lstm_hidden_size,
+        lstm_num_layers=args.lstm_num_layers,
+        grn_hidden_size=args.grn_hidden_size,
     )
-    print(f"Using policy/value hidden layers: {hidden_layers}")
+    print(
+        "Using {ptype} policy with head {layers}".format(
+            ptype=args.policy_type.upper(), layers=hidden_layers
+        )
+    )
     model: PPO = PPO(
         "MultiInputPolicy",
         env,
@@ -294,7 +339,7 @@ if args.resume_model_path is None:
 else:
     path_zip = pathlib.Path(args.resume_model_path)
     print("Loading model: " + os.path.abspath(path_zip))
-    if args.policy_hidden_layers != "64,64":
+    if args.policy_hidden_layers != "256,256":
         print("Info: --policy-hidden-layers is ignored when loading a saved model.")
     model = PPO.load(path_zip, env=env, tensorboard_log=args.experiment_dir)
 

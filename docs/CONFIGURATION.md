@@ -64,9 +64,14 @@ All fields prefixed with `sb3_`:
 }
 ```
 
+- `sb3_policy_type` (string): Backbone selector for SB3 policies (`"mlp"`, `"cnn"`, `"lstm"`, `"grn"`). Default: `"mlp"`.
 - `sb3_policy_layers` (array of integers): Hidden layer sizes
   - Default: `[64, 64]`
   - Example: `[128, 128, 64]` for 3-layer network
+- `sb3_cnn_channels` (array of integers): Number of filters per convolution layer when using the CNN backbone. Default: `[32, 64, 64]`.
+- `sb3_lstm_hidden_size` (integer): Hidden size for the LSTM backbone. Default: `256`.
+- `sb3_lstm_num_layers` (integer): Number of stacked LSTM layers. Default: `1`.
+- `sb3_grn_hidden_size` (integer): Hidden size for the GRN backbone. Default: `256`.
   
 ##### Training Hyperparameters
 
@@ -266,6 +271,7 @@ All fields prefixed with `rllib_`:
 {
   "rllib_framework": "torch",
   "rllib_activation": "relu",
+  "rllib_policy_type": "mlp",
   "rllib_fcnet_hiddens": [64, 64]
 }
 ```
@@ -279,9 +285,14 @@ All fields prefixed with `rllib_`:
   - `"tanh"` - Tanh
   - `"elu"` - ELU
 
-- `rllib_fcnet_hiddens` (array of integers): Hidden layer sizes
+- `rllib_policy_type` (string): Selects the policy backbone (`"mlp"`, `"cnn"`, `"lstm"`, `"grn"`). Default: `"mlp"`.
+- `rllib_fcnet_hiddens` (array of integers): Hidden layer sizes shared by the value/policy heads
   - Default: `[64, 64]`
   - Example: `[256, 256, 128]`
+- `rllib_cnn_channels` (array of integers): Convolution filters per layer when using the CNN policy type. Default: `[32, 64, 64]`.
+- `rllib_lstm_cell_size` (integer): LSTM hidden size for the LSTM policy type. Default: `256`.
+- `rllib_lstm_num_layers` (integer): Number of stacked LSTM layers. Default: `1`.
+- `rllib_grn_hidden_size` (integer): Hidden size used by the GRN backbone. Default: `256`.
 
 ##### Batch Mode
 

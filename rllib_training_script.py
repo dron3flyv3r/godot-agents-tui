@@ -21,6 +21,7 @@ from ray import train, tune
 from ray.rllib.algorithms.algorithm import Algorithm
 from ray.rllib.env.wrappers.pettingzoo_env import ParallelPettingZooEnv
 from ray.rllib.policy.policy import PolicySpec
+from custom_models import register_rllib_models
 
 METRIC_PREFIX = "@METRIC "
 METRIC_SOURCE = os.environ.get("CONTROLLER_METRICS")
@@ -328,6 +329,7 @@ if __name__ == "__main__":
 
     signal.signal(signal.SIGINT, _handle_interrupt_signal)
     signal.signal(signal.SIGTERM, _handle_interrupt_signal)
+    register_rllib_models()
 
     # Get config from file
     with open(args.config_file) as f:
