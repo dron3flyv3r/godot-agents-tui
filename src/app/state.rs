@@ -13,8 +13,8 @@ use color_eyre::{
 };
 
 use super::config::{
-    ConfigField, ExportConfig, ExportField, ExportMode, ExportState, RllibStopMode, TrainingConfig,
-    TrainingMode, EXPORT_CONFIG_FILENAME, TRAINING_CONFIG_FILENAME,
+    ConfigField, ExportConfig, ExportField, ExportMode, ExportState, PolicyType, RllibStopMode,
+    TrainingConfig, TrainingMode, EXPORT_CONFIG_FILENAME, TRAINING_CONFIG_FILENAME,
 };
 use super::file_browser::{FileBrowserEntry, FileBrowserKind, FileBrowserState, FileBrowserTarget};
 use super::metrics::{ChartData, ChartMetricKind, ChartMetricOption, MetricSample};
@@ -2099,6 +2099,7 @@ impl App {
             ConfigField::EnvPath => self.training_config.env_path.clone(),
             ConfigField::Timesteps => self.training_config.timesteps.to_string(),
             ConfigField::ExperimentName => self.training_config.experiment_name.clone(),
+            ConfigField::Sb3PolicyType => self.training_config.sb3_policy_type.as_str().to_string(),
             ConfigField::Sb3Speedup => self.training_config.sb3_speedup.to_string(),
             ConfigField::Sb3NParallel => self.training_config.sb3_n_parallel.to_string(),
             ConfigField::Sb3Viz => if self.training_config.sb3_viz {
@@ -2110,6 +2111,12 @@ impl App {
             ConfigField::Sb3PolicyLayers => {
                 format_usize_list(&self.training_config.sb3_policy_layers)
             }
+            ConfigField::Sb3CnnChannels => {
+                format_usize_list(&self.training_config.sb3_cnn_channels)
+            }
+            ConfigField::Sb3LstmHiddenSize => self.training_config.sb3_lstm_hidden_size.to_string(),
+            ConfigField::Sb3LstmNumLayers => self.training_config.sb3_lstm_num_layers.to_string(),
+            ConfigField::Sb3GrnHiddenSize => self.training_config.sb3_grn_hidden_size.to_string(),
             ConfigField::Sb3LearningRate => format_f64(self.training_config.sb3_learning_rate),
             ConfigField::Sb3BatchSize => self.training_config.sb3_batch_size.to_string(),
             ConfigField::Sb3NSteps => self.training_config.sb3_n_steps.to_string(),
@@ -2153,6 +2160,19 @@ impl App {
                 .to_string(),
             ConfigField::RllibFcnetHiddens => {
                 format_usize_list(&self.training_config.rllib_fcnet_hiddens)
+            }
+            ConfigField::RllibPolicyType => {
+                self.training_config.rllib_policy_type.as_str().to_string()
+            }
+            ConfigField::RllibCnnChannels => {
+                format_usize_list(&self.training_config.rllib_cnn_channels)
+            }
+            ConfigField::RllibLstmCellSize => self.training_config.rllib_lstm_cell_size.to_string(),
+            ConfigField::RllibLstmNumLayers => {
+                self.training_config.rllib_lstm_num_layers.to_string()
+            }
+            ConfigField::RllibGrnHiddenSize => {
+                self.training_config.rllib_grn_hidden_size.to_string()
             }
             ConfigField::RllibCheckpointFrequency => {
                 self.training_config.rllib_checkpoint_frequency.to_string()
@@ -2561,6 +2581,15 @@ impl App {
                     true
                 }
             }
+            ConfigField::Sb3PolicyType => {
+                if self.training_config.sb3_policy_type == defaults.sb3_policy_type {
+                    false
+                } else {
+                    self.training_config.sb3_policy_type = defaults.sb3_policy_type;
+                    self.rebuild_advanced_fields();
+                    true
+                }
+            }
             ConfigField::Sb3Speedup => {
                 if self.training_config.sb3_speedup == defaults.sb3_speedup {
                     false
@@ -2590,6 +2619,38 @@ impl App {
                     false
                 } else {
                     self.training_config.sb3_policy_layers = defaults.sb3_policy_layers.clone();
+                    true
+                }
+            }
+            ConfigField::Sb3CnnChannels => {
+                if self.training_config.sb3_cnn_channels == defaults.sb3_cnn_channels {
+                    false
+                } else {
+                    self.training_config.sb3_cnn_channels = defaults.sb3_cnn_channels.clone();
+                    true
+                }
+            }
+            ConfigField::Sb3LstmHiddenSize => {
+                if self.training_config.sb3_lstm_hidden_size == defaults.sb3_lstm_hidden_size {
+                    false
+                } else {
+                    self.training_config.sb3_lstm_hidden_size = defaults.sb3_lstm_hidden_size;
+                    true
+                }
+            }
+            ConfigField::Sb3LstmNumLayers => {
+                if self.training_config.sb3_lstm_num_layers == defaults.sb3_lstm_num_layers {
+                    false
+                } else {
+                    self.training_config.sb3_lstm_num_layers = defaults.sb3_lstm_num_layers;
+                    true
+                }
+            }
+            ConfigField::Sb3GrnHiddenSize => {
+                if self.training_config.sb3_grn_hidden_size == defaults.sb3_grn_hidden_size {
+                    false
+                } else {
+                    self.training_config.sb3_grn_hidden_size = defaults.sb3_grn_hidden_size;
                     true
                 }
             }
@@ -2844,6 +2905,47 @@ impl App {
                     true
                 }
             }
+            ConfigField::RllibPolicyType => {
+                if self.training_config.rllib_policy_type == defaults.rllib_policy_type {
+                    false
+                } else {
+                    self.training_config.rllib_policy_type = defaults.rllib_policy_type;
+                    self.rebuild_advanced_fields();
+                    true
+                }
+            }
+            ConfigField::RllibCnnChannels => {
+                if self.training_config.rllib_cnn_channels == defaults.rllib_cnn_channels {
+                    false
+                } else {
+                    self.training_config.rllib_cnn_channels = defaults.rllib_cnn_channels.clone();
+                    true
+                }
+            }
+            ConfigField::RllibLstmCellSize => {
+                if self.training_config.rllib_lstm_cell_size == defaults.rllib_lstm_cell_size {
+                    false
+                } else {
+                    self.training_config.rllib_lstm_cell_size = defaults.rllib_lstm_cell_size;
+                    true
+                }
+            }
+            ConfigField::RllibLstmNumLayers => {
+                if self.training_config.rllib_lstm_num_layers == defaults.rllib_lstm_num_layers {
+                    false
+                } else {
+                    self.training_config.rllib_lstm_num_layers = defaults.rllib_lstm_num_layers;
+                    true
+                }
+            }
+            ConfigField::RllibGrnHiddenSize => {
+                if self.training_config.rllib_grn_hidden_size == defaults.rllib_grn_hidden_size {
+                    false
+                } else {
+                    self.training_config.rllib_grn_hidden_size = defaults.rllib_grn_hidden_size;
+                    true
+                }
+            }
             ConfigField::RllibCheckpointFrequency => {
                 if self.training_config.rllib_checkpoint_frequency
                     == defaults.rllib_checkpoint_frequency
@@ -2906,6 +3008,15 @@ impl App {
                 }
                 self.training_config.experiment_name = trimmed.to_string();
             }
+            ConfigField::Sb3PolicyType => {
+                let Some(policy) = PolicyType::from_str(trimmed) else {
+                    bail!("Unknown SB3 policy type '{trimmed}'");
+                };
+                if self.training_config.sb3_policy_type != policy {
+                    self.training_config.sb3_policy_type = policy;
+                    self.rebuild_advanced_fields();
+                }
+            }
             ConfigField::Sb3Speedup => {
                 let val: u32 = trimmed
                     .parse()
@@ -2931,6 +3042,37 @@ impl App {
             ConfigField::Sb3PolicyLayers => {
                 let layers = parse_usize_list(trimmed)?;
                 self.training_config.sb3_policy_layers = layers;
+            }
+            ConfigField::Sb3CnnChannels => {
+                let layers = parse_usize_list(trimmed)?;
+                self.training_config.sb3_cnn_channels = layers;
+            }
+            ConfigField::Sb3LstmHiddenSize => {
+                let val: usize = trimmed
+                    .parse()
+                    .wrap_err("Hidden size must be a positive integer")?;
+                if val == 0 {
+                    bail!("Hidden size must be greater than 0");
+                }
+                self.training_config.sb3_lstm_hidden_size = val;
+            }
+            ConfigField::Sb3LstmNumLayers => {
+                let val: usize = trimmed
+                    .parse()
+                    .wrap_err("Number of layers must be a positive integer")?;
+                if val == 0 {
+                    bail!("Number of layers must be at least 1");
+                }
+                self.training_config.sb3_lstm_num_layers = val;
+            }
+            ConfigField::Sb3GrnHiddenSize => {
+                let val: usize = trimmed
+                    .parse()
+                    .wrap_err("Hidden size must be a positive integer")?;
+                if val == 0 {
+                    bail!("Hidden size must be greater than 0");
+                }
+                self.training_config.sb3_grn_hidden_size = val;
             }
             ConfigField::Sb3LearningRate => {
                 let val: f64 = trimmed.parse().wrap_err("Learning rate must be a number")?;
@@ -3146,6 +3288,46 @@ impl App {
                 let layers = parse_usize_list(trimmed)?;
                 self.training_config.rllib_fcnet_hiddens = layers;
             }
+            ConfigField::RllibPolicyType => {
+                let Some(policy) = PolicyType::from_str(trimmed) else {
+                    bail!("Unknown RLlib policy type '{trimmed}'");
+                };
+                if self.training_config.rllib_policy_type != policy {
+                    self.training_config.rllib_policy_type = policy;
+                    self.rebuild_advanced_fields();
+                }
+            }
+            ConfigField::RllibCnnChannels => {
+                let layers = parse_usize_list(trimmed)?;
+                self.training_config.rllib_cnn_channels = layers;
+            }
+            ConfigField::RllibLstmCellSize => {
+                let val: usize = trimmed
+                    .parse()
+                    .wrap_err("Hidden size must be a positive integer")?;
+                if val == 0 {
+                    bail!("Hidden size must be greater than 0");
+                }
+                self.training_config.rllib_lstm_cell_size = val;
+            }
+            ConfigField::RllibLstmNumLayers => {
+                let val: usize = trimmed
+                    .parse()
+                    .wrap_err("Number of layers must be a positive integer")?;
+                if val == 0 {
+                    bail!("Number of layers must be at least 1");
+                }
+                self.training_config.rllib_lstm_num_layers = val;
+            }
+            ConfigField::RllibGrnHiddenSize => {
+                let val: usize = trimmed
+                    .parse()
+                    .wrap_err("Hidden size must be a positive integer")?;
+                if val == 0 {
+                    bail!("Hidden size must be greater than 0");
+                }
+                self.training_config.rllib_grn_hidden_size = val;
+            }
             ConfigField::RllibCheckpointFrequency => {
                 let val: u32 = trimmed
                     .parse()
@@ -3357,46 +3539,73 @@ impl App {
 
     fn build_advanced_fields(&self) -> Vec<ConfigField> {
         match self.training_config.mode {
-            TrainingMode::SingleAgent => vec![
-                ConfigField::Sb3Speedup,
-                ConfigField::Sb3NParallel,
-                ConfigField::Sb3Viz,
-                ConfigField::Sb3PolicyLayers,
-                ConfigField::Sb3LearningRate,
-                ConfigField::Sb3BatchSize,
-                ConfigField::Sb3NSteps,
-                ConfigField::Sb3Gamma,
-                ConfigField::Sb3GaeLambda,
-                ConfigField::Sb3EntCoef,
-                ConfigField::Sb3ClipRange,
-                ConfigField::Sb3VfCoef,
-                ConfigField::Sb3MaxGradNorm,
-            ],
-            TrainingMode::MultiAgent => vec![
-                ConfigField::RllibConfigFile,
-                ConfigField::RllibStopMode,
-                ConfigField::RllibStopTimeSeconds,
-                ConfigField::RllibResumeFrom,
-                ConfigField::RllibShowWindow,
-                ConfigField::RllibNumWorkers,
-                ConfigField::RllibNumEnvWorkers,
-                ConfigField::RllibTrainBatchSize,
-                ConfigField::RllibSgdMinibatchSize,
-                ConfigField::RllibNumSgdIter,
-                ConfigField::RllibLr,
-                ConfigField::RllibGamma,
-                ConfigField::RllibLambda,
-                ConfigField::RllibClipParam,
-                ConfigField::RllibEntropyCoeff,
-                ConfigField::RllibVfLossCoeff,
-                ConfigField::RllibGradClip,
-                ConfigField::RllibFramework,
-                ConfigField::RllibActivation,
-                ConfigField::RllibBatchMode,
-                ConfigField::RllibRolloutFragmentLength,
-                ConfigField::RllibFcnetHiddens,
-                ConfigField::RllibCheckpointFrequency,
-            ],
+            TrainingMode::SingleAgent => {
+                let mut fields = vec![ConfigField::Sb3PolicyType, ConfigField::Sb3PolicyLayers];
+                match self.training_config.sb3_policy_type {
+                    PolicyType::Cnn => fields.push(ConfigField::Sb3CnnChannels),
+                    PolicyType::Lstm => {
+                        fields.push(ConfigField::Sb3LstmHiddenSize);
+                        fields.push(ConfigField::Sb3LstmNumLayers);
+                    }
+                    PolicyType::Grn => fields.push(ConfigField::Sb3GrnHiddenSize),
+                    PolicyType::Mlp => {}
+                }
+                fields.extend_from_slice(&[
+                    ConfigField::Sb3Speedup,
+                    ConfigField::Sb3NParallel,
+                    ConfigField::Sb3Viz,
+                    ConfigField::Sb3LearningRate,
+                    ConfigField::Sb3BatchSize,
+                    ConfigField::Sb3NSteps,
+                    ConfigField::Sb3Gamma,
+                    ConfigField::Sb3GaeLambda,
+                    ConfigField::Sb3EntCoef,
+                    ConfigField::Sb3ClipRange,
+                    ConfigField::Sb3VfCoef,
+                    ConfigField::Sb3MaxGradNorm,
+                ]);
+                fields
+            }
+            TrainingMode::MultiAgent => {
+                let mut fields = vec![
+                    ConfigField::RllibConfigFile,
+                    ConfigField::RllibStopMode,
+                    ConfigField::RllibStopTimeSeconds,
+                    ConfigField::RllibResumeFrom,
+                    ConfigField::RllibShowWindow,
+                    ConfigField::RllibPolicyType,
+                    ConfigField::RllibFcnetHiddens,
+                ];
+                match self.training_config.rllib_policy_type {
+                    PolicyType::Cnn => fields.push(ConfigField::RllibCnnChannels),
+                    PolicyType::Lstm => {
+                        fields.push(ConfigField::RllibLstmCellSize);
+                        fields.push(ConfigField::RllibLstmNumLayers);
+                    }
+                    PolicyType::Grn => fields.push(ConfigField::RllibGrnHiddenSize),
+                    PolicyType::Mlp => {}
+                }
+                fields.extend_from_slice(&[
+                    ConfigField::RllibNumWorkers,
+                    ConfigField::RllibNumEnvWorkers,
+                    ConfigField::RllibTrainBatchSize,
+                    ConfigField::RllibSgdMinibatchSize,
+                    ConfigField::RllibNumSgdIter,
+                    ConfigField::RllibLr,
+                    ConfigField::RllibGamma,
+                    ConfigField::RllibLambda,
+                    ConfigField::RllibClipParam,
+                    ConfigField::RllibEntropyCoeff,
+                    ConfigField::RllibVfLossCoeff,
+                    ConfigField::RllibGradClip,
+                    ConfigField::RllibFramework,
+                    ConfigField::RllibActivation,
+                    ConfigField::RllibBatchMode,
+                    ConfigField::RllibRolloutFragmentLength,
+                    ConfigField::RllibCheckpointFrequency,
+                ]);
+                fields
+            }
         }
     }
 
@@ -4572,7 +4781,36 @@ impl App {
                     format!("--timesteps={}", self.training_config.timesteps),
                     format!("--speedup={}", self.training_config.sb3_speedup),
                     format!("--n_parallel={}", self.training_config.sb3_n_parallel),
+                    format!(
+                        "--policy-type={}",
+                        self.training_config.sb3_policy_type.as_str()
+                    ),
+                    format!(
+                        "--policy-hidden-layers={}",
+                        format_usize_list_compact(&self.training_config.sb3_policy_layers)
+                    ),
                 ];
+                match self.training_config.sb3_policy_type {
+                    PolicyType::Cnn => args.push(format!(
+                        "--cnn-channels={}",
+                        format_usize_list_compact(&self.training_config.sb3_cnn_channels)
+                    )),
+                    PolicyType::Lstm => {
+                        args.push(format!(
+                            "--lstm-hidden-size={}",
+                            self.training_config.sb3_lstm_hidden_size
+                        ));
+                        args.push(format!(
+                            "--lstm-num-layers={}",
+                            self.training_config.sb3_lstm_num_layers
+                        ));
+                    }
+                    PolicyType::Grn => args.push(format!(
+                        "--grn-hidden-size={}",
+                        self.training_config.sb3_grn_hidden_size
+                    )),
+                    PolicyType::Mlp => {}
+                }
                 if self.training_config.sb3_viz {
                     args.push("--viz".to_string());
                 }
@@ -5977,6 +6215,14 @@ fn format_usize_list(values: &[usize]) -> String {
         .join(", ")
 }
 
+fn format_usize_list_compact(values: &[usize]) -> String {
+    values
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn parse_usize_list(input: &str) -> Result<Vec<usize>> {
     let mut values = Vec::new();
     for token in input.split(|c| matches!(c, ',' | ';' | ' ' | '\t')) {
@@ -6508,22 +6754,43 @@ fn write_rllib_config(path: &Path, config: &TrainingConfig) -> Result<()> {
         RllibStopMode::Timesteps => format!("    timesteps_total: {}", config.timesteps),
     };
 
-    let fcnet_hiddens = if config.rllib_fcnet_hiddens.is_empty() {
-        String::from("[]")
-    } else {
-        format!(
-            "[{}]",
-            config
-                .rllib_fcnet_hiddens
-                .iter()
-                .map(|v| v.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
+    let format_list = |values: &[usize]| {
+        if values.is_empty() {
+            String::from("[]")
+        } else {
+            format!(
+                "[{}]",
+                values
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    };
+
+    let fcnet_hiddens = format_list(&config.rllib_fcnet_hiddens);
+    let cnn_channels = format_list(&config.rllib_cnn_channels);
+    let model_block = match config.rllib_policy_type {
+        PolicyType::Mlp => format!(
+            "    model:\n        vf_share_layers: False\n        fcnet_hiddens: {fcnet_hiddens}\n"
+        ),
+        PolicyType::Cnn => format!(
+            "    model:\n        vf_share_layers: False\n        custom_model: tui_cnn\n        custom_model_config:\n            channels: {cnn_channels}\n            fcnet_hiddens: {fcnet_hiddens}\n"
+        ),
+        PolicyType::Lstm => format!(
+            "    model:\n        vf_share_layers: False\n        custom_model: tui_lstm\n        custom_model_config:\n            hidden_size: {hidden}\n            num_layers: {layers}\n            fcnet_hiddens: {fcnet_hiddens}\n",
+            hidden = config.rllib_lstm_cell_size,
+            layers = config.rllib_lstm_num_layers
+        ),
+        PolicyType::Grn => format!(
+            "    model:\n        vf_share_layers: False\n        custom_model: tui_grn\n        custom_model_config:\n            hidden_size: {hidden}\n            fcnet_hiddens: {fcnet_hiddens}\n",
+            hidden = config.rllib_grn_hidden_size
+        ),
     };
 
     let content = format!(
-        "algorithm: PPO\n\n# Multi-agent-env setting:\n# If true:\n# - Any AIController with done = true will receive zeroes as action values until all AIControllers are done, an episode ends at that point.\n# - ai_controller.needs_reset will also be set to true every time a new episode begins (but you can ignore it in your env if needed).\n# If false:\n# - AIControllers auto-reset in Godot and will receive actions after setting done = true.\n# - Each AIController has its own episodes that can end/reset at any point.\n# Set to false if you have a single policy name for all agents set in AIControllers\nenv_is_multiagent: true\n\ncheckpoint_frequency: {checkpoint_frequency}\n\n# You can set one or more stopping criteria\nstop:\n    #episode_reward_mean: 0\n    #training_iteration: 1000\n    #timesteps_total: 10000\n{stop_line}\n\nconfig:\n    env: godot\n    env_config:\n      env_path: {escaped_env_path} # Set your env path here (exported executable from Godot) - e.g. env_path: 'env_path.exe' on Windows\n      action_repeat: 2 # Doesn't need to be set here, you can set this in sync node in Godot editor as well\n      show_window: {show_window} # Displays game window while training. Might be faster when false in some cases, turning off also reduces GPU usage if you don't need rendering.\n      speedup: 30 # Speeds up Godot physics\n\n    framework: {framework} # ONNX models exported with torch are compatible with the current Godot RL Agents Plugin\n\n    lr: {lr}\n    lambda: {lambda}\n    gamma: {gamma}\n\n    vf_loss_coeff: {vf_loss_coeff}\n    vf_clip_param: .inf\n    #clip_param: {clip_param_comment}\n    entropy_coeff: {entropy_coeff}\n    entropy_coeff_schedule: null\n    #grad_clip: {grad_clip_comment}\n\n    normalize_actions: False\n    clip_actions: True # During onnx inference we simply clip the actions to [-1.0, 1.0] range, set here to match\n\n    rollout_fragment_length: {rollout_fragment_length}\n    sgd_minibatch_size: {sgd_minibatch_size}\n    num_workers: {num_workers}\n    num_envs_per_worker: {num_envs_per_worker} # This will be set automatically if not multi-agent. If multi-agent, changing this changes how many envs to launch per worker.\n    train_batch_size: {train_batch_size}\n\n    num_sgd_iter: {num_sgd_iter}\n    batch_mode: {batch_mode}\n\n    num_gpus: 0\n    model:\n        vf_share_layers: False\n        fcnet_hiddens: {fcnet_hiddens}\n"
+        "algorithm: PPO\n\n# Multi-agent-env setting:\n# If true:\n# - Any AIController with done = true will receive zeroes as action values until all AIControllers are done, an episode ends at that point.\n# - ai_controller.needs_reset will also be set to true every time a new episode begins (but you can ignore it in your env if needed).\n# If false:\n# - AIControllers auto-reset in Godot and will receive actions after setting done = true.\n# - Each AIController has its own episodes that can end/reset at any point.\n# Set to false if you have a single policy name for all agents set in AIControllers\nenv_is_multiagent: true\n\ncheckpoint_frequency: {checkpoint_frequency}\n\n# You can set one or more stopping criteria\nstop:\n    #episode_reward_mean: 0\n    #training_iteration: 1000\n    #timesteps_total: 10000\n{stop_line}\n\nconfig:\n    env: godot\n    env_config:\n      env_path: {escaped_env_path} # Set your env path here (exported executable from Godot) - e.g. env_path: 'env_path.exe' on Windows\n      action_repeat: 2 # Doesn't need to be set here, you can set this in sync node in Godot editor as well\n      show_window: {show_window} # Displays game window while training. Might be faster when false in some cases, turning off also reduces GPU usage if you don't need rendering.\n      speedup: 30 # Speeds up Godot physics\n\n    framework: {framework} # ONNX models exported with torch are compatible with the current Godot RL Agents Plugin\n\n    lr: {lr}\n    lambda: {lambda}\n    gamma: {gamma}\n\n    vf_loss_coeff: {vf_loss_coeff}\n    vf_clip_param: .inf\n    #clip_param: {clip_param_comment}\n    entropy_coeff: {entropy_coeff}\n    entropy_coeff_schedule: null\n    #grad_clip: {grad_clip_comment}\n\n    normalize_actions: False\n    clip_actions: True # During onnx inference we simply clip the actions to [-1.0, 1.0] range, set here to match\n\n    rollout_fragment_length: {rollout_fragment_length}\n    sgd_minibatch_size: {sgd_minibatch_size}\n    num_workers: {num_workers}\n    num_envs_per_worker: {num_envs_per_worker} # This will be set automatically if not multi-agent. If multi-agent, changing this changes how many envs to launch per worker.\n    train_batch_size: {train_batch_size}\n\n    num_sgd_iter: {num_sgd_iter}\n    batch_mode: {batch_mode}\n\n    num_gpus: 0\n{model_block}"
     );
 
     fs::write(path, content)

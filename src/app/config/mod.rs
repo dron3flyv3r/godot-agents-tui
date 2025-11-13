@@ -1,5 +1,41 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyType {
+    Mlp,
+    Cnn,
+    Lstm,
+    Grn,
+}
+
+impl Default for PolicyType {
+    fn default() -> Self {
+        PolicyType::Mlp
+    }
+}
+
+impl PolicyType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PolicyType::Mlp => "mlp",
+            PolicyType::Cnn => "cnn",
+            PolicyType::Lstm => "lstm",
+            PolicyType::Grn => "grn",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value.trim().to_lowercase().as_str() {
+            "mlp" => Some(PolicyType::Mlp),
+            "cnn" => Some(PolicyType::Cnn),
+            "lstm" => Some(PolicyType::Lstm),
+            "grn" => Some(PolicyType::Grn),
+            _ => None,
+        }
+    }
+}
+
 pub const TRAINING_CONFIG_FILENAME: &str = "training_config.json";
 pub const EXPORT_CONFIG_FILENAME: &str = "export_config.json";
 
@@ -30,7 +66,12 @@ pub struct TrainingConfig {
     pub env_path: String,
     pub timesteps: u64,
     pub experiment_name: String,
+    pub sb3_policy_type: PolicyType,
     pub sb3_policy_layers: Vec<usize>,
+    pub sb3_cnn_channels: Vec<usize>,
+    pub sb3_lstm_hidden_size: usize,
+    pub sb3_lstm_num_layers: usize,
+    pub sb3_grn_hidden_size: usize,
     pub sb3_viz: bool,
     pub sb3_speedup: u32,
     pub sb3_n_parallel: u32,
@@ -62,6 +103,11 @@ pub struct TrainingConfig {
     pub rllib_batch_mode: String,
     pub rllib_rollout_fragment_length: u32,
     pub rllib_fcnet_hiddens: Vec<usize>,
+    pub rllib_policy_type: PolicyType,
+    pub rllib_cnn_channels: Vec<usize>,
+    pub rllib_lstm_cell_size: usize,
+    pub rllib_lstm_num_layers: usize,
+    pub rllib_grn_hidden_size: usize,
     pub rllib_checkpoint_frequency: u32,
     pub rllib_resume_from: String,
     pub rllib_stop_mode: RllibStopMode,
@@ -75,7 +121,12 @@ impl Default for TrainingConfig {
             env_path: String::new(),
             timesteps: 1_000_000,
             experiment_name: "training".to_string(),
+            sb3_policy_type: PolicyType::Mlp,
             sb3_policy_layers: vec![256, 256],
+            sb3_cnn_channels: vec![32, 64, 64],
+            sb3_lstm_hidden_size: 256,
+            sb3_lstm_num_layers: 1,
+            sb3_grn_hidden_size: 256,
             sb3_viz: false,
             sb3_speedup: 1,
             sb3_n_parallel: 1,
@@ -107,6 +158,11 @@ impl Default for TrainingConfig {
             rllib_batch_mode: "truncate_episodes".to_string(),
             rllib_rollout_fragment_length: 200,
             rllib_fcnet_hiddens: vec![256, 256],
+            rllib_policy_type: PolicyType::Mlp,
+            rllib_cnn_channels: vec![32, 64, 64],
+            rllib_lstm_cell_size: 256,
+            rllib_lstm_num_layers: 1,
+            rllib_grn_hidden_size: 256,
             rllib_checkpoint_frequency: 20,
             rllib_resume_from: String::new(),
             rllib_stop_mode: RllibStopMode::TimeSeconds,
@@ -121,10 +177,15 @@ pub enum ConfigField {
     EnvPath,
     Timesteps,
     ExperimentName,
+    Sb3PolicyType,
     Sb3Speedup,
     Sb3NParallel,
     Sb3Viz,
     Sb3PolicyLayers,
+    Sb3CnnChannels,
+    Sb3LstmHiddenSize,
+    Sb3LstmNumLayers,
+    Sb3GrnHiddenSize,
     Sb3LearningRate,
     Sb3BatchSize,
     Sb3NSteps,
@@ -153,6 +214,11 @@ pub enum ConfigField {
     RllibBatchMode,
     RllibRolloutFragmentLength,
     RllibFcnetHiddens,
+    RllibPolicyType,
+    RllibCnnChannels,
+    RllibLstmCellSize,
+    RllibLstmNumLayers,
+    RllibGrnHiddenSize,
     RllibCheckpointFrequency,
     RllibResumeFrom,
     RllibStopMode,
@@ -299,10 +365,15 @@ impl ConfigField {
             ConfigField::EnvPath => "Environment Path",
             ConfigField::Timesteps => "Timesteps",
             ConfigField::ExperimentName => "Experiment Name",
+            ConfigField::Sb3PolicyType => "SB3 Policy Type",
             ConfigField::Sb3Speedup => "SB3 Speedup",
             ConfigField::Sb3NParallel => "SB3 Parallel Envs",
             ConfigField::Sb3Viz => "SB3 Visualization",
             ConfigField::Sb3PolicyLayers => "SB3 Policy Layers",
+            ConfigField::Sb3CnnChannels => "SB3 CNN Channels",
+            ConfigField::Sb3LstmHiddenSize => "SB3 LSTM Hidden Size",
+            ConfigField::Sb3LstmNumLayers => "SB3 LSTM Layers",
+            ConfigField::Sb3GrnHiddenSize => "SB3 GRN Hidden Size",
             ConfigField::Sb3LearningRate => "SB3 Learning Rate",
             ConfigField::Sb3BatchSize => "SB3 Batch Size",
             ConfigField::Sb3NSteps => "SB3 n_steps",
@@ -331,6 +402,11 @@ impl ConfigField {
             ConfigField::RllibBatchMode => "RLlib Batch Mode",
             ConfigField::RllibRolloutFragmentLength => "RLlib Rollout Fragment",
             ConfigField::RllibFcnetHiddens => "RLlib FC Layers",
+            ConfigField::RllibPolicyType => "RLlib Policy Type",
+            ConfigField::RllibCnnChannels => "RLlib CNN Channels",
+            ConfigField::RllibLstmCellSize => "RLlib LSTM Hidden Size",
+            ConfigField::RllibLstmNumLayers => "RLlib LSTM Layers",
+            ConfigField::RllibGrnHiddenSize => "RLlib GRN Hidden Size",
             ConfigField::RllibCheckpointFrequency => "RLlib Checkpoint Frequency",
             ConfigField::RllibResumeFrom => "RLlib Resume Directory",
             ConfigField::RllibStopMode => "RLlib Stop Mode",
@@ -349,6 +425,9 @@ impl ConfigField {
             ConfigField::ExperimentName => {
                 "Name used for experiment folders, checkpoints, and logs."
             }
+            ConfigField::Sb3PolicyType => {
+                "Select which SB3 policy backbone (MLP, CNN, LSTM, GRN) to build."
+            }
             ConfigField::Sb3Speedup => "Simulation speed multiplier applied while SB3 is running.",
             ConfigField::Sb3NParallel => {
                 "Number of parallel environments to launch for SB3 training."
@@ -356,6 +435,16 @@ impl ConfigField {
             ConfigField::Sb3Viz => "Enable to render the Godot window during SB3 training.",
             ConfigField::Sb3PolicyLayers => {
                 "Comma-separated hidden layer sizes for the SB3 policy network."
+            }
+            ConfigField::Sb3CnnChannels => {
+                "Comma-separated convolution channels for SB3 CNN feature extractors."
+            }
+            ConfigField::Sb3LstmHiddenSize => "Hidden size used by SB3 LSTM feature extractors.",
+            ConfigField::Sb3LstmNumLayers => {
+                "Number of stacked layers inside the SB3 LSTM extractor."
+            }
+            ConfigField::Sb3GrnHiddenSize => {
+                "Hidden size applied by the SB3 GRN feature extractor."
             }
             ConfigField::Sb3LearningRate => "Learning rate used by the SB3 optimizer.",
             ConfigField::Sb3BatchSize => "Batch size sampled when performing SB3 updates.",
@@ -403,6 +492,17 @@ impl ConfigField {
             ConfigField::RllibFcnetHiddens => {
                 "Comma-separated hidden layer sizes for RLlib's fully connected net."
             }
+            ConfigField::RllibPolicyType => {
+                "Select which RLlib policy backbone (MLP, CNN, LSTM, GRN) to build."
+            }
+            ConfigField::RllibCnnChannels => {
+                "Comma-separated convolution channels for RLlib CNN models."
+            }
+            ConfigField::RllibLstmCellSize => "Hidden size of the RLlib LSTM backbone.",
+            ConfigField::RllibLstmNumLayers => {
+                "Number of stacked layers inside the RLlib LSTM backbone."
+            }
+            ConfigField::RllibGrnHiddenSize => "Hidden size applied by the RLlib GRN backbone.",
             ConfigField::RllibCheckpointFrequency => {
                 "Number of iterations between RLlib checkpoints."
             }
