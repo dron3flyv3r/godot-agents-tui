@@ -822,7 +822,7 @@ print(f"DEBUG: Starting with env_path={args.env_path}", file=sys.stderr)
 python -m json.tool projects/my_project/training_config.json
 
 # Check YAML syntax
-python -c "import yaml; yaml.safe_load(open('rllib_config.yaml'))"
+python -c "import yaml; yaml.safe_load(open('.rlcontroller/rllib_config.yaml'))"
 ```
 
 ### Test ONNX Models

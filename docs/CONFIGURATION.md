@@ -168,14 +168,14 @@ All fields prefixed with `rllib_`:
 
 ```json
 {
-  "rllib_config_file": "rllib_config.yaml",
+  "rllib_config_file": ".rlcontroller/rllib_config.yaml",
   "rllib_show_window": true
 }
 ```
 
 - `rllib_config_file` (string): Path to RLlib YAML config
-  - Relative to project directory
-  - Default: `"rllib_config.yaml"`
+  - Relative paths are resolved against the project directory; by default the controller keeps the file under `.rlcontroller/`
+  - Default: `".rlcontroller/rllib_config.yaml"`
 
 - `rllib_show_window` (boolean): Show game window
   - `true` - Visual feedback
@@ -345,7 +345,7 @@ All fields prefixed with `rllib_`:
 
 ### RLlib YAML Configuration (`rllib_config.yaml`)
 
-**Location**: `projects/<project-name>/rllib_config.yaml`
+**Location**: `projects/<project-name>/.rlcontroller/rllib_config.yaml`
 
 **Purpose**: Defines environment setup and multi-agent policies
 
@@ -705,7 +705,7 @@ The controller respects these environment variables:
 **Symptoms**: RLlib uses different settings
 
 **Solutions**:
-1. Verify `rllib_config.yaml` in project directory
+1. Verify `.rlcontroller/rllib_config.yaml` exists in the project
 2. Check `rllib_config_file` path in `training_config.json`
 3. Ensure YAML syntax is valid
 4. Review RLlib logs for errors

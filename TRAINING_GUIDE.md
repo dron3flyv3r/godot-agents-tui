@@ -62,11 +62,11 @@ Uses the `stable_baselines3_training_script.py` script with these parameters:
 ### Multi-Agent (RLlib)
 
 Uses the `rllib_training_script.py` script with these parameters:
-- `--config_file`: Path to RLlib config YAML (default: `rllib_config.yaml`)
+- `--config_file`: Path to RLlib config YAML (default: `rllib_config.yaml`; controller-managed projects output `.rlcontroller/rllib_config.yaml`)
 - `--experiment_dir`: Directory for logs (defaults to `logs/rllib`)
 
 **Configuration options:**
-- `rllib_config_file`: Path to the RLlib YAML configuration
+- `rllib_config_file`: Path to the RLlib YAML configuration (defaults to `.rlcontroller/rllib_config.yaml` in new projects)
 
 ## Keyboard Controls (Train Tab)
 
@@ -108,7 +108,7 @@ Both training scripts support emitting structured metrics when the `CONTROLLER_M
    chmod +x path/to/your/environment.x86_64
    ```
 
-5. **Configuration files**: For RLlib training, ensure `rllib_config.yaml` is present in your project
+5. **Configuration files**: For RLlib training, ensure `.rlcontroller/rllib_config.yaml` exists (press `g` to regenerate if needed)
 
 ## Troubleshooting
 

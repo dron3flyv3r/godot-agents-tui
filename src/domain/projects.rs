@@ -138,6 +138,11 @@ impl ProjectManager {
         let logs_path = root.join("logs");
         fs::create_dir_all(&logs_path)
             .wrap_err_with(|| format!("failed to create logs directory {}", logs_path.display()))?;
+        let gdignore_path = logs_path.join(".gdignore");
+        if !gdignore_path.exists() {
+            fs::write(&gdignore_path, b"")
+                .wrap_err_with(|| format!("failed to create {}", gdignore_path.display()))?;
+        }
 
         let info = ProjectInfo {
             name: cleaned.to_string(),

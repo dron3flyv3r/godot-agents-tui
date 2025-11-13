@@ -200,7 +200,7 @@ Configure and execute training runs.
    - Best for: Complex environments, multiple agents
    - Algorithm: PPO with multi-agent support
    - Output: Checkpoints saved to `logs/rllib/`
-   - Configuration: Uses `rllib_config.yaml` in project directory
+   - Configuration: Uses `.rlcontroller/rllib_config.yaml` inside each project
 
 **Advanced Configuration:**
 Press `o` to access 50+ hyperparameters for fine-tuning:
@@ -309,7 +309,7 @@ Each project directory (located under `$PROJECTS_ROOT` by default) contains:
    - Hyperparameters for both SB3 and RLlib
    - Experiment settings
 
-3. **`rllib_config.yaml`**: RLlib-specific configuration
+3. **`rllib_config.yaml`** (stored under `.rlcontroller/`): RLlib-specific configuration
    - Environment factory
    - Multi-agent policies
    - Algorithm configuration
@@ -378,7 +378,7 @@ python stable_baselines3_training_script.py \
 Multi-agent training with RLlib.
 
 **Key Parameters:**
-- `--config_file`: RLlib YAML configuration (default: `rllib_config.yaml`)
+- `--config_file`: RLlib YAML configuration (default: `rllib_config.yaml`; controller-managed projects use `.rlcontroller/rllib_config.yaml`)
 - `--experiment_dir`: Output directory (default: `logs/rllib`)
 
 **Example:**
@@ -468,12 +468,14 @@ $PROJECTS_ROOT/
 │   ├── project.json
 │   ├── training_config.json
 │   ├── export_config.json
+│   ├── rllib_config.yaml
 │   └── runs/
 │       └── <timestamp>_<experiment>.json
 ├── logs/
+│   ├── .gdignore
 │   ├── sb3/…             # SB3 runs
 │   └── rllib/…           # RLlib runs
-└── rllib_config.yaml
+└── …                     # Your game/project files
 
 agents/                   # Controller workspace (this repository)
 ├── src/

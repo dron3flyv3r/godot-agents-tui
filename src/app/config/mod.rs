@@ -1,5 +1,11 @@
 use serde::{Deserialize, Serialize};
 
+use crate::domain::projects::PROJECT_CONFIG_DIR;
+
+pub fn default_rllib_config_file() -> String {
+    format!("{}/rllib_config.yaml", PROJECT_CONFIG_DIR)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyType {
@@ -122,12 +128,12 @@ impl Default for TrainingConfig {
             timesteps: 1_000_000,
             experiment_name: "training".to_string(),
             sb3_policy_type: PolicyType::Mlp,
-            sb3_policy_layers: vec![256, 256],
+            sb3_policy_layers: vec![64, 64],
             sb3_cnn_channels: vec![32, 64, 64],
-            sb3_lstm_hidden_size: 256,
+            sb3_lstm_hidden_size: 128,
             sb3_lstm_num_layers: 1,
-            sb3_grn_hidden_size: 256,
-            sb3_viz: false,
+            sb3_grn_hidden_size: 128,
+            sb3_viz: true,
             sb3_speedup: 1,
             sb3_n_parallel: 1,
             sb3_learning_rate: 3e-4,
@@ -139,8 +145,8 @@ impl Default for TrainingConfig {
             sb3_clip_range: 0.2,
             sb3_vf_coef: 0.5,
             sb3_max_grad_norm: 0.5,
-            rllib_config_file: "rllib_config.yaml".to_string(),
-            rllib_show_window: false,
+            rllib_config_file: default_rllib_config_file(),
+            rllib_show_window: true,
             rllib_num_workers: 4,
             rllib_num_envs_per_worker: 1,
             rllib_train_batch_size: 4000,
@@ -157,12 +163,12 @@ impl Default for TrainingConfig {
             rllib_activation: "relu".to_string(),
             rllib_batch_mode: "truncate_episodes".to_string(),
             rllib_rollout_fragment_length: 200,
-            rllib_fcnet_hiddens: vec![256, 256],
+            rllib_fcnet_hiddens: vec![64, 64],
             rllib_policy_type: PolicyType::Mlp,
             rllib_cnn_channels: vec![32, 64, 64],
-            rllib_lstm_cell_size: 256,
+            rllib_lstm_cell_size: 64,
             rllib_lstm_num_layers: 1,
-            rllib_grn_hidden_size: 256,
+            rllib_grn_hidden_size: 64,
             rllib_checkpoint_frequency: 20,
             rllib_resume_from: String::new(),
             rllib_stop_mode: RllibStopMode::TimeSeconds,

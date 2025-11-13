@@ -1,7 +1,8 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::ops::Index;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
@@ -13,8 +14,9 @@ use color_eyre::{
 };
 
 use super::config::{
-    ConfigField, ExportConfig, ExportField, ExportMode, ExportState, PolicyType, RllibStopMode,
-    TrainingConfig, TrainingMode, EXPORT_CONFIG_FILENAME, TRAINING_CONFIG_FILENAME,
+    default_rllib_config_file, ConfigField, ExportConfig, ExportField, ExportMode, ExportState,
+    PolicyType, RllibStopMode, TrainingConfig, TrainingMode, EXPORT_CONFIG_FILENAME,
+    TRAINING_CONFIG_FILENAME,
 };
 use super::file_browser::{FileBrowserEntry, FileBrowserKind, FileBrowserState, FileBrowserTarget};
 use super::metrics::{ChartData, ChartMetricKind, ChartMetricOption, MetricSample};
@@ -3149,7 +3151,7 @@ impl App {
                 if trimmed.is_empty() {
                     bail!("Config file path cannot be empty");
                 }
-                self.training_config.rllib_config_file = trimmed.to_string();
+                self.training_config.rllib_config_file = normalize_rllib_config_value(trimmed);
             }
             ConfigField::RllibShowWindow => {
                 self.training_config.rllib_show_window =
@@ -3396,6 +3398,29 @@ impl App {
                     Ok(contents) => match serde_json::from_str::<TrainingConfig>(&contents) {
                         Ok(config) => {
                             self.training_config = config;
+                            if let Some(previous) = self.normalize_rllib_config_file_setting() {
+                                if let Some(project) = &self.active_project {
+                                    if let Err(error) = self
+                                        .migrate_rllib_config_file(&project.root_path, &previous)
+                                    {
+                                        self.set_status(
+                                            format!(
+                                                "Failed to move RLlib config into .rlcontroller: {}",
+                                                error
+                                            ),
+                                            StatusKind::Warning,
+                                        );
+                                        had_error = true;
+                                    }
+                                }
+                                if let Err(error) = self.persist_training_config() {
+                                    self.set_status(
+                                        format!("Failed to update RLlib config path: {}", error),
+                                        StatusKind::Warning,
+                                    );
+                                    had_error = true;
+                                }
+                            }
                         }
                         Err(error) => {
                             self.training_config = TrainingConfig::default();
@@ -4158,7 +4183,7 @@ impl App {
                 self.training_config.env_path = value;
             }
             ConfigField::RllibConfigFile => {
-                self.training_config.rllib_config_file = value;
+                self.training_config.rllib_config_file = normalize_rllib_config_value(&value);
             }
             ConfigField::RllibResumeFrom => {
                 self.training_config.rllib_resume_from = value;
@@ -4206,6 +4231,69 @@ impl App {
             }
         }
         path.to_string_lossy().to_string()
+    }
+
+    fn rllib_config_absolute_path(&self, project_root: &Path) -> PathBuf {
+        let raw = self.training_config.rllib_config_file.trim();
+        let value = if raw.is_empty() {
+            default_rllib_config_file()
+        } else {
+            raw.to_string()
+        };
+        let path = PathBuf::from(&value);
+        if path.is_absolute() {
+            path
+        } else {
+            project_root.join(path)
+        }
+    }
+
+    fn normalize_rllib_config_file_setting(&mut self) -> Option<String> {
+        let normalized = normalize_rllib_config_value(&self.training_config.rllib_config_file);
+        if normalized != self.training_config.rllib_config_file {
+            let previous = self.training_config.rllib_config_file.clone();
+            self.training_config.rllib_config_file = normalized;
+            Some(previous)
+        } else {
+            None
+        }
+    }
+
+    fn migrate_rllib_config_file(&self, project_root: &Path, previous_value: &str) -> Result<()> {
+        let trimmed = previous_value.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        let previous_path = PathBuf::from(trimmed);
+        let previous_abs = if previous_path.is_absolute() {
+            previous_path
+        } else {
+            project_root.join(previous_path)
+        };
+        let new_path = self.rllib_config_absolute_path(project_root);
+        if previous_abs == new_path || !previous_abs.exists() || new_path.exists() {
+            return Ok(());
+        }
+        if let Some(parent) = new_path.parent() {
+            fs::create_dir_all(parent)
+                .wrap_err_with(|| format!("failed to create directory {}", parent.display()))?;
+        }
+        if let Err(rename_err) = fs::rename(&previous_abs, &new_path) {
+            fs::copy(&previous_abs, &new_path).wrap_err_with(|| {
+                format!(
+                    "failed to copy RLlib config from {} to {} after rename error {rename_err}",
+                    previous_abs.display(),
+                    new_path.display()
+                )
+            })?;
+            fs::remove_file(&previous_abs).wrap_err_with(|| {
+                format!(
+                    "failed to remove old RLlib config {} after copy",
+                    previous_abs.display()
+                )
+            })?;
+        }
+        Ok(())
     }
 
     fn stringify_for_export(&self, path: &Path) -> String {
@@ -4324,7 +4412,7 @@ impl App {
         }
 
         if self.training_config.mode == TrainingMode::MultiAgent {
-            let config_path = project_root.join(&self.training_config.rllib_config_file);
+            let config_path = self.rllib_config_absolute_path(project_root);
             if !config_path.exists() {
                 bail!(
                     "RLlib config file not found: {}. Use 'g' to generate it.",
@@ -4372,9 +4460,7 @@ impl App {
 
     pub fn generate_rllib_config(&mut self) -> Result<()> {
         if let Some(project) = &self.active_project {
-            let config_path = project
-                .root_path
-                .join(&self.training_config.rllib_config_file);
+            let config_path = self.rllib_config_absolute_path(&project.root_path);
             let existed = config_path.exists();
             match write_rllib_config(&config_path, &self.training_config) {
                 Ok(()) => {
@@ -6713,6 +6799,34 @@ fn spawn_simulator_task(
         }
     });
 }
+
+fn normalize_rllib_config_value(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return default_rllib_config_file();
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() || path_starts_with_config_dir(path) {
+        trimmed.to_string()
+    } else {
+        Path::new(PROJECT_CONFIG_DIR)
+            .join(path)
+            .to_string_lossy()
+            .to_string()
+    }
+}
+
+fn path_starts_with_config_dir(path: &Path) -> bool {
+    for component in path.components() {
+        match component {
+            Component::CurDir => continue,
+            Component::Normal(name) => return name == OsStr::new(PROJECT_CONFIG_DIR),
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn write_rllib_config(path: &Path, config: &TrainingConfig) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)

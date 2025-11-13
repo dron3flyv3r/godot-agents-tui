@@ -237,7 +237,7 @@ Try different opset version in export settings.
 ### Multi-Agent Training
 
 1. **Switch to multi-agent mode**: Press `m` in Train tab
-2. **Create `rllib_config.yaml`** in your project directory
+2. **Generate `.rlcontroller/rllib_config.yaml`** with `g` (or edit it manually)
 3. **Define multiple policies** for different agents
 4. **Train**: Press `t`
 

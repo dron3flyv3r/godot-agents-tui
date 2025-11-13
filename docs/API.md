@@ -207,7 +207,7 @@ python rllib_training_script.py [OPTIONS]
 **`--config_file PATH`**
 - **Type**: String
 - **Default**: `rllib_config.yaml`
-- **Description**: Path to RLlib YAML configuration file
+- **Description**: Path to RLlib YAML configuration file (controller projects pass `.rlcontroller/rllib_config.yaml`)
 - **Example**: `--config_file ./my_config.yaml`
 
 **`--experiment_dir PATH`**
@@ -226,7 +226,7 @@ python rllib_training_script.py [OPTIONS]
 
 #### RLlib Configuration File
 
-The script reads configuration from a YAML file (default: `rllib_config.yaml`).
+The script reads configuration from a YAML file (default: `rllib_config.yaml`; controller-managed projects keep it under `.rlcontroller/rllib_config.yaml`).
 
 **Required Structure**:
 ```yaml

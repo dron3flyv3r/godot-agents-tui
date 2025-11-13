@@ -264,7 +264,7 @@ impl MetricSample {
    - All hyperparameters for SB3 and RLlib
    - Mode selection
 
-3. **RLlib Config** (`rllib_config.yaml`)
+3. **RLlib Config** (`rllib_config.yaml`, stored under `.rlcontroller/`)
    - Environment factory
    - Policy mappings
    - Algorithm-specific settings
@@ -442,11 +442,13 @@ Similar structure to training process, but typically shorter-lived.
 projects/
 ├── index.json                      # Project registry
 └── <project-name>/
-    ├── project.json                # Metadata
-    ├── training_config.json        # Training params
-    ├── rllib_config.yaml           # RLlib specific
-    ├── export_config.json          # Export settings
+    ├── .rlcontroller/
+    │   ├── project.json            # Metadata
+    │   ├── training_config.json    # Training params
+    │   ├── rllib_config.yaml       # RLlib specific
+    │   └── export_config.json      # Export settings
     ├── logs/
+    │   ├── .gdignore
     │   ├── sb3/                   # SB3 logs
     │   │   └── <experiment>/
     │   │       ├── model.zip
