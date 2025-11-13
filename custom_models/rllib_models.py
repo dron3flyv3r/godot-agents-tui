@@ -53,8 +53,16 @@ class _AdaptiveTorchModel(TorchModelV2, nn.Module):
 
 
 class CnnPolicyModel(_AdaptiveTorchModel):
-    def __init__(self, obs_space, action_space, num_outputs, model_config, name):
-        cfg = model_config.get("custom_model_config", {})
+    def __init__(
+        self,
+        obs_space,
+        action_space,
+        num_outputs,
+        model_config,
+        name,
+        **custom_model_kwargs,
+    ):
+        cfg = {**model_config.get("custom_model_config", {}), **custom_model_kwargs}
         channels: Sequence[int] = cfg.get("channels", [32, 64, 64])
         fcnet: Sequence[int] = cfg.get("fcnet_hiddens", [256, 256])
         body = Conv1dBody(_infer_input_dim(obs_space), channels)
@@ -62,8 +70,16 @@ class CnnPolicyModel(_AdaptiveTorchModel):
 
 
 class LstmPolicyModel(_AdaptiveTorchModel):
-    def __init__(self, obs_space, action_space, num_outputs, model_config, name):
-        cfg = model_config.get("custom_model_config", {})
+    def __init__(
+        self,
+        obs_space,
+        action_space,
+        num_outputs,
+        model_config,
+        name,
+        **custom_model_kwargs,
+    ):
+        cfg = {**model_config.get("custom_model_config", {}), **custom_model_kwargs}
         hidden_size = int(cfg.get("hidden_size", 256))
         num_layers = int(cfg.get("num_layers", 1))
         fcnet: Sequence[int] = cfg.get("fcnet_hiddens", [256, 256])
@@ -72,8 +88,16 @@ class LstmPolicyModel(_AdaptiveTorchModel):
 
 
 class GrnPolicyModel(_AdaptiveTorchModel):
-    def __init__(self, obs_space, action_space, num_outputs, model_config, name):
-        cfg = model_config.get("custom_model_config", {})
+    def __init__(
+        self,
+        obs_space,
+        action_space,
+        num_outputs,
+        model_config,
+        name,
+        **custom_model_kwargs,
+    ):
+        cfg = {**model_config.get("custom_model_config", {}), **custom_model_kwargs}
         hidden_size = int(cfg.get("hidden_size", 256))
         fcnet: Sequence[int] = cfg.get("fcnet_hiddens", [256, 256])
         body = GrnBody(_infer_input_dim(obs_space), hidden_size)

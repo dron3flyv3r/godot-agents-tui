@@ -20,6 +20,7 @@ A powerful TUI (Terminal User Interface) application for managing reinforcement 
 - 🐍 **Python Integration**: Seamless integration with Python training scripts
 - 📈 **Advanced Configuration**: Extensive hyperparameter tuning options for both frameworks
 - 🧪 **Live Simulator Tab**: Launch the included Python simulator script to fire random actions at your Godot environment (single- or multi-agent) and verify observations/actions without writing custom harnesses. The controller streams simulator events and per-agent action tables directly into the TUI, with auto-restart and robust cancellation safeguards.
+- 🧠 **Custom RLlib Policy Models**: Swap between feed-forward, LSTM, and GRN-based Torch models (or your own) for multi-agent runs by editing a small block in `rllib_config.yaml`.
 
 ## Table of Contents
 
@@ -317,6 +318,28 @@ Each project directory (located under `$PROJECTS_ROOT` by default) contains:
    - Checkpoint paths
    - Output directories
    - Export options
+
+### Custom RLlib Policy Models
+
+Multi-agent runs can now swap between several built-in Torch architectures (or your own) by editing the `model` block inside `rllib_config.yaml`. Set `custom_model` to one of the registered names in `custom_models/rllib_models.py` and pass overrides via `custom_model_config`:
+
+```yaml
+model:
+  vf_share_layers: False
+  custom_model: tui_lstm        # tui_lstm, tui_grn, or tui_cnn
+  custom_model_config:
+    hidden_size: 64             # Body width (LSTM/GRN)
+    num_layers: 1               # LSTM depth
+    fcnet_hiddens: [128, 128]   # Post-body MLP head for policy/value
+```
+
+Available models:
+
+- `tui_lstm`: Adds a recurrent LSTM body so each policy can decide what to remember between steps (configurable `hidden_size`/`num_layers`).
+- `tui_grn`: Uses a gating residual network that blends learned context + candidate features (`hidden_size` sets the width).
+- `tui_cnn`: 1D convolutional stack for ordered observation vectors (set `channels` to control filter sizes). Treat this as experimental unless your observation layout demands it.
+
+All custom models end with a fully connected head whose depth is controlled by `fcnet_hiddens`, so you can balance feature extractors against policy capacity. Leaving `custom_model_config` empty uses the sane defaults baked into the helper module. Because these integrations live in Python, you can also register additional architectures by extending `custom_models/rllib_models.py`.
 
 ### Global Configuration
 

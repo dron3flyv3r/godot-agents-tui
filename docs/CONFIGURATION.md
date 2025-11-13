@@ -437,6 +437,28 @@ multiagent:
 - Other policies remain frozen
 - Useful for self-play or curriculum learning
 
+#### Custom Policy Models (RLlib)
+
+The `model` section of `rllib_config.yaml` now plugs directly into the bundled Torch architectures found in `custom_models/rllib_models.py`. Set `custom_model` to switch bodies and describe overrides inside `custom_model_config`:
+
+```yaml
+model:
+  vf_share_layers: false
+  custom_model: tui_lstm        # tui_lstm, tui_grn, or tui_cnn
+  custom_model_config:
+    hidden_size: 64             # Body width
+    num_layers: 1               # LSTM depth only
+    fcnet_hiddens: [128, 128]   # Shared policy/value head
+```
+
+Supported models:
+
+- `tui_lstm` – Adds an internal LSTM so each policy can learn temporal context. Tunable keys: `hidden_size`, `num_layers`, `fcnet_hiddens`.
+- `tui_grn` – Lightweight gating residual network that mixes candidate/context features. Tunable keys: `hidden_size`, `fcnet_hiddens`.
+- `tui_cnn` – 1D convolutional stack for ordered observation vectors. Tunable keys: `channels` (per-layer widths), `fcnet_hiddens`. Treat this as experimental unless your env exposes spatial/temporal grids.
+
+All models end with a configurable fully connected head whose layers are controlled by `fcnet_hiddens` (defaults to `[256, 256]`). If `custom_model_config` is omitted, the helper use defaults baked into the Python module. You can also register your own model names by extending `custom_models/rllib_models.py` and calling `register_rllib_models()`.
+
 ---
 
 ### Export Configuration (`export_config.json`)
