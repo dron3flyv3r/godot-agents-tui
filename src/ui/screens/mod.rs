@@ -2781,6 +2781,7 @@ pub fn render_placeholder(frame: &mut Frame<'_>, area: Rect, tab: TabId, app: &A
         TabId::Train => "Training configuration pending",
         TabId::Metrics => "Metrics view pending",
         TabId::Simulator => "Simulator view pending",
+        TabId::Interface => "Interface view pending",
         TabId::Export => unreachable!(),
         TabId::Settings => "Settings pending",
     };
@@ -2874,6 +2875,7 @@ fn build_help_sections(app: &App) -> Vec<(String, Vec<String>)> {
         TabId::Train => ("Train tab".to_string(), train_help_lines()),
         TabId::Metrics => ("Metrics tab".to_string(), metrics_help_lines(app)),
         TabId::Simulator => ("Simulator tab".to_string(), simulator_help_lines()),
+        TabId::Interface => ("Interface tab".to_string(), interface_help_lines()),
         TabId::Export => ("Export tab".to_string(), export_help_lines()),
         TabId::Settings => ("Settings tab".to_string(), settings_help_lines()),
     };
@@ -2941,6 +2943,20 @@ fn simulator_help_lines() -> Vec<String> {
         "m / w / a      Toggle mode, window visibility, auto-restart".to_string(),
         "t              Toggle verbose Python tracebacks".to_string(),
         "p / y          Pick an environment binary or copy the training path".to_string(),
+        "f / Tab        Switch focus between Events and Actions panes".to_string(),
+        "v              Toggle compact agent table layout".to_string(),
+        "[ / ]          Decrease / increase the step delay".to_string(),
+        "- / =          Decrease / increase the restart delay".to_string(),
+        "Up/Down        Scroll the focused pane (PgUp/PgDn for speed)".to_string(),
+    ]
+}
+
+fn interface_help_lines() -> Vec<String> {
+    vec![
+        "s / c          Start or cancel the agent interface".to_string(),
+        "m / w / a      Toggle mode, window visibility, auto-restart".to_string(),
+        "t / T          Toggle agent type (SB3 / RLlib), tracebacks".to_string(),
+        "p / y          Pick an agent file or copy the agent path".to_string(),
         "f / Tab        Switch focus between Events and Actions panes".to_string(),
         "v              Toggle compact agent table layout".to_string(),
         "[ / ]          Decrease / increase the step delay".to_string(),

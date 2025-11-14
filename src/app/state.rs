@@ -31,6 +31,8 @@ const EXPORT_BUFFER_LIMIT: usize = 512;
 const METRIC_PREFIX: &str = "@METRIC ";
 const SIM_EVENT_PREFIX: &str = "@SIM_EVENT ";
 const SIM_ACTION_PREFIX: &str = "@SIM_ACTION ";
+const INTERFACE_EVENT_PREFIX: &str = "@INTERFACE_EVENT ";
+const INTERFACE_ACTION_PREFIX: &str = "@INTERFACE_ACTION ";
 const TRAINING_METRIC_HISTORY_LIMIT: usize = 2048;
 const SIM_EVENT_BUFFER_LIMIT: usize = 512;
 const SIM_ACTION_AUTO_COMPACT_THRESHOLD: usize = 20;
@@ -56,6 +58,7 @@ pub enum TabId {
     Train,
     Metrics,
     Simulator,
+    Interface,
     Export,
     Settings,
 }
@@ -303,6 +306,130 @@ impl SimulatorActionMeta {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentType {
+    StableBaselines3,
+    Rllib,
+}
+
+impl AgentType {
+    pub fn label(self) -> &'static str {
+        match self {
+            AgentType::StableBaselines3 => "SB3",
+            AgentType::Rllib => "RLlib",
+        }
+    }
+
+    fn arg(self) -> &'static str {
+        match self {
+            AgentType::StableBaselines3 => "sb3",
+            AgentType::Rllib => "rllib",
+        }
+    }
+
+    fn toggle(&mut self) {
+        *self = match self {
+            AgentType::StableBaselines3 => AgentType::Rllib,
+            AgentType::Rllib => AgentType::StableBaselines3,
+        };
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct InterfaceConfig {
+    pub agent_type: AgentType,
+    pub agent_path: String,
+    pub mode: SimulatorMode,
+    pub env_path: String,
+    pub show_window: bool,
+    pub step_delay: f64,
+    pub restart_delay: f64,
+    pub max_episodes: Option<u32>,
+    pub max_steps: Option<u32>,
+    pub auto_restart: bool,
+    pub log_tracebacks: bool,
+    // RLlib-specific
+    pub rllib_checkpoint_number: Option<u32>,
+    pub rllib_policy_id: String,
+    // SB3-specific
+    pub sb3_algo: String,
+}
+
+impl Default for InterfaceConfig {
+    fn default() -> Self {
+        Self {
+            agent_type: AgentType::StableBaselines3,
+            agent_path: String::new(),
+            mode: SimulatorMode::Single,
+            env_path: String::new(),
+            show_window: false,
+            step_delay: 0.0,
+            restart_delay: 2.0,
+            max_episodes: None,
+            max_steps: None,
+            auto_restart: true,
+            log_tracebacks: false,
+            rllib_checkpoint_number: None,
+            rllib_policy_id: String::new(),
+            sb3_algo: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct InterfaceAgentRow {
+    pub episode: Option<u64>,
+    pub step: Option<u64>,
+    pub agent_id: String,
+    pub policy: Option<String>,
+    pub observation: Option<String>,
+    pub action: String,
+    pub reward: Option<f64>,
+    pub terminated: bool,
+    pub truncated: bool,
+    pub info: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct InterfaceActionMeta {
+    episode: Option<u64>,
+    step: Option<u64>,
+    mode: SimulatorMode,
+    total_agents: usize,
+}
+
+impl InterfaceActionMeta {
+    pub fn episode(self) -> Option<u64> {
+        self.episode
+    }
+
+    pub fn step(self) -> Option<u64> {
+        self.step
+    }
+
+    pub fn mode(self) -> SimulatorMode {
+        self.mode
+    }
+
+    pub fn total_agents(self) -> usize {
+        self.total_agents
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct InterfaceEventEntry {
+    pub timestamp: Option<String>,
+    pub kind: String,
+    pub message: String,
+    pub severity: SimulatorEventSeverity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterfaceFocus {
+    Events,
+    Actions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsField {
     AnimationsEnabled,
     AnimationSpeed,
@@ -446,6 +573,13 @@ enum SimulatorEvent {
     Finished(Option<i32>),
 }
 
+#[derive(Debug)]
+enum InterfaceEvent {
+    Line(String),
+    Error(String),
+    Finished(Option<i32>),
+}
+
 pub struct App {
     tabs: Vec<Tab>,
     active_tab_index: usize,
@@ -514,6 +648,20 @@ pub struct App {
     simulator_action_meta: Option<SimulatorActionMeta>,
     simulator_status_line: Option<String>,
 
+    interface_config: InterfaceConfig,
+    interface_running: bool,
+    interface_receiver: Option<Receiver<InterfaceEvent>>,
+    interface_cancel: Option<Sender<()>>,
+    interface_event_log: Vec<InterfaceEventEntry>,
+    interface_event_scroll: usize,
+    interface_focus: InterfaceFocus,
+    interface_actions: Vec<InterfaceAgentRow>,
+    interface_actions_scroll: usize,
+    interface_compact_view: bool,
+    interface_compact_user_override: bool,
+    interface_action_meta: Option<InterfaceActionMeta>,
+    interface_status_line: Option<String>,
+
     export_mode: ExportMode,
     export_config: ExportConfig,
     export_focus: ExportFocus,
@@ -560,6 +708,10 @@ impl App {
             Tab {
                 title: "Simulator",
                 id: TabId::Simulator,
+            },
+            Tab {
+                title: "Interface",
+                id: TabId::Interface,
             },
             Tab {
                 title: "Export",
@@ -636,6 +788,20 @@ impl App {
             simulator_compact_user_override: false,
             simulator_action_meta: None,
             simulator_status_line: None,
+
+            interface_config: InterfaceConfig::default(),
+            interface_running: false,
+            interface_receiver: None,
+            interface_cancel: None,
+            interface_event_log: Vec::new(),
+            interface_event_scroll: 0,
+            interface_focus: InterfaceFocus::Events,
+            interface_actions: Vec::new(),
+            interface_actions_scroll: 0,
+            interface_compact_view: false,
+            interface_compact_user_override: false,
+            interface_action_meta: None,
+            interface_status_line: None,
 
             export_mode: ExportMode::StableBaselines3,
             export_config: ExportConfig::default(),
