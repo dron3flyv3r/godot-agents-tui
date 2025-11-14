@@ -9,6 +9,7 @@ pub enum FileBrowserTarget {
     ProjectLocation,
     SavedRun,
     SimulatorEnvPath,
+    InterfaceAgentPath,
 }
 
 #[derive(Debug, Clone)]
