@@ -1009,6 +1009,46 @@ impl App {
         self.simulator_running
     }
 
+    pub fn interface_config(&self) -> &InterfaceConfig {
+        &self.interface_config
+    }
+
+    pub fn interface_focus(&self) -> InterfaceFocus {
+        self.interface_focus
+    }
+
+    pub fn interface_events(&self) -> &[InterfaceEventEntry] {
+        &self.interface_event_log
+    }
+
+    pub fn interface_event_scroll(&self) -> usize {
+        self.interface_event_scroll
+    }
+
+    pub fn interface_actions(&self) -> &[InterfaceAgentRow] {
+        &self.interface_actions
+    }
+
+    pub fn interface_actions_scroll(&self) -> usize {
+        self.interface_actions_scroll
+    }
+
+    pub fn interface_action_meta(&self) -> Option<InterfaceActionMeta> {
+        self.interface_action_meta
+    }
+
+    pub fn interface_status_line(&self) -> Option<&str> {
+        self.interface_status_line.as_deref()
+    }
+
+    pub fn interface_compact_view(&self) -> bool {
+        self.interface_compact_view
+    }
+
+    pub fn is_interface_running(&self) -> bool {
+        self.interface_running
+    }
+
     pub fn metrics_log_lines(&self) -> Option<&[String]> {
         self.archived_run_view.as_ref().map(|view| view.logs())
     }
@@ -3942,6 +3982,9 @@ impl App {
             FileBrowserTarget::SimulatorEnvPath => self
                 .resolve_existing_path(&self.simulator_config.env_path)
                 .unwrap_or_else(|| project_root.clone()),
+            FileBrowserTarget::InterfaceAgentPath => self
+                .resolve_existing_path(&self.interface_config.agent_path)
+                .unwrap_or_else(|| project_root.clone()),
             FileBrowserTarget::ProjectLocation => {
                 let raw = self.project_location_buffer.trim();
                 let mut candidate = if raw.is_empty() {
@@ -4336,6 +4379,11 @@ impl App {
                 let stored_value = self.stringify_for_storage(&path);
                 self.simulator_config.env_path = stored_value;
                 self.set_status("Simulator environment updated", StatusKind::Success);
+            }
+            Some(FileBrowserTarget::InterfaceAgentPath) => {
+                let stored_value = self.stringify_for_storage(&path);
+                self.interface_config.agent_path = stored_value;
+                self.set_status("Interface agent updated", StatusKind::Success);
             }
             None => {}
         }
@@ -5466,6 +5514,345 @@ impl App {
         }
     }
 
+    // Interface methods (similar to simulator)
+    pub fn start_interface(&mut self) -> Result<()> {
+        if self.interface_running {
+            self.set_status(
+                "Interface already running. Stop it before starting a new session.",
+                StatusKind::Warning,
+            );
+            return Ok(());
+        }
+
+        let project_root = match self.active_project.as_ref() {
+            Some(project) => project.root_path.clone(),
+            None => {
+                self.set_status("Select a project first", StatusKind::Warning);
+                return Ok(());
+            }
+        };
+
+        // Validate agent path
+        if self.interface_config.agent_path.trim().is_empty() {
+            self.set_status("Agent path is required. Use 'p' to select an agent.", StatusKind::Warning);
+            return Ok(());
+        }
+
+        let command = determine_python_command();
+        let script_path = find_script(&project_root, "interface.py")?;
+
+        let mut args = vec![
+            self.interface_config.agent_type.arg().to_string(),
+            self.interface_config.agent_path.clone(),
+        ];
+
+        args.push(format!("--mode={}", self.interface_config.mode.arg()));
+
+        if let Some(path) = self.resolve_existing_path(&self.interface_config.env_path) {
+            args.push(format!("--env-path={}", path.to_string_lossy()));
+        } else if !self.interface_config.env_path.trim().is_empty() {
+            args.push(format!(
+                "--env-path={}",
+                self.interface_config.env_path.trim()
+            ));
+        }
+
+        if self.interface_config.show_window {
+            args.push("--show-window".to_string());
+        } else {
+            args.push("--headless".to_string());
+        }
+
+        if self.interface_config.step_delay > 0.0 {
+            args.push(format!(
+                "--step-delay={:.4}",
+                self.interface_config.step_delay.max(0.0)
+            ));
+        }
+
+        args.push(format!(
+            "--restart-delay={:.4}",
+            self.interface_config.restart_delay.max(0.0)
+        ));
+
+        if let Some(max_steps) = self.interface_config.max_steps {
+            if max_steps > 0 {
+                args.push(format!("--max-steps={max_steps}"));
+            }
+        }
+
+        if let Some(max_episodes) = self.interface_config.max_episodes {
+            if max_episodes > 0 {
+                args.push(format!("--max-episodes={max_episodes}"));
+            }
+        }
+
+        if !self.interface_config.auto_restart {
+            args.push("--no-auto-restart".to_string());
+        }
+
+        if self.interface_config.log_tracebacks {
+            args.push("--log-tracebacks".to_string());
+        }
+
+        // Add RLlib-specific args
+        if self.interface_config.agent_type == AgentType::Rllib {
+            if let Some(num) = self.interface_config.rllib_checkpoint_number {
+                args.push(format!("--checkpoint-number={num}"));
+            }
+            if !self.interface_config.rllib_policy_id.trim().is_empty() {
+                args.push(format!("--policy={}", self.interface_config.rllib_policy_id));
+            }
+        }
+
+        // Add SB3-specific args
+        if self.interface_config.agent_type == AgentType::StableBaselines3 {
+            if !self.interface_config.sb3_algo.trim().is_empty() {
+                args.push(format!("--algo={}", self.interface_config.sb3_algo));
+            }
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let (cancel_tx, cancel_rx) = mpsc::channel();
+        self.interface_receiver = Some(rx);
+        self.interface_cancel = Some(cancel_tx);
+        self.interface_running = true;
+        self.interface_focus = InterfaceFocus::Events;
+        self.interface_event_log.clear();
+        self.interface_event_scroll = 0;
+        self.interface_actions.clear();
+        self.interface_actions_scroll = 0;
+        self.interface_action_meta = None;
+        self.interface_status_line = Some("Launching interface...".to_string());
+        if !self.interface_compact_user_override {
+            self.interface_compact_view = false;
+        }
+
+        let display_cmd = format!(
+            "{} -u {} {}",
+            command,
+            script_path.display(),
+            args.join(" ")
+        );
+
+        self.append_interface_event_entry(InterfaceEventEntry {
+            timestamp: None,
+            kind: "command".into(),
+            message: format!("$ {display_cmd}"),
+            severity: SimulatorEventSeverity::Info,
+        });
+
+        spawn_interface_task(tx, command, script_path, args, project_root, cancel_rx);
+
+        self.set_status("Interface starting...", StatusKind::Info);
+        Ok(())
+    }
+
+    pub fn cancel_interface(&mut self) {
+        if let Some(cancel) = self.interface_cancel.take() {
+            let _ = cancel.send(());
+            self.append_interface_event_entry(InterfaceEventEntry {
+                timestamp: None,
+                kind: "status".into(),
+                message: "Cancellation requested...".to_string(),
+                severity: SimulatorEventSeverity::Warning,
+            });
+            self.set_status("Stopping interface...", StatusKind::Info);
+        }
+    }
+
+    pub fn start_interface_agent_browser(&mut self) {
+        if self.interface_running {
+            self.set_status(
+                "Stop the interface before changing the agent path.",
+                StatusKind::Warning,
+            );
+            return;
+        }
+        
+        let extensions = match self.interface_config.agent_type {
+            AgentType::StableBaselines3 => vec!["zip".into()],
+            AgentType::Rllib => Vec::new(), // Directories for RLlib
+        };
+        
+        let kind = if self.interface_config.agent_type == AgentType::Rllib {
+            FileBrowserKind::Directory {
+                allow_create: false,
+                require_checkpoints: true,
+            }
+        } else {
+            FileBrowserKind::ExistingFile { extensions }
+        };
+        
+        self.start_file_browser(FileBrowserTarget::InterfaceAgentPath, kind, None);
+    }
+
+    pub fn toggle_interface_agent_type(&mut self) {
+        if self.interface_running {
+            self.set_status(
+                "Stop the interface before changing the agent type.",
+                StatusKind::Warning,
+            );
+            return;
+        }
+        self.interface_config.agent_type.toggle();
+        self.set_status(
+            format!("Agent type: {}", self.interface_config.agent_type.label()),
+            StatusKind::Info,
+        );
+    }
+
+    pub fn toggle_interface_mode(&mut self) {
+        if self.interface_running {
+            self.set_status(
+                "Stop the interface before changing mode.",
+                StatusKind::Warning,
+            );
+            return;
+        }
+        self.interface_config.mode.toggle();
+        self.set_status(
+            format!("Interface mode: {}", self.interface_config.mode.label()),
+            StatusKind::Info,
+        );
+    }
+
+    pub fn toggle_interface_window(&mut self) {
+        if self.interface_running {
+            self.set_status(
+                "Stop the interface before changing window settings.",
+                StatusKind::Warning,
+            );
+            return;
+        }
+        self.interface_config.show_window = !self.interface_config.show_window;
+        let state = if self.interface_config.show_window {
+            "visible"
+        } else {
+            "hidden"
+        };
+        self.set_status(format!("Godot window: {state}"), StatusKind::Info);
+    }
+
+    pub fn toggle_interface_auto_restart(&mut self) {
+        if self.interface_running {
+            self.set_status(
+                "Stop the interface before changing auto-restart.",
+                StatusKind::Warning,
+            );
+            return;
+        }
+        self.interface_config.auto_restart = !self.interface_config.auto_restart;
+        let state = if self.interface_config.auto_restart {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        self.set_status(format!("Auto-restart: {state}"), StatusKind::Info);
+    }
+
+    pub fn toggle_interface_tracebacks(&mut self) {
+        self.interface_config.log_tracebacks = !self.interface_config.log_tracebacks;
+        let state = if self.interface_config.log_tracebacks {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        self.set_status(format!("Tracebacks: {state}"), StatusKind::Info);
+    }
+
+    pub fn adjust_interface_step_delay(&mut self, delta: f64) {
+        if self.interface_running {
+            self.set_status(
+                "Stop the interface before adjusting delays.",
+                StatusKind::Warning,
+            );
+            return;
+        }
+        self.interface_config.step_delay = (self.interface_config.step_delay + delta).max(0.0);
+        self.set_status(
+            format!("Step delay: {:.2}s", self.interface_config.step_delay),
+            StatusKind::Info,
+        );
+    }
+
+    pub fn adjust_interface_restart_delay(&mut self, delta: f64) {
+        if self.interface_running {
+            self.set_status(
+                "Stop the interface before adjusting delays.",
+                StatusKind::Warning,
+            );
+            return;
+        }
+        self.interface_config.restart_delay =
+            (self.interface_config.restart_delay + delta).max(0.0);
+        self.set_status(
+            format!("Restart delay: {:.2}s", self.interface_config.restart_delay),
+            StatusKind::Info,
+        );
+    }
+
+    pub fn cycle_interface_focus(&mut self) {
+        self.interface_focus = match self.interface_focus {
+            InterfaceFocus::Events => InterfaceFocus::Actions,
+            InterfaceFocus::Actions => InterfaceFocus::Events,
+        };
+    }
+
+    pub fn toggle_interface_compact_view(&mut self) {
+        self.interface_compact_view = !self.interface_compact_view;
+        self.interface_compact_user_override = true;
+    }
+
+    pub fn interface_scroll_up(&mut self, amount: usize) {
+        match self.interface_focus {
+            InterfaceFocus::Events => {
+                self.interface_event_scroll = self.interface_event_scroll.saturating_add(amount);
+            }
+            InterfaceFocus::Actions => {
+                self.interface_actions_scroll =
+                    self.interface_actions_scroll.saturating_add(amount);
+            }
+        }
+    }
+
+    pub fn interface_scroll_down(&mut self, amount: usize) {
+        match self.interface_focus {
+            InterfaceFocus::Events => {
+                self.interface_event_scroll = self.interface_event_scroll.saturating_sub(amount);
+            }
+            InterfaceFocus::Actions => {
+                self.interface_actions_scroll =
+                    self.interface_actions_scroll.saturating_sub(amount);
+            }
+        }
+    }
+
+    fn append_interface_event_entry(&mut self, entry: InterfaceEventEntry) {
+        self.interface_status_line = Some(entry.message.clone());
+        self.interface_event_log.push(entry);
+        if self.interface_event_log.len() > SIM_EVENT_BUFFER_LIMIT {
+            let overflow = self.interface_event_log.len() - SIM_EVENT_BUFFER_LIMIT;
+            self.interface_event_log.drain(0..overflow);
+        }
+        if self.controller_settings.auto_scroll_training_log() {
+            self.interface_event_scroll = 0;
+        } else {
+            self.clamp_interface_event_scroll();
+        }
+    }
+
+    fn clamp_interface_event_scroll(&mut self) {
+        if self.interface_event_log.is_empty() {
+            self.interface_event_scroll = 0;
+            return;
+        }
+        let max_offset = self.interface_event_log.len().saturating_sub(1);
+        if self.interface_event_scroll > max_offset {
+            self.interface_event_scroll = max_offset;
+        }
+    }
+
     pub fn start_run_overlay_browser(&mut self) -> Result<()> {
         let project = match self.active_project.as_ref() {
             Some(project) => project,
@@ -5879,6 +6266,8 @@ impl App {
         let mut disconnected = false;
         let mut simulator_events = Vec::new();
         let mut simulator_disconnected = false;
+        let mut interface_events = Vec::new();
+        let mut interface_disconnected = false;
         let mut export_events = Vec::new();
         let mut export_disconnected = false;
 
@@ -5910,6 +6299,23 @@ impl App {
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         simulator_disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(rx) = self.interface_receiver.as_ref() {
+            loop {
+                match rx.try_recv() {
+                    Ok(InterfaceEvent::Finished(code)) => {
+                        interface_events.push(InterfaceEvent::Finished(code));
+                        break;
+                    }
+                    Ok(event) => interface_events.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        interface_disconnected = true;
                         break;
                     }
                 }
@@ -6016,6 +6422,57 @@ impl App {
             }
             if simulator_finished && !simulator_disconnected {
                 self.simulator_status_line = Some("Simulator idle.".to_string());
+            }
+        }
+
+        let mut interface_finished = false;
+        for event in interface_events {
+            match event {
+                InterfaceEvent::Line(line) => self.handle_interface_line(line),
+                InterfaceEvent::Error(message) => {
+                    self.append_interface_event_entry(InterfaceEventEntry {
+                        timestamp: None,
+                        kind: "error".into(),
+                        message: message.clone(),
+                        severity: SimulatorEventSeverity::Error,
+                    });
+                    self.set_status(message, StatusKind::Error);
+                }
+                InterfaceEvent::Finished(code) => {
+                    interface_finished = true;
+                    let message = match code {
+                        Some(0) => "Interface finished cleanly.".to_string(),
+                        Some(code) => format!("Interface exited with code {code}."),
+                        None => "Interface finished.".to_string(),
+                    };
+                    self.append_interface_event_entry(InterfaceEventEntry {
+                        timestamp: None,
+                        kind: "status".into(),
+                        message: message.clone(),
+                        severity: SimulatorEventSeverity::Info,
+                    });
+                    self.set_status(message, StatusKind::Info);
+                }
+            }
+        }
+        if interface_finished || interface_disconnected {
+            self.interface_running = false;
+            self.interface_receiver = None;
+            self.interface_cancel = None;
+            if interface_disconnected {
+                self.append_interface_event_entry(InterfaceEventEntry {
+                    timestamp: None,
+                    kind: "warning".into(),
+                    message: "Interface task disconnected unexpectedly.".to_string(),
+                    severity: SimulatorEventSeverity::Warning,
+                });
+                self.set_status(
+                    "Interface task disconnected unexpectedly.",
+                    StatusKind::Warning,
+                );
+            }
+            if interface_finished && !interface_disconnected {
+                self.interface_status_line = Some("Interface idle.".to_string());
             }
         }
 
@@ -6369,6 +6826,199 @@ impl App {
                 ),
             };
             self.simulator_status_line = Some(summary);
+        }
+    }
+
+    fn handle_interface_line(&mut self, line: String) {
+        if self.try_parse_interface_action(&line) {
+            return;
+        }
+        if self.try_parse_interface_event(&line) {
+            return;
+        }
+        self.append_interface_event_entry(InterfaceEventEntry {
+            timestamp: None,
+            kind: "stdout".into(),
+            message: line,
+            severity: SimulatorEventSeverity::Info,
+        });
+    }
+
+    fn try_parse_interface_event(&mut self, line: &str) -> bool {
+        let payload = match line.strip_prefix(INTERFACE_EVENT_PREFIX) {
+            Some(payload) => payload,
+            None => return false,
+        };
+
+        if let Ok(value) = serde_json::from_str::<Value>(payload) {
+            let timestamp = value.get("timestamp").and_then(|ts| match ts {
+                Value::String(s) => Some(s.clone()),
+                Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            });
+            let kind = value
+                .get("kind")
+                .and_then(|k| k.as_str())
+                .unwrap_or("event")
+                .to_string();
+            let severity = match kind.as_str() {
+                "error" => SimulatorEventSeverity::Error,
+                "warning" => SimulatorEventSeverity::Warning,
+                _ => SimulatorEventSeverity::Info,
+            };
+            let message = value
+                .get("message")
+                .and_then(|msg| msg.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    if kind == "connected" {
+                        let attempt = value
+                            .get("attempt")
+                            .and_then(|a| a.as_u64())
+                            .map(|a| format!("attempt {a}"))
+                            .unwrap_or_else(|| "attempt unknown".to_string());
+                        let mode = value
+                            .get("mode")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("single");
+                        Some(format!("Connected ({attempt}, mode: {mode})"))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| payload.to_string());
+            self.append_interface_event_entry(InterfaceEventEntry {
+                timestamp,
+                kind,
+                message,
+                severity,
+            });
+        }
+        true
+    }
+
+    fn try_parse_interface_action(&mut self, line: &str) -> bool {
+        let payload = match line.strip_prefix(INTERFACE_ACTION_PREFIX) {
+            Some(payload) => payload,
+            None => return false,
+        };
+
+        if let Ok(value) = serde_json::from_str::<Value>(payload) {
+            self.update_interface_actions_from_payload(&value);
+        }
+        true
+    }
+
+    fn update_interface_actions_from_payload(&mut self, value: &Value) {
+        let episode = value.get("episode").and_then(|v| v.as_u64());
+        let step = value.get("step").and_then(|v| v.as_u64());
+        let mode = value
+            .get("mode")
+            .and_then(|m| m.as_str())
+            .map(|m| {
+                if m.eq_ignore_ascii_case("multi") {
+                    SimulatorMode::Multi
+                } else {
+                    SimulatorMode::Single
+                }
+            })
+            .unwrap_or(self.interface_config.mode);
+
+        let mut rows = Vec::new();
+        if let Some(agents) = value.get("agents").and_then(|a| a.as_array()) {
+            for agent in agents {
+                let agent_id = agent
+                    .get("agent")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("agent")
+                    .to_string();
+                let policy = agent
+                    .get("policy")
+                    .and_then(|p| p.as_str())
+                    .map(|p| p.to_string());
+                let observation = agent
+                    .get("observation")
+                    .map(|obs| truncate_display_value(obs, SIM_ACTION_VALUE_MAX_LEN));
+                let action = format_action_value(
+                    agent.get("action").unwrap_or(&Value::Null),
+                    SIM_ACTION_VALUE_MAX_LEN,
+                );
+                let reward = agent.get("reward").and_then(|r| r.as_f64());
+                let terminated = agent
+                    .get("terminated")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let truncated = agent
+                    .get("truncated")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let info = agent
+                    .get("info")
+                    .filter(|info| !info.is_null())
+                    .map(|info| truncate_display_value(info, SIM_INFO_VALUE_MAX_LEN));
+                rows.push(InterfaceAgentRow {
+                    episode,
+                    step,
+                    agent_id,
+                    policy,
+                    observation,
+                    action,
+                    reward,
+                    terminated,
+                    truncated,
+                    info,
+                });
+            }
+        }
+
+        rows.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+        let new_count = rows.len();
+        self.interface_actions.extend(rows);
+        if self.interface_actions.len() > SIM_ACTION_HISTORY_LIMIT {
+            let overflow = self.interface_actions.len() - SIM_ACTION_HISTORY_LIMIT;
+            self.interface_actions.drain(0..overflow);
+        }
+
+        if !self.interface_compact_user_override {
+            if new_count > SIM_ACTION_AUTO_COMPACT_THRESHOLD {
+                self.interface_compact_view = true;
+            } else {
+                self.interface_compact_view = false;
+            }
+        }
+
+        if self.controller_settings.auto_scroll_training_log() {
+            self.interface_actions_scroll = 0;
+        } else {
+            let max_offset = self.interface_actions.len();
+            if self.interface_actions_scroll > max_offset {
+                self.interface_actions_scroll = max_offset;
+            }
+        }
+
+        self.interface_action_meta = Some(InterfaceActionMeta {
+            episode,
+            step,
+            mode,
+            total_agents: new_count,
+        });
+
+        if let Some(meta) = self.interface_action_meta {
+            let summary = match (meta.episode(), meta.step()) {
+                (Some(ep), Some(step)) => format!(
+                    "{} episode {} step {} ({} agents)",
+                    meta.mode().label(),
+                    ep,
+                    step,
+                    meta.total_agents()
+                ),
+                _ => format!(
+                    "{} action update ({} agents)",
+                    meta.mode().label(),
+                    meta.total_agents()
+                ),
+            };
+            self.interface_status_line = Some(summary);
         }
     }
 }
@@ -6961,6 +7611,138 @@ fn spawn_simulator_task(
                     "Failed to wait for process: {error}"
                 )));
                 let _ = tx.send(SimulatorEvent::Finished(None));
+            }
+        }
+    });
+}
+
+fn spawn_interface_task(
+    tx: Sender<InterfaceEvent>,
+    command: String,
+    script_path: PathBuf,
+    args: Vec<String>,
+    workdir: PathBuf,
+    cancel_rx: Receiver<()>,
+) {
+    thread::spawn(move || {
+        if !script_path.exists() {
+            let _ = tx.send(InterfaceEvent::Error(format!(
+                "Script not found: {}",
+                script_path.display()
+            )));
+            let _ = tx.send(InterfaceEvent::Finished(None));
+            return;
+        }
+
+        let mut cmd = Command::new(&command);
+        cmd.arg("-u")
+            .arg(&script_path)
+            .args(&args)
+            .current_dir(&workdir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = tx.send(InterfaceEvent::Error(format!(
+                    "Failed to start interface command: {error}"
+                )));
+                let _ = tx.send(InterfaceEvent::Finished(None));
+                return;
+            }
+        };
+
+        let pid = child.id();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        if let Some(stdout) = stdout {
+            let tx_stdout = tx.clone();
+            thread::spawn(move || {
+                let reader = BufReader::new(stdout);
+                for line in reader.lines().flatten() {
+                    if tx_stdout.send(InterfaceEvent::Line(line)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        if let Some(stderr) = stderr {
+            let tx_stderr = tx.clone();
+            thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().flatten() {
+                    let formatted = format!("! {}", line);
+                    if tx_stderr.send(InterfaceEvent::Line(formatted)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        let mut cancel_requested = false;
+        let mut kill_deadline: Option<Instant> = None;
+
+        let status_result = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {}
+                Err(error) => break Err(error),
+            }
+
+            if !cancel_requested {
+                match cancel_rx.try_recv() {
+                    Ok(_) => {
+                        cancel_requested = true;
+                        kill_deadline = Some(Instant::now() + Duration::from_secs(10));
+                        let _ = tx.send(InterfaceEvent::Line(
+                            "Cancellation requested (sending Ctrl+C)...".into(),
+                        ));
+                        #[cfg(unix)]
+                        {
+                            use nix::sys::signal::{kill, Signal};
+                            use nix::unistd::Pid;
+                            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGINT);
+                        }
+                    }
+                    Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => {}
+                }
+            } else if let Some(deadline) = kill_deadline {
+                if Instant::now() >= deadline {
+                    let _ = tx.send(InterfaceEvent::Line(
+                        "Interface unresponsive; forcing termination...".into(),
+                    ));
+                    if let Err(error) = child.kill() {
+                        let _ = tx.send(InterfaceEvent::Error(format!(
+                            "Failed to terminate interface: {error}"
+                        )));
+                        break Err(error);
+                    } else {
+                        break child.wait();
+                    }
+                }
+            }
+
+            thread::sleep(Duration::from_millis(100));
+        };
+
+        match status_result {
+            Ok(status) => {
+                let code = status.code();
+                let message = match code {
+                    Some(code) => format!("Process exited with code {code}."),
+                    None => "Process terminated by signal.".to_string(),
+                };
+                let _ = tx.send(InterfaceEvent::Line(message));
+                let _ = tx.send(InterfaceEvent::Finished(code));
+            }
+            Err(error) => {
+                let _ = tx.send(InterfaceEvent::Error(format!(
+                    "Failed to wait for process: {error}"
+                )));
+                let _ = tx.send(InterfaceEvent::Finished(None));
             }
         }
     });
