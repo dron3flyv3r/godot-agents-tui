@@ -339,12 +339,9 @@ pub struct InterfaceConfig {
     pub agent_type: AgentType,
     pub agent_path: String,
     pub mode: SimulatorMode,
-    pub env_path: String,
     pub show_window: bool,
     pub step_delay: f64,
     pub restart_delay: f64,
-    pub max_episodes: Option<u32>,
-    pub max_steps: Option<u32>,
     pub auto_restart: bool,
     pub log_tracebacks: bool,
     // RLlib-specific
@@ -360,12 +357,9 @@ impl Default for InterfaceConfig {
             agent_type: AgentType::StableBaselines3,
             agent_path: String::new(),
             mode: SimulatorMode::Single,
-            env_path: String::new(),
             show_window: false,
             step_delay: 0.0,
             restart_delay: 2.0,
-            max_episodes: None,
-            max_steps: None,
             auto_restart: true,
             log_tracebacks: false,
             rllib_checkpoint_number: None,
@@ -2431,6 +2425,7 @@ impl App {
                 "false"
             }
             .to_string(),
+            ExportField::RllibPrefix => self.export_config.rllib_prefix.clone(),
         }
     }
 
@@ -2600,6 +2595,9 @@ impl App {
             ExportField::RllibMultiagent => {
                 bail!("Toggle values cannot be edited as text");
             }
+            ExportField::RllibPrefix => {
+                self.export_config.rllib_prefix = trimmed.to_string();
+            }
         }
         self.persist_export_state()?;
         Ok(())
@@ -2722,6 +2720,14 @@ impl App {
                     true
                 }
             }
+            ExportField::RllibPrefix => {
+                if self.export_config.rllib_prefix == defaults.rllib_prefix {
+                    false
+                } else {
+                    self.export_config.rllib_prefix = defaults.rllib_prefix.clone();
+                    true
+                }
+            }
         };
 
         if changed {
@@ -2754,6 +2760,7 @@ impl App {
                 ExportField::RllibCheckpointPath,
                 ExportField::RllibCheckpointNumber,
                 ExportField::RllibOutputDir,
+                ExportField::RllibPrefix,
                 ExportField::RllibPolicyId,
                 ExportField::RllibOpset,
                 ExportField::RllibIrVersion,
@@ -4382,6 +4389,10 @@ impl App {
             }
             Some(FileBrowserTarget::InterfaceAgentPath) => {
                 let stored_value = self.stringify_for_storage(&path);
+                if self.interface_config.agent_type == AgentType::Rllib {
+                    self.interface_config.rllib_checkpoint_number =
+                        Self::checkpoint_number_from_path(&path);
+                }
                 self.interface_config.agent_path = stored_value;
                 self.set_status("Interface agent updated", StatusKind::Success);
             }
@@ -5534,7 +5545,10 @@ impl App {
 
         // Validate agent path
         if self.interface_config.agent_path.trim().is_empty() {
-            self.set_status("Agent path is required. Use 'p' to select an agent.", StatusKind::Warning);
+            self.set_status(
+                "Agent path is required. Use 'p' to select an agent.",
+                StatusKind::Warning,
+            );
             return Ok(());
         }
 
@@ -5547,15 +5561,6 @@ impl App {
         ];
 
         args.push(format!("--mode={}", self.interface_config.mode.arg()));
-
-        if let Some(path) = self.resolve_existing_path(&self.interface_config.env_path) {
-            args.push(format!("--env-path={}", path.to_string_lossy()));
-        } else if !self.interface_config.env_path.trim().is_empty() {
-            args.push(format!(
-                "--env-path={}",
-                self.interface_config.env_path.trim()
-            ));
-        }
 
         if self.interface_config.show_window {
             args.push("--show-window".to_string());
@@ -5575,18 +5580,6 @@ impl App {
             self.interface_config.restart_delay.max(0.0)
         ));
 
-        if let Some(max_steps) = self.interface_config.max_steps {
-            if max_steps > 0 {
-                args.push(format!("--max-steps={max_steps}"));
-            }
-        }
-
-        if let Some(max_episodes) = self.interface_config.max_episodes {
-            if max_episodes > 0 {
-                args.push(format!("--max-episodes={max_episodes}"));
-            }
-        }
-
         if !self.interface_config.auto_restart {
             args.push("--no-auto-restart".to_string());
         }
@@ -5601,7 +5594,10 @@ impl App {
                 args.push(format!("--checkpoint-number={num}"));
             }
             if !self.interface_config.rllib_policy_id.trim().is_empty() {
-                args.push(format!("--policy={}", self.interface_config.rllib_policy_id));
+                args.push(format!(
+                    "--policy={}",
+                    self.interface_config.rllib_policy_id
+                ));
             }
         }
 
@@ -5669,12 +5665,12 @@ impl App {
             );
             return;
         }
-        
+
         let extensions = match self.interface_config.agent_type {
             AgentType::StableBaselines3 => vec!["zip".into()],
             AgentType::Rllib => Vec::new(), // Directories for RLlib
         };
-        
+
         let kind = if self.interface_config.agent_type == AgentType::Rllib {
             FileBrowserKind::Directory {
                 allow_create: false,
@@ -5683,7 +5679,7 @@ impl App {
         } else {
             FileBrowserKind::ExistingFile { extensions }
         };
-        
+
         self.start_file_browser(FileBrowserTarget::InterfaceAgentPath, kind, None);
     }
 
@@ -5700,6 +5696,47 @@ impl App {
             format!("Agent type: {}", self.interface_config.agent_type.label()),
             StatusKind::Info,
         );
+    }
+
+    pub fn interface_use_export_agent_path(&mut self) {
+        match self.interface_config.agent_type {
+            AgentType::StableBaselines3 => {
+                let sb3_path = self.export_config.sb3_model_path.trim();
+                if sb3_path.is_empty() {
+                    self.set_status(
+                        "SB3 model path is empty in the Export tab.",
+                        StatusKind::Warning,
+                    );
+                    return;
+                }
+                self.interface_config.agent_path = sb3_path.to_string();
+                if !self.export_config.sb3_algo.trim().is_empty() {
+                    self.interface_config.sb3_algo = self.export_config.sb3_algo.clone();
+                }
+                self.set_status(
+                    "Interface agent path synced with SB3 export config.",
+                    StatusKind::Success,
+                );
+            }
+            AgentType::Rllib => {
+                let checkpoint_path = self.export_config.rllib_checkpoint_path.trim();
+                if checkpoint_path.is_empty() {
+                    self.set_status(
+                        "RLlib checkpoint path is empty in the Export tab.",
+                        StatusKind::Warning,
+                    );
+                    return;
+                }
+                self.interface_config.agent_path = checkpoint_path.to_string();
+                self.interface_config.rllib_checkpoint_number =
+                    self.export_config.rllib_checkpoint_number;
+                self.interface_config.rllib_policy_id = self.export_config.rllib_policy_id.clone();
+                self.set_status(
+                    "Interface checkpoint synced with Export config.",
+                    StatusKind::Success,
+                );
+            }
+        }
     }
 
     pub fn toggle_interface_mode(&mut self) {
@@ -6055,6 +6092,10 @@ impl App {
             args.push("--policy".to_string());
             args.push(self.export_config.rllib_policy_id.trim().to_string());
         }
+        if !self.export_config.rllib_prefix.trim().is_empty() {
+            args.push("--prefix".to_string());
+            args.push(self.export_config.rllib_prefix.trim().to_string());
+        }
 
         Ok((script_path, args))
     }
@@ -6155,15 +6196,15 @@ impl App {
         );
     }
 
+    fn checkpoint_number_from_path(path: &Path) -> Option<u32> {
+        let name = path.file_name()?.to_str()?;
+        let suffix = name.strip_prefix("checkpoint_")?;
+        suffix.parse::<u32>().ok()
+    }
+
     fn sync_checkpoint_number_from_path(&mut self, value: &str) {
-        let path = Path::new(value);
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if let Some(suffix) = name.strip_prefix("checkpoint_") {
-                if let Ok(number) = suffix.parse::<u32>() {
-                    self.export_config.rllib_checkpoint_number = Some(number);
-                }
-            }
-        }
+        self.export_config.rllib_checkpoint_number =
+            Self::checkpoint_number_from_path(Path::new(value));
     }
 
     fn resolve_project_path(&self, project: &ProjectInfo, value: &str) -> PathBuf {

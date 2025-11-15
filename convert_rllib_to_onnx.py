@@ -39,6 +39,7 @@ from godot_rl.wrappers.ray_wrapper import RayVectorGodotEnv
 from ray import tune
 from ray.rllib.algorithms.algorithm import Algorithm
 from ray.rllib.env.wrappers.pettingzoo_env import ParallelPettingZooEnv
+from custom_models import register_rllib_models
 
 
 def non_negative_int(value: str) -> int:
@@ -374,6 +375,11 @@ def parse_args() -> argparse.Namespace:
         type=non_negative_int,
         help="Select a specific checkpoint number when providing a directory of checkpoints.",
     )
+    parser.add_argument(
+        "--prefix",
+        type=str,
+        help="Prefix for naming exported ONNX files <prefix>_<policy_id>.onnx. Default is no prefix.",
+    )
     return parser.parse_args()
 
 
@@ -435,14 +441,15 @@ def main():
     # Export settings
     opset_version = args.opset
     target_ir_version = args.ir_version
+    prefix = args.prefix + "_" if args.prefix else ""
 
     # Export each policy
     for policy_id in policy_ids:
         print(f"\nExporting policy: {policy_id}")
         try:
             policy = algo.get_policy(policy_id)
-            export_path = export_dir / f"{policy_id}.onnx"
-            
+            export_path = export_dir / f"{prefix}{policy_id}.onnx"
+
             export_rllib_policy_to_onnx(
                 policy,
                 str(export_path),
@@ -459,4 +466,5 @@ def main():
 
 
 if __name__ == "__main__":
+    register_rllib_models()
     main()

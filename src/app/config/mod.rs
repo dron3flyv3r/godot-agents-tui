@@ -269,6 +269,13 @@ pub enum ExportField {
     RllibOpset,
     RllibIrVersion,
     RllibMultiagent,
+    RllibPrefix,
+}
+
+impl Default for ExportField {
+    fn default() -> Self {
+        Self::RllibPrefix
+    }
 }
 
 impl ExportField {
@@ -288,6 +295,7 @@ impl ExportField {
             ExportField::RllibOpset => "RLlib Opset",
             ExportField::RllibIrVersion => "RLlib IR Version",
             ExportField::RllibMultiagent => "RLlib Multi-agent",
+            ExportField::RllibPrefix => "RLlib Prefix",
         }
     }
 
@@ -326,6 +334,7 @@ pub struct ExportConfig {
     pub rllib_opset: u32,
     pub rllib_ir_version: u32,
     pub rllib_multiagent: bool,
+    pub rllib_prefix: String,
 }
 
 impl Default for ExportConfig {
@@ -345,6 +354,7 @@ impl Default for ExportConfig {
             rllib_opset: 13,
             rllib_ir_version: 9,
             rllib_multiagent: true,
+            rllib_prefix: String::new(),
         }
     }
 }

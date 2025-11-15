@@ -12,8 +12,8 @@ use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    App, ConfigField, FileBrowserEntry, FileBrowserKind, FileBrowserState, InputMode, MetricSample,
-    MetricsFocus, SimulatorFocus, StatusKind, TabId,
+    AgentType, App, ConfigField, FileBrowserEntry, FileBrowserKind, FileBrowserState, InputMode,
+    InterfaceFocus, MetricSample, MetricsFocus, SimulatorFocus, StatusKind, TabId,
 };
 
 use super::utils::alphanumeric_sort_key;
@@ -863,6 +863,411 @@ fn render_simulator_actions(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let table = Table::new(table_rows, widths).header(header).block(block);
 
+    frame.render_widget(table, area);
+}
+
+pub fn render_interface(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let status_height = if area.height >= 18 { 9 } else { 7 };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(status_height), Constraint::Min(4)])
+        .split(area);
+
+    render_interface_status(frame, chunks[0], app);
+
+    let feeds = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(chunks[1]);
+
+    render_interface_events(frame, feeds[0], app);
+    render_interface_actions(frame, feeds[1], app);
+}
+
+fn render_interface_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let config = app.interface_config();
+    let running = app.is_interface_running();
+    let label_style = Style::default().fg(Color::DarkGray);
+    let status_color = if running {
+        Color::LightGreen
+    } else {
+        Color::DarkGray
+    };
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("Status: ", label_style),
+        Span::styled(
+            if running { "Running" } else { "Idle" },
+            Style::default()
+                .fg(status_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  Agent: ", label_style),
+        Span::styled(
+            config.agent_type.label(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  Mode: ", label_style),
+        Span::styled(
+            config.mode.label(),
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  Window: ", label_style),
+        Span::styled(
+            if config.show_window {
+                "Visible"
+            } else {
+                "Headless"
+            },
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::styled("  Auto-Restart: ", label_style),
+        Span::styled(
+            if config.auto_restart { "On" } else { "Off" },
+            Style::default().fg(if config.auto_restart {
+                Color::LightGreen
+            } else {
+                Color::LightRed
+            }),
+        ),
+        Span::styled("  Tracebacks: ", label_style),
+        Span::styled(
+            if config.log_tracebacks {
+                "Verbose"
+            } else {
+                "Hidden"
+            },
+            Style::default().fg(Color::Gray),
+        ),
+    ]));
+
+    let agent_display = if config.agent_path.trim().is_empty() {
+        "<agent path not set>"
+    } else {
+        config.agent_path.trim()
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled("Agent Path: ", label_style),
+        Span::styled(
+            agent_display,
+            Style::default().fg(if config.agent_path.trim().is_empty() {
+                Color::LightRed
+            } else {
+                Color::White
+            }),
+        ),
+    ]));
+
+    match config.agent_type {
+        AgentType::StableBaselines3 => {
+            let algo_display = if config.sb3_algo.trim().is_empty() {
+                "auto"
+            } else {
+                config.sb3_algo.trim()
+            };
+            lines.push(Line::from(vec![
+                Span::styled("SB3 Algo: ", label_style),
+                Span::styled(algo_display, Style::default().fg(Color::White)),
+            ]));
+        }
+        AgentType::Rllib => {
+            let checkpoint = config
+                .rllib_checkpoint_number
+                .map(|n| format!("checkpoint_{n:06}"))
+                .unwrap_or_else(|| "latest".into());
+            lines.push(Line::from(vec![
+                Span::styled("RLlib Policy: ", label_style),
+                Span::styled(
+                    if config.rllib_policy_id.trim().is_empty() {
+                        "<default>"
+                    } else {
+                        config.rllib_policy_id.trim()
+                    },
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled("  Checkpoint: ", label_style),
+                Span::styled(checkpoint, Style::default().fg(Color::White)),
+            ]));
+        }
+    }
+
+    lines.push(Line::from(vec![
+        Span::styled("Step Delay: ", label_style),
+        Span::styled(
+            format!("{:.2}s", config.step_delay),
+            Style::default().fg(Color::Gray),
+        ),
+        Span::styled("  Restart Delay: ", label_style),
+        Span::styled(
+            format!("{:.1}s", config.restart_delay),
+            Style::default().fg(Color::Gray),
+        ),
+        Span::styled("  Focus: ", label_style),
+        Span::styled(
+            match app.interface_focus() {
+                InterfaceFocus::Events => "Events",
+                InterfaceFocus::Actions => "Actions",
+            },
+            Style::default().fg(Color::LightCyan),
+        ),
+    ]));
+
+    lines.push(Line::from(vec![
+        Span::styled("Controls: ", label_style),
+        Span::styled("s", Style::default().fg(Color::Yellow)),
+        Span::styled("tart  ", label_style),
+        Span::styled("c", Style::default().fg(Color::Yellow)),
+        Span::styled("ancel  ", label_style),
+        Span::styled("m", Style::default().fg(Color::Yellow)),
+        Span::styled("ode  ", label_style),
+        Span::styled("w", Style::default().fg(Color::Yellow)),
+        Span::styled("indow  ", label_style),
+        Span::styled("a", Style::default().fg(Color::Yellow)),
+        Span::styled("uto  ", label_style),
+        Span::styled("t", Style::default().fg(Color::Yellow)),
+        Span::styled("ype  ", label_style),
+        Span::styled("T", Style::default().fg(Color::Yellow)),
+        Span::styled("racebacks  ", label_style),
+        Span::styled("p", Style::default().fg(Color::Yellow)),
+        Span::styled("ick  ", label_style),
+        Span::styled("y", Style::default().fg(Color::Yellow)),
+        Span::styled(" sync", label_style),
+    ]));
+
+    lines.push(Line::from(vec![
+        Span::styled("Focus & view: ", label_style),
+        Span::styled("f", Style::default().fg(Color::Yellow)),
+        Span::styled("/Tab switch  ", label_style),
+        Span::styled("v", Style::default().fg(Color::Yellow)),
+        Span::styled(" compact", label_style),
+    ]));
+
+    lines.push(Line::from(vec![
+        Span::styled("Delays: ", label_style),
+        Span::styled("[ / ]", Style::default().fg(Color::Yellow)),
+        Span::styled(" step  ", label_style),
+        Span::styled("- / =", Style::default().fg(Color::Yellow)),
+        Span::styled(" restart", label_style),
+    ]));
+
+    if let Some(latest) = app.interface_status_line() {
+        lines.push(Line::from(vec![
+            Span::styled("Latest: ", label_style),
+            Span::styled(latest, Style::default().fg(Color::White)),
+        ]));
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Interface Overview");
+    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
+    frame.render_widget(paragraph, area);
+}
+
+fn render_interface_events(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let focus = matches!(app.interface_focus(), InterfaceFocus::Events);
+    let border_style = Style::default().fg(focused_border_color(app, focus));
+    let title = if focus { "Events (focus)" } else { "Events" };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(border_style);
+
+    if app.interface_events().is_empty() {
+        let placeholder = Paragraph::new(if app.is_interface_running() {
+            "Awaiting interface output..."
+        } else {
+            "Press 's' to launch the interface."
+        })
+        .block(block)
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(placeholder, area);
+        return;
+    }
+
+    let mut lines = Vec::with_capacity(app.interface_events().len());
+    for entry in app.interface_events() {
+        let timestamp = entry.timestamp.as_deref().unwrap_or("-");
+        let severity_color = match entry.severity {
+            crate::app::SimulatorEventSeverity::Error => Color::LightRed,
+            crate::app::SimulatorEventSeverity::Warning => Color::Yellow,
+            crate::app::SimulatorEventSeverity::Info => Color::White,
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("[{timestamp}] "),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                format!("{:<8}", entry.kind),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(entry.message.clone(), Style::default().fg(severity_color)),
+        ]));
+    }
+
+    let mut paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+
+    let total_lines = app.interface_events().len();
+    let visible_height = area.height.saturating_sub(2).max(1) as usize;
+    let max_offset = total_lines.saturating_sub(visible_height);
+    let offset = app.interface_event_scroll().min(max_offset);
+    let first_line = total_lines.saturating_sub(visible_height + offset) as u16;
+    paragraph = paragraph.scroll((first_line, 0));
+
+    frame.render_widget(paragraph, area);
+}
+
+fn render_interface_actions(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let focus = matches!(app.interface_focus(), InterfaceFocus::Actions);
+    let border_style = Style::default().fg(focused_border_color(app, focus));
+    let rows = app.interface_actions();
+    let meta = app.interface_action_meta();
+
+    if rows.is_empty() {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title("Actions")
+            .border_style(border_style);
+        let placeholder = Paragraph::new(if app.is_interface_running() {
+            "Waiting for agent actions..."
+        } else {
+            "Start the interface to stream actions."
+        })
+        .block(block)
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(placeholder, area);
+        return;
+    }
+
+    let visible_height = area.height.saturating_sub(3).max(1) as usize;
+    let total_rows = rows.len();
+    let max_offset = total_rows.saturating_sub(visible_height);
+    let offset_from_bottom = app.interface_actions_scroll().min(max_offset);
+    let mut visible_rows = Vec::new();
+    let mut idx = total_rows.saturating_sub(visible_height + offset_from_bottom);
+    while idx < total_rows {
+        visible_rows.push(&rows[idx]);
+        idx += 1;
+    }
+    visible_rows.reverse();
+
+    let mut table_rows = Vec::new();
+    for row in visible_rows.iter() {
+        let reward = row
+            .reward
+            .map(|r| format!("{r:.2}"))
+            .unwrap_or_else(|| "-".into());
+        let done = match (row.terminated, row.truncated) {
+            (true, true) => "term+trunc",
+            (true, false) => "term",
+            (false, true) => "trunc",
+            _ => "",
+        };
+
+        let mut cells = Vec::new();
+        let episode_text = row
+            .episode
+            .map(|ep| ep.to_string())
+            .unwrap_or_else(|| "-".into());
+        let step_text = row
+            .step
+            .map(|st| st.to_string())
+            .unwrap_or_else(|| "-".into());
+
+        cells.push(Cell::from(episode_text));
+        cells.push(Cell::from(step_text));
+        cells.push(Cell::from(row.agent_id.clone()));
+        if !app.interface_compact_view() {
+            cells.push(Cell::from(row.policy.clone().unwrap_or_else(|| "-".into())));
+        }
+        if !app.interface_compact_view() {
+            cells.push(Cell::from(
+                row.observation.clone().unwrap_or_else(|| "-".into()),
+            ));
+        }
+        cells.push(Cell::from(row.action.clone()));
+        cells.push(Cell::from(reward));
+        cells.push(Cell::from(done));
+        if !app.interface_compact_view() {
+            cells.push(Cell::from(row.info.clone().unwrap_or_else(|| "".into())));
+        }
+
+        table_rows.push(Row::new(cells).style(Style::default().fg(Color::White)));
+    }
+
+    let header = if app.interface_compact_view() {
+        Row::new(vec!["Ep", "Step", "Agent", "Action", "Reward", "Done"])
+    } else {
+        Row::new(vec![
+            "Ep",
+            "Step",
+            "Agent",
+            "Policy",
+            "Observation",
+            "Action",
+            "Reward",
+            "Done",
+            "Info",
+        ])
+    }
+    .style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let widths: Vec<Constraint> = if app.interface_compact_view() {
+        vec![
+            Constraint::Length(6),
+            Constraint::Length(6),
+            Constraint::Length(14),
+            Constraint::Min(18),
+            Constraint::Length(10),
+            Constraint::Length(10),
+        ]
+    } else {
+        vec![
+            Constraint::Length(6),
+            Constraint::Length(6),
+            Constraint::Length(12),
+            Constraint::Length(12),
+            Constraint::Length(18),
+            Constraint::Min(18),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(18),
+        ]
+    };
+
+    let mut title = String::from(if focus { "Actions (focus)" } else { "Actions" });
+    title.push_str(&format!(
+        " • displaying {} of {} rows",
+        table_rows.len(),
+        rows.len()
+    ));
+    if let Some(meta) = meta {
+        title.push_str(&format!(" • {}", meta.mode().label()));
+        if let (Some(ep), Some(step)) = (meta.episode(), meta.step()) {
+            title.push_str(&format!(" • episode {ep} step {step}"));
+        }
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(border_style);
+    let table = Table::new(table_rows, widths).header(header).block(block);
     frame.render_widget(table, area);
 }
 
@@ -2955,8 +3360,8 @@ fn interface_help_lines() -> Vec<String> {
     vec![
         "s / c          Start or cancel the agent interface".to_string(),
         "m / w / a      Toggle mode, window visibility, auto-restart".to_string(),
-        "t / T          Toggle agent type (SB3 / RLlib), tracebacks".to_string(),
-        "p / y          Pick an agent file or copy the agent path".to_string(),
+        "t / T          Toggle agent type / tracebacks".to_string(),
+        "p / y          Pick agent file or sync path from Export tab".to_string(),
         "f / Tab        Switch focus between Events and Actions panes".to_string(),
         "v              Toggle compact agent table layout".to_string(),
         "[ / ]          Decrease / increase the step delay".to_string(),

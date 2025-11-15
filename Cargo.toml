@@ -12,10 +12,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 unicode-width = "0.1"
 
-[build]
-target-dir = "target" # optional, keep default
-rustflags = ["-C", "target-cpu=native"]
-
 [profile.release]
 opt-level = 3
 lto = "fat"
@@ -25,6 +21,3 @@ incremental = false
 
 [package.metadata]
 # optional metadata if you want to reference it later
-
-[alias]
-build-root = "build --release && cp target/release/${CARGO_PKG_NAME} ."

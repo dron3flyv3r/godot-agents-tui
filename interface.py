@@ -31,6 +31,9 @@ except ImportError as exc:
     )
     print(f"Import error: {exc}", file=sys.stderr)
     sys.exit(1)
+    
+from custom_models import register_rllib_models
+
 
 # Event prefixes for structured output
 EVENT_PREFIX = "@INTERFACE_EVENT "
@@ -99,8 +102,6 @@ class InterfaceSettings:
     seed: int
     step_delay: float
     restart_delay: float
-    max_episodes: Optional[int]
-    max_steps: Optional[int]
     auto_restart: bool
     log_tracebacks: bool
     # RLlib-specific settings
@@ -114,7 +115,6 @@ class InterfaceSettings:
             f"InterfaceSettings(agent_type={self.agent_type}, "
             f"agent_path={self.agent_path}, "
             f"mode={self.mode}, "
-            f"env_path={self.env_config.get('env_path')}, "
             f"show_window={self.show_window})"
         )
 
@@ -174,6 +174,7 @@ class AgentLoader:
             port = index + GodotEnv.DEFAULT_PORT
             seed = index
             if multiagent:
+                env_config["env_path"] = None
                 return ParallelPettingZooEnv(
                     GDRLPettingZooEnv(config=env_config, port=port, seed=seed)
                 )
@@ -230,6 +231,12 @@ class InterfaceRunner:
             "mode": settings.mode,
         })
         
+        # Create environment first
+        self.env = None
+        self._emit_event("status", message="Creating environment...")
+        self.env = self._create_env()
+        self._emit_event("status", message="Environment created successfully")
+        
         # Load agent
         self.agent = None
         self.rllib_policies = None
@@ -256,7 +263,7 @@ class InterfaceRunner:
             )
             # Get policy IDs
             try:
-                self.rllib_policies = list(self.agent.env_runner.policy_map.keys())
+                self.rllib_policies = list(self.agent.env_runner.policy_map.keys()) # type: ignore
             except:
                 try:
                     config_dict = self.agent.config if isinstance(self.agent.config, dict) else {}
@@ -274,21 +281,23 @@ class InterfaceRunner:
         attempt = 0
         while not self._stop_requested:
             attempt += 1
-            env = None
             try:
-                env = self._create_env()
+                # Use the environment created in __init__
+                if self.env is None:
+                    self._emit_event("status", message="Recreating environment after error...")
+                    self.env = self._create_env()
+                
                 self._emit_event(
                     "connected",
                     attempt=attempt,
                     mode=self.settings.mode,
-                    env_path=self.settings.env_config.get("env_path"),
                 )
                 if self.settings.mode == "multi":
-                    assert isinstance(env, GDRLPettingZooEnv)
-                    self._run_multi(env)
+                    assert isinstance(self.env, GDRLPettingZooEnv)
+                    self._run_multi(self.env)
                 else:
-                    assert isinstance(env, GodotEnv)
-                    self._run_single(env)
+                    assert isinstance(self.env, GodotEnv)
+                    self._run_single(self.env)
             except KeyboardInterrupt:
                 self._emit_event("status", message="Interrupted by user, shutting down.")
                 self._stop_requested = True
@@ -300,16 +309,24 @@ class InterfaceRunner:
                         "Is the environment running and reachable?"
                     ),
                 )
+                # Close and recreate environment on timeout
+                if self.env is not None:
+                    try:
+                        self.env.close()
+                    except Exception:
+                        pass
+                    self.env = None
                 continue
             except Exception as exc:
                 traceback.print_exc()
                 self._emit_error(exc)
-            finally:
-                if env is not None:
+                # Close and recreate environment on error
+                if self.env is not None:
                     try:
-                        env.close()
+                        self.env.close()
                     except Exception:
                         pass
+                    self.env = None
 
             if self._stop_requested or not self.settings.auto_restart:
                 break
@@ -322,6 +339,13 @@ class InterfaceRunner:
                 ),
             )
             self._sleep(self.settings.restart_delay)
+        
+        # Clean up environment on exit
+        if self.env is not None:
+            try:
+                self.env.close()
+            except Exception:
+                pass
 
     def _handle_signal(self, signum: int, _frame: Any) -> None:
         try:
@@ -367,11 +391,14 @@ class InterfaceRunner:
 
     def _create_env(self):
         if self.settings.mode == "multi":
-            return GDRLPettingZooEnv(
+            self.settings.env_config["env_path"] = None
+            env = GDRLPettingZooEnv(
                 config=self.settings.env_config,
                 show_window=self.settings.show_window,
                 seed=self.settings.seed,
             )
+            env.godot_env.port = GodotEnv.DEFAULT_PORT
+            return env
         env_kwargs = dict(self.settings.env_config)
         env_kwargs.pop("show_window", None)
         return GodotEnv(
@@ -381,11 +408,20 @@ class InterfaceRunner:
 
     def _predict_sb3_action(self, observation):
         """Get action from SB3 agent."""
+        if self.agent is None:
+            raise RuntimeError("SB3 agent not loaded")
+        
         action, _ = self.agent.predict(observation, deterministic=True)
         return action
 
     def _predict_rllib_action(self, agent_id: str, observation):
         """Get action from RLlib agent for a specific agent."""
+        if self.agent is None:
+            raise RuntimeError("RLlib agent not loaded")
+        
+        if self.rllib_policies is None:
+            raise RuntimeError("RLlib policies not available")
+        
         # Get the policy for this agent
         policy_id = self.settings.rllib_policy_id or self.rllib_policies[0]
         if len(self.rllib_policies) > 1 and agent_id in self.rllib_policies:
@@ -398,8 +434,6 @@ class InterfaceRunner:
     def _run_single(self, env: GodotEnv) -> None:
         episode = 0
         while not self._stop_requested:
-            if self._limit_hit(episode):
-                break
             episode += 1
             self._emit_event("episode_start", mode="single", episode=episode)
             try:
@@ -414,12 +448,6 @@ class InterfaceRunner:
             step = 0
             done = False
             while not done and not self._stop_requested:
-                if self.settings.max_steps and step >= self.settings.max_steps:
-                    self._emit_event(
-                        "status",
-                        message=f"Max steps reached in episode {episode}, resetting.",
-                    )
-                    break
                 step += 1
                 
                 # Get actions from the agent (not random)
@@ -462,19 +490,11 @@ class InterfaceRunner:
         
         episode = 0
         while not self._stop_requested:
-            if self._limit_hit(episode):
-                break
             episode += 1
             self._emit_event("episode_start", mode="multi", episode=episode)
             observations, _ = self._safe_reset_pz(env, self.settings.seed + episode)
             step = 0
             while env.agents and not self._stop_requested:
-                if self.settings.max_steps and step >= self.settings.max_steps:
-                    self._emit_event(
-                        "status",
-                        message=f"Max steps reached in episode {episode}, resetting.",
-                    )
-                    break
                 step += 1
                 
                 # Get actions from the agent (not random)
@@ -533,27 +553,8 @@ class InterfaceRunner:
             return result
         return result, {}
 
-    def _limit_hit(self, episode: int) -> bool:
-        if self.settings.max_episodes and episode >= self.settings.max_episodes:
-            self._emit_event("status", message="Reached max episodes, stopping.")
-            return True
-        return False
-
-
-def _positive_or_none(value: Optional[int]) -> Optional[int]:
-    if value is None or value <= 0:
-        return None
-    return value
-
-
 def _build_settings(args: argparse.Namespace) -> InterfaceSettings:
     env_config: dict[str, Any] = {}
-
-    resolved_env_path: Optional[Path] = None
-    if args.env_path:
-        resolved_env_path = Path(args.env_path)
-
-    env_config["env_path"] = str(resolved_env_path.expanduser()) if resolved_env_path else None
 
     if args.action_repeat is not None:
         env_config["action_repeat"] = args.action_repeat
@@ -567,9 +568,6 @@ def _build_settings(args: argparse.Namespace) -> InterfaceSettings:
     show_window = args.show_window if args.show_window is not None else False
     env_config["show_window"] = show_window
 
-    max_episodes = _positive_or_none(args.max_episodes)
-    max_steps = _positive_or_none(args.max_steps)
-
     return InterfaceSettings(
         agent_type=args.agent_type,
         agent_path=args.agent_path,
@@ -579,8 +577,6 @@ def _build_settings(args: argparse.Namespace) -> InterfaceSettings:
         seed=args.seed,
         step_delay=max(args.step_delay, 0.0),
         restart_delay=max(args.restart_delay, 0.0),
-        max_episodes=max_episodes,
-        max_steps=max_steps,
         auto_restart=not args.no_auto_restart,
         log_tracebacks=args.log_tracebacks,
         rllib_checkpoint_number=args.checkpoint_number,
@@ -602,11 +598,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "agent_path",
         type=str,
         help="Path to the agent (.zip for SB3, checkpoint directory for RLlib).",
-    )
-    parser.add_argument(
-        "--env-path",
-        type=str,
-        help="Path to the exported Godot environment (leave empty for editor API mode).",
     )
     parser.add_argument(
         "--mode",
@@ -647,16 +638,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Delay before reconnecting after an error or env shutdown.",
     )
     parser.add_argument(
-        "--max-episodes",
-        type=int,
-        help="Stop after this many episodes (<=0 means unlimited).",
-    )
-    parser.add_argument(
-        "--max-steps",
-        type=int,
-        help="Stop or reset an episode after this many steps (<=0 means unlimited).",
-    )
-    parser.add_argument(
         "--no-auto-restart",
         action="store_true",
         help="Exit immediately if the env exits or errors instead of reconnecting.",
@@ -691,6 +672,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    register_rllib_models()
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
     settings = _build_settings(args)

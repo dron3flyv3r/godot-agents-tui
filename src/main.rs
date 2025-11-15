@@ -73,8 +73,9 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
         KeyCode::Char('2') => app.activate(TabId::Train),
         KeyCode::Char('3') => app.activate(TabId::Metrics),
         KeyCode::Char('4') => app.activate(TabId::Simulator),
-        KeyCode::Char('5') => app.activate(TabId::Export),
-        KeyCode::Char('6') => app.activate(TabId::Settings),
+        KeyCode::Char('5') => app.activate(TabId::Interface),
+        KeyCode::Char('6') => app.activate(TabId::Export),
+        KeyCode::Char('7') => app.activate(TabId::Settings),
         KeyCode::Home => app.activate(TabId::Home),
         KeyCode::End => app.activate(TabId::Settings),
         _ => {}
@@ -256,6 +257,35 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
             }
             KeyCode::PageUp => app.simulator_scroll_up(10),
             KeyCode::PageDown => app.simulator_scroll_down(10),
+            _ => {}
+        }
+    } else if app.active_tab().id == TabId::Interface {
+        match key {
+            KeyCode::Char('s') | KeyCode::Char('S') => app.start_interface()?,
+            KeyCode::Char('c') | KeyCode::Char('C') => app.cancel_interface(),
+            KeyCode::Char('m') | KeyCode::Char('M') => app.toggle_interface_mode(),
+            KeyCode::Char('w') | KeyCode::Char('W') => app.toggle_interface_window(),
+            KeyCode::Char('a') | KeyCode::Char('A') => app.toggle_interface_auto_restart(),
+            KeyCode::Char('t') => app.toggle_interface_agent_type(),
+            KeyCode::Char('T') => app.toggle_interface_tracebacks(),
+            KeyCode::Char('p') | KeyCode::Char('P') => app.start_interface_agent_browser(),
+            KeyCode::Char('y') | KeyCode::Char('Y') => app.interface_use_export_agent_path(),
+            KeyCode::Char('f') | KeyCode::Char('F') | KeyCode::Tab => {
+                app.cycle_interface_focus();
+            }
+            KeyCode::Char('v') | KeyCode::Char('V') => app.toggle_interface_compact_view(),
+            KeyCode::Char('[') => app.adjust_interface_step_delay(-0.05),
+            KeyCode::Char(']') => app.adjust_interface_step_delay(0.05),
+            KeyCode::Char('-') => app.adjust_interface_restart_delay(-0.5),
+            KeyCode::Char('=') => app.adjust_interface_restart_delay(0.5),
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
+                app.interface_scroll_up(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+                app.interface_scroll_down(1);
+            }
+            KeyCode::PageUp => app.interface_scroll_up(10),
+            KeyCode::PageDown => app.interface_scroll_down(10),
             _ => {}
         }
     } else if app.active_tab().id == TabId::Export {
