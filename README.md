@@ -195,7 +195,7 @@ Configure and execute training runs.
    - Best for: Simple environments, single agent scenarios
    - Algorithm: PPO (Proximal Policy Optimization)
    - Output: Model saved to `logs/sb3/`
-
+ 
 2. **Multi-Agent (RLlib)**:
    - Best for: Complex environments, multiple agents
    - Algorithm: PPO with multi-agent support
