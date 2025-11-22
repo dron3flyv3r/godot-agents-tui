@@ -1,0 +1,15 @@
+[project]
+name = "agents"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "godot-rl",
+    "onnx==1.16.1",
+    "pettingzoo>=1.24.3",
+    "ray[rllib]<=2.38.0",
+]
+
+[tool.uv.sources]
+godot-rl = { url = "https://github.com/edbeeching/godot_rl_agents/archive/refs/heads/main.zip" }

@@ -77,10 +77,34 @@ class LstmBody(FeatureBody):
         )
         self.output_dim = hidden_size
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
-        seq = x.unsqueeze(1)
-        out, _ = self.lstm(seq)
-        return out[:, -1, :]
+    def _as_sequence(self, x: torch.Tensor) -> torch.Tensor:
+        """Ensure input is shaped [B, T, F] for the LSTM."""
+
+        if x.dim() == 2:
+            return x.unsqueeze(1)
+        if x.dim() == 3:
+            return x
+        # Fallback: flatten everything but the batch dim, keep a single time step.
+        return torch.flatten(x, start_dim=1).unsqueeze(1)
+
+    def forward(
+        self, x: torch.Tensor, state: tuple[torch.Tensor, torch.Tensor] | None = None
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:  # type: ignore[override]
+        seq = self._as_sequence(x)
+        out, new_state = self.lstm(seq, state)
+        features = out[:, -1, :]
+        if state is None:
+            return features
+        return features, new_state
+
+    def forward_with_state(
+        self, x: torch.Tensor, state: tuple[torch.Tensor, torch.Tensor] | None
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Run the LSTM and return the full sequence plus new hidden state."""
+
+        seq = self._as_sequence(x)
+        out, new_state = self.lstm(seq, state)
+        return out, new_state
 
 
 class GrnBody(FeatureBody):

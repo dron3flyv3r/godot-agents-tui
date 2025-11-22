@@ -15,6 +15,13 @@ pub enum PolicyType {
     Grn,
 }
 
+pub const POLICY_TYPE_LIST: [PolicyType; 4] = [
+    PolicyType::Mlp,
+    PolicyType::Cnn,
+    PolicyType::Lstm,
+    PolicyType::Grn,
+];
+
 impl Default for PolicyType {
     fn default() -> Self {
         PolicyType::Mlp
@@ -22,12 +29,38 @@ impl Default for PolicyType {
 }
 
 impl PolicyType {
+    pub fn label(self) -> &'static str {
+        match self {
+            PolicyType::Mlp => "MLP",
+            PolicyType::Cnn => "CNN",
+            PolicyType::Lstm => "LSTM",
+            PolicyType::Grn => "GRN",
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             PolicyType::Mlp => "mlp",
             PolicyType::Cnn => "cnn",
             PolicyType::Lstm => "lstm",
             PolicyType::Grn => "grn",
+        }
+    }
+
+    pub fn summary(self) -> &'static str {
+        match self {
+            PolicyType::Mlp => {
+                "Fully connected network for low-dimensional state vectors; fast but lacks spatial inductive biases."
+            }
+            PolicyType::Cnn => {
+                "1-D convolutional stack better suited for grid/temporal observations; higher capacity than an MLP."
+            }
+            PolicyType::Lstm => {
+                "Recurrent LSTM backbone that remembers previous observations; ideal for partial observability at higher compute cost."
+            }
+            PolicyType::Grn => {
+                "Gated residual network mixing linear context with nonlinear gating; useful when features benefit from adaptive blending."
+            }
         }
     }
 
@@ -41,6 +74,80 @@ impl PolicyType {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RllibAlgorithm {
+    Ppo,
+    Dqn,
+    Sac,
+    Appo,
+    Impala,
+}
+
+pub const RLLIB_ALGORITHM_LIST: [RllibAlgorithm; 5] = [
+    RllibAlgorithm::Ppo,
+    RllibAlgorithm::Dqn,
+    RllibAlgorithm::Sac,
+    RllibAlgorithm::Appo,
+    RllibAlgorithm::Impala,
+];
+
+impl Default for RllibAlgorithm {
+    fn default() -> Self {
+        Self::Ppo
+    }
+}
+
+impl RllibAlgorithm {
+    pub fn trainer_name(self) -> &'static str {
+        match self {
+            Self::Ppo => "PPO",
+            Self::Dqn => "DQN",
+            Self::Sac => "SAC",
+            Self::Appo => "APPO",
+            Self::Impala => "IMPALA",
+        }
+    }
+
+    pub fn summary(self) -> &'static str {
+        match self {
+            Self::Ppo => "Balanced on-policy baseline for both discrete and continuous actions; slower to adapt than off-policy methods when data is scarce.",
+            Self::Dqn => "Value-based off-policy learner for discrete actions only; excellent with small action spaces but unusable for continuous control.",
+            Self::Sac => "Off-policy actor-critic tuned for continuous control and noisy rewards; can handle discrete branches but shines with continuous vectors.",
+            Self::Appo => "High-throughput PPO variant that scales to many workers for either action type; still inherits PPO's on-policy sample-efficiency limits.",
+            Self::Impala => "Distributed importance-sampling trainer targeting massive discrete-action workloads; great for parallel simulations but incompatible with continuous actions.",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ppo => "ppo",
+            Self::Dqn => "dqn",
+            Self::Sac => "sac",
+            Self::Appo => "appo",
+            Self::Impala => "impala",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value.trim().to_lowercase().as_str() {
+            "ppo" => Some(Self::Ppo),
+            "dqn" => Some(Self::Dqn),
+            "sac" => Some(Self::Sac),
+            "appo" => Some(Self::Appo),
+            "impala" => Some(Self::Impala),
+            _ => None,
+        }
+    }
+}
+
+const RLLIB_ALGO_DESCRIPTION: &str = "Select which RLlib trainer to run.\n\
+- PPO: Stable on-policy baseline for both discrete and continuous actions; slower than off-policy methods when data is scarce.\n\
+- DQN: Value-based off-policy learner for discrete actions only; great when the action space is small, unusable for continuous control.\n\
+- SAC: Off-policy actor-critic that shines on continuous control and noisy rewards; heavier compute cost and can be finicky on tiny discrete tasks.\n\
+- APPO: High-throughput PPO variant that supports both action types; good for scaling across many CPUs but still has on-policy sample efficiency limits.\n\
+- IMPALA: Distributed importance-sampling trainer for large discrete problems; excellent for many parallel actors, cannot operate on continuous actions.";
 
 pub const TRAINING_CONFIG_FILENAME: &str = "training_config.json";
 pub const EXPORT_CONFIG_FILENAME: &str = "export_config.json";
@@ -92,6 +199,7 @@ pub struct TrainingConfig {
     pub sb3_max_grad_norm: f64,
     pub rllib_config_file: String,
     pub rllib_show_window: bool,
+    pub rllib_algorithm: RllibAlgorithm,
     pub rllib_num_workers: u32,
     pub rllib_num_envs_per_worker: u32,
     pub rllib_train_batch_size: u32,
@@ -108,11 +216,16 @@ pub struct TrainingConfig {
     pub rllib_activation: String,
     pub rllib_batch_mode: String,
     pub rllib_rollout_fragment_length: u32,
+    pub rllib_env_action_repeat: u32,
+    pub rllib_env_speedup: u32,
+    pub rllib_num_gpus: f64,
+    pub rllib_max_seq_len: u32,
     pub rllib_fcnet_hiddens: Vec<usize>,
     pub rllib_policy_type: PolicyType,
     pub rllib_cnn_channels: Vec<usize>,
     pub rllib_lstm_cell_size: usize,
     pub rllib_lstm_num_layers: usize,
+    pub rllib_lstm_include_prev_actions: bool,
     pub rllib_grn_hidden_size: usize,
     pub rllib_checkpoint_frequency: u32,
     pub rllib_resume_from: String,
@@ -147,6 +260,7 @@ impl Default for TrainingConfig {
             sb3_max_grad_norm: 0.5,
             rllib_config_file: default_rllib_config_file(),
             rllib_show_window: true,
+            rllib_algorithm: RllibAlgorithm::Ppo,
             rllib_num_workers: 4,
             rllib_num_envs_per_worker: 1,
             rllib_train_batch_size: 4000,
@@ -163,11 +277,16 @@ impl Default for TrainingConfig {
             rllib_activation: "relu".to_string(),
             rllib_batch_mode: "truncate_episodes".to_string(),
             rllib_rollout_fragment_length: 200,
+            rllib_env_action_repeat: 2,
+            rllib_env_speedup: 30,
+            rllib_num_gpus: 0.0,
+            rllib_max_seq_len: 20,
             rllib_fcnet_hiddens: vec![64, 64],
             rllib_policy_type: PolicyType::Mlp,
             rllib_cnn_channels: vec![32, 64, 64],
             rllib_lstm_cell_size: 64,
             rllib_lstm_num_layers: 1,
+            rllib_lstm_include_prev_actions: true,
             rllib_grn_hidden_size: 64,
             rllib_checkpoint_frequency: 20,
             rllib_resume_from: String::new(),
@@ -203,6 +322,9 @@ pub enum ConfigField {
     Sb3MaxGradNorm,
     RllibConfigFile,
     RllibShowWindow,
+    RllibAlgorithm,
+    RllibEnvActionRepeat,
+    RllibEnvSpeedup,
     RllibNumWorkers,
     RllibNumEnvWorkers,
     RllibTrainBatchSize,
@@ -219,11 +341,14 @@ pub enum ConfigField {
     RllibActivation,
     RllibBatchMode,
     RllibRolloutFragmentLength,
+    RllibNumGpus,
+    RllibMaxSeqLen,
     RllibFcnetHiddens,
     RllibPolicyType,
     RllibCnnChannels,
     RllibLstmCellSize,
     RllibLstmNumLayers,
+    RllibLstmIncludePrevActions,
     RllibGrnHiddenSize,
     RllibCheckpointFrequency,
     RllibResumeFrom,
@@ -401,6 +526,9 @@ impl ConfigField {
             ConfigField::Sb3MaxGradNorm => "SB3 Max Grad Norm",
             ConfigField::RllibConfigFile => "RLlib Config File",
             ConfigField::RllibShowWindow => "RLlib Show Window",
+            ConfigField::RllibAlgorithm => "RLlib Algorithm",
+            ConfigField::RllibEnvActionRepeat => "RLlib Action Repeat",
+            ConfigField::RllibEnvSpeedup => "RLlib Speedup",
             ConfigField::RllibNumWorkers => "RLlib Workers",
             ConfigField::RllibNumEnvWorkers => "RLlib Envs/Worker",
             ConfigField::RllibTrainBatchSize => "RLlib Train Batch",
@@ -417,11 +545,14 @@ impl ConfigField {
             ConfigField::RllibActivation => "RLlib Activation",
             ConfigField::RllibBatchMode => "RLlib Batch Mode",
             ConfigField::RllibRolloutFragmentLength => "RLlib Rollout Fragment",
+            ConfigField::RllibNumGpus => "RLlib GPUs",
+            ConfigField::RllibMaxSeqLen => "RLlib Max Seq Len",
             ConfigField::RllibFcnetHiddens => "RLlib FC Layers",
             ConfigField::RllibPolicyType => "RLlib Policy Type",
             ConfigField::RllibCnnChannels => "RLlib CNN Channels",
             ConfigField::RllibLstmCellSize => "RLlib LSTM Hidden Size",
             ConfigField::RllibLstmNumLayers => "RLlib LSTM Layers",
+            ConfigField::RllibLstmIncludePrevActions => "RLlib LSTM Prev Actions",
             ConfigField::RllibGrnHiddenSize => "RLlib GRN Hidden Size",
             ConfigField::RllibCheckpointFrequency => "RLlib Checkpoint Frequency",
             ConfigField::RllibResumeFrom => "RLlib Resume Directory",
@@ -479,6 +610,13 @@ impl ConfigField {
             ConfigField::RllibShowWindow => {
                 "Show the Godot window during RLlib training when enabled."
             }
+            ConfigField::RllibAlgorithm => RLLIB_ALGO_DESCRIPTION,
+            ConfigField::RllibEnvActionRepeat => {
+                "Number of times each action is repeated by the RLlib Godot environment."
+            }
+            ConfigField::RllibEnvSpeedup => {
+                "Simulation speed multiplier applied while RLlib is running."
+            }
             ConfigField::RllibNumWorkers => "Number of RLlib rollout workers to spawn.",
             ConfigField::RllibNumEnvWorkers => "Environments created per RLlib worker.",
             ConfigField::RllibTrainBatchSize => {
@@ -505,6 +643,10 @@ impl ConfigField {
             ConfigField::RllibRolloutFragmentLength => {
                 "Steps per rollout fragment collected by each RLlib worker."
             }
+            ConfigField::RllibNumGpus => "Number of GPUs (can be fractional) reserved by RLlib.",
+            ConfigField::RllibMaxSeqLen => {
+                "Unroll length for RLlib RNNs (padding/truncation per sequence)."
+            }
             ConfigField::RllibFcnetHiddens => {
                 "Comma-separated hidden layer sizes for RLlib's fully connected net."
             }
@@ -517,6 +659,9 @@ impl ConfigField {
             ConfigField::RllibLstmCellSize => "Hidden size of the RLlib LSTM backbone.",
             ConfigField::RllibLstmNumLayers => {
                 "Number of stacked layers inside the RLlib LSTM backbone."
+            }
+            ConfigField::RllibLstmIncludePrevActions => {
+                "When enabled, feed the previous action vector into the RLlib LSTM."
             }
             ConfigField::RllibGrnHiddenSize => "Hidden size applied by the RLlib GRN backbone.",
             ConfigField::RllibCheckpointFrequency => {

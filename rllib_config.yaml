@@ -1,4 +1,4 @@
-algorithm: PPO
+algorithm: SAC
 
 # Multi-agent-env setting:
 # If true:
@@ -10,7 +10,7 @@ algorithm: PPO
 # Set to false if you have a single policy name for all agents set in AIControllers
 env_is_multiagent: true
 
-checkpoint_frequency: 20
+checkpoint_frequency: 20000
 
 # You can set one or more stopping criteria
 stop:
@@ -25,7 +25,7 @@ config:
       env_path: '/home/kasper/GameProjects/better-pong-rl/exports/Better_Pong_RL.x86_64' # Set your env path here (exported executable from Godot) - e.g. env_path: 'env_path.exe' on Windows
       action_repeat: 2 # Doesn't need to be set here, you can set this in sync node in Godot editor as well
       show_window: true # Displays game window while training. Might be faster when false in some cases, turning off also reduces GPU usage if you don't need rendering.
-      speedup: 30 # Speeds up Godot physics
+      speedup: 8 # Speeds up Godot physics
 
     framework: torch # ONNX models exported with torch are compatible with the current Godot RL Agents Plugin
 
@@ -52,11 +52,12 @@ config:
     num_sgd_iter: 30
     batch_mode: truncate_episodes
 
-    num_gpus: 0
+    num_gpus: 1
     model:
         vf_share_layers: False
+        max_seq_len: 20
         custom_model: tui_lstm
         custom_model_config:
-            hidden_size: 32
+            hidden_size: 64
             num_layers: 1
-            fcnet_hiddens: [32, 32]
+            fcnet_hiddens: [64, 64]

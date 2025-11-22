@@ -12,8 +12,9 @@ use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    AgentType, App, ConfigField, FileBrowserEntry, FileBrowserKind, FileBrowserState, InputMode,
-    InterfaceFocus, MetricSample, MetricsFocus, SimulatorFocus, StatusKind, TabId,
+    config::RLLIB_ALGORITHM_LIST, AgentType, App, ConfigField, FileBrowserEntry, FileBrowserKind,
+    FileBrowserState, InputMode, InterfaceFocus, MetricSample, MetricsFocus, SimulatorFocus,
+    StatusKind, TabId,
 };
 
 use super::utils::alphanumeric_sort_key;
@@ -233,6 +234,12 @@ fn render_home_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             lines.push(Line::from(spans));
             lines.push(Line::from(Span::styled(
                 "Enter to confirm • Esc to cancel",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        InputMode::SelectingConfigOption => {
+            lines.push(Line::from(Span::styled(
+                "Select an option from the menu...",
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -3763,6 +3770,7 @@ pub fn render_advanced_config(frame: &mut Frame<'_>, app: &App) {
         .borders(Borders::ALL)
         .title(" Field Description ");
     let description_lines = match app.selected_advanced_field() {
+        Some(ConfigField::RllibAlgorithm) => algorithm_description_lines(app),
         Some(field) => vec![
             Line::from(Span::styled(
                 field.label(),
@@ -3835,4 +3843,176 @@ pub fn render_advanced_config(frame: &mut Frame<'_>, app: &App) {
         .alignment(Alignment::Center)
         .wrap(Wrap { trim: true });
     frame.render_widget(footer, layout[3]);
+}
+
+pub fn render_choice_menu(frame: &mut Frame<'_>, app: &App) {
+    let Some(menu) = app.choice_menu() else {
+        return;
+    };
+    let field_label = menu.field.label();
+
+    let area = frame.area();
+    let vertical_margin = area.height / 8;
+    let horizontal_margin = area.width / 10;
+    let overlay_area = Rect {
+        x: horizontal_margin,
+        y: vertical_margin,
+        width: area.width.saturating_sub(horizontal_margin * 2),
+        height: area.height.saturating_sub(vertical_margin * 2),
+    };
+
+    frame.render_widget(Clear, overlay_area);
+
+    let outer_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(5),
+            Constraint::Length(3),
+        ])
+        .split(overlay_area);
+
+    let header_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Choose Configuration Option ")
+        .title_alignment(Alignment::Center)
+        .border_style(Style::default().fg(Color::Cyan));
+    let header_lines = vec![
+        Line::from(Span::styled(
+            format!("Select {}", field_label),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "Use ↑/↓ to browse options. Enter to confirm, Esc to cancel.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    let header = Paragraph::new(header_lines)
+        .block(header_block)
+        .alignment(Alignment::Center);
+    frame.render_widget(header, outer_layout[0]);
+
+    let body_split = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(outer_layout[1]);
+
+    let list_items: Vec<ListItem> = menu
+        .options
+        .iter()
+        .map(|choice| {
+            let spans = vec![
+                Span::styled(
+                    choice.label.as_str(),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  ({})", choice.value),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ];
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let list = List::new(list_items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Options ")
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("› ");
+    let mut list_state = ListState::default();
+    list_state.select(Some(menu.selected));
+    frame.render_stateful_widget(list, body_split[0], &mut list_state);
+
+    let description_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Description ");
+    let description_text = menu
+        .options
+        .get(menu.selected)
+        .map(|choice| choice.description.as_str())
+        .unwrap_or("Select an option to view details.");
+    let description_lines = vec![
+        Line::from(Span::styled(
+            menu.options
+                .get(menu.selected)
+                .map(|choice| choice.label.as_str())
+                .unwrap_or("No selection"),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::raw("")),
+        Line::from(Span::styled(
+            description_text,
+            Style::default().fg(Color::White),
+        )),
+    ];
+    let description = Paragraph::new(description_lines)
+        .block(description_block)
+        .wrap(Wrap { trim: true })
+        .alignment(Alignment::Left);
+    frame.render_widget(description, body_split[1]);
+
+    let footer_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Instructions ")
+        .title_alignment(Alignment::Center);
+    let footer = Paragraph::new(vec![Line::from(Span::styled(
+        "↑/↓: Navigate • Enter: Select • Esc: Cancel",
+        Style::default().fg(Color::DarkGray),
+    ))])
+    .block(footer_block)
+    .alignment(Alignment::Center);
+    frame.render_widget(footer, outer_layout[2]);
+}
+
+fn algorithm_description_lines(app: &App) -> Vec<Line<'static>> {
+    let config = app.training_config();
+    let current = config.rllib_algorithm;
+    let available = RLLIB_ALGORITHM_LIST
+        .iter()
+        .map(|algo| algo.trainer_name())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    vec![
+        Line::from(Span::styled(
+            "RLlib Algorithm",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::raw("")),
+        Line::from(vec![
+            Span::styled(
+                "Algorithms available: ",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+            Span::styled(available, Style::default().fg(Color::White)),
+        ]),
+        Line::from(Span::raw("")),
+        Line::from(vec![
+            Span::styled(
+                format!("{}: ", current.trainer_name()),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(current.summary(), Style::default().fg(Color::White)),
+        ]),
+    ]
 }

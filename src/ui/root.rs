@@ -17,6 +17,11 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         return;
     }
 
+    if app.input_mode() == InputMode::SelectingConfigOption {
+        screens::render_choice_menu(frame, app);
+        return;
+    }
+
     if matches!(
         app.input_mode(),
         InputMode::AdvancedConfig | InputMode::EditingAdvancedConfig

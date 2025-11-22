@@ -1,4 +1,5 @@
 mod app;
+mod cli;
 mod domain;
 mod ui;
 
@@ -6,6 +7,8 @@ use std::io::{self, Stdout};
 use std::time::Duration;
 
 use app::{App, ExportFocus, FileBrowserKind, FileBrowserState, InputMode, TabId};
+use clap::Parser;
+use cli::Cli;
 use color_eyre::Result;
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode};
 use crossterm::execute;
@@ -39,6 +42,7 @@ fn handle_key_event(app: &mut App, key: KeyCode) -> Result<()> {
         InputMode::CreatingProject => handle_project_creation_input(app, key)?,
         InputMode::EditingConfig => handle_config_edit_input(app, key)?,
         InputMode::EditingAdvancedConfig => handle_config_edit_input(app, key)?,
+        InputMode::SelectingConfigOption => handle_choice_menu_input(app, key)?,
         InputMode::AdvancedConfig => handle_advanced_config_input(app, key)?,
         InputMode::BrowsingFiles => handle_file_browser_input(app, key)?,
         InputMode::Help => handle_help_input(app, key)?,
@@ -57,6 +61,19 @@ fn handle_project_creation_input(app: &mut App, key: KeyCode) -> Result<()> {
         KeyCode::Esc => app.cancel_project_creation(),
         KeyCode::Backspace => app.pop_project_name_char(),
         KeyCode::Char(ch) => app.push_project_name_char(ch),
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_choice_menu_input(app: &mut App, key: KeyCode) -> Result<()> {
+    match key {
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => app.move_choice_selection(-1),
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => app.move_choice_selection(1),
+        KeyCode::Enter => {
+            app.confirm_choice_selection()?;
+        }
+        KeyCode::Esc => app.cancel_choice_selection(),
         _ => {}
     }
     Ok(())
@@ -290,7 +307,7 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
         }
     } else if app.active_tab().id == TabId::Export {
         match key {
-            KeyCode::Char('x') | KeyCode::Char('X') => app.start_export()?,
+            KeyCode::Char('x') => app.start_export()?,
             KeyCode::Char('c') | KeyCode::Char('C') => app.cancel_export(),
             KeyCode::Char('m') | KeyCode::Char('M') => {
                 if app.is_export_running() {
@@ -493,5 +510,13 @@ fn run() -> Result<()> {
 
 fn main() -> Result<()> {
     color_eyre::install()?;
-    run()
+
+    let cli = Cli::parse();
+    if cli.command.is_some() {
+        cli::handle_cli(cli)?;
+    } else {
+        run()?;
+    }
+
+    Ok(())
 }

@@ -15,8 +15,8 @@ use color_eyre::{
 
 use super::config::{
     default_rllib_config_file, ConfigField, ExportConfig, ExportField, ExportMode, ExportState,
-    PolicyType, RllibStopMode, TrainingConfig, TrainingMode, EXPORT_CONFIG_FILENAME,
-    TRAINING_CONFIG_FILENAME,
+    PolicyType, RllibAlgorithm, RllibStopMode, TrainingConfig, TrainingMode,
+    EXPORT_CONFIG_FILENAME, POLICY_TYPE_LIST, RLLIB_ALGORITHM_LIST, TRAINING_CONFIG_FILENAME,
 };
 use super::file_browser::{FileBrowserEntry, FileBrowserKind, FileBrowserState, FileBrowserTarget};
 use super::metrics::{ChartData, ChartMetricKind, ChartMetricOption, MetricSample};
@@ -50,6 +50,45 @@ const OVERLAY_COLORS: [Color; 6] = [
     Color::LightBlue,
     Color::LightRed,
     Color::White,
+];
+
+const RLLIB_STOP_MODE_CHOICES: [(&str, &str, &str); 2] = [
+    (
+        "time_seconds",
+        "Time (seconds)",
+        "Ends training once the configured wall-clock seconds have elapsed.",
+    ),
+    (
+        "timesteps",
+        "Environment Timesteps",
+        "Stops when the requested total number of environment timesteps are collected.",
+    ),
+];
+
+const RLLIB_BATCH_MODE_CHOICES: [(&str, &str, &str); 2] = [
+    (
+        "truncate_episodes",
+        "Truncate Episodes",
+        "Splits rollouts into fragments regardless of episode boundaries (default).",
+    ),
+    (
+        "complete_episodes",
+        "Complete Episodes",
+        "Collects full episodes per batch; useful for on-policy algorithms needing trajectories.",
+    ),
+];
+
+const RLLIB_FRAMEWORK_CHOICES: [(&str, &str, &str); 2] = [
+    (
+        "torch",
+        "PyTorch",
+        "Recommended backend with first-class ONNX export support in this toolkit.",
+    ),
+    (
+        "tf",
+        "TensorFlow",
+        "Alternative backend if your project already depends on TensorFlow.",
+    ),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +192,47 @@ pub struct PolicyComparisonData {
 }
 
 impl PolicyComparisonData {}
+
+#[derive(Debug, Clone)]
+pub struct ConfigChoice {
+    pub label: String,
+    pub value: String,
+    pub description: String,
+}
+
+impl ConfigChoice {
+    fn new(
+        label: impl Into<String>,
+        value: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            value: value.into(),
+            description: description.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ChoiceMenuState {
+    field: ConfigField,
+    options: Vec<ConfigChoice>,
+    selected: usize,
+}
+
+impl ChoiceMenuState {
+    fn selected_choice(&self) -> Option<&ConfigChoice> {
+        self.options.get(self.selected)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ChoiceMenuView<'a> {
+    pub field: ConfigField,
+    pub options: &'a [ConfigChoice],
+    pub selected: usize,
+}
 #[derive(Debug, Clone)]
 pub struct ChartOverlaySeries {
     pub label: String,
@@ -166,6 +246,7 @@ pub enum InputMode {
     CreatingProject,
     EditingConfig,
     EditingAdvancedConfig,
+    SelectingConfigOption,
     AdvancedConfig,
     BrowsingFiles,
     Help,
@@ -591,6 +672,7 @@ pub struct App {
     config_edit_buffer: String,
     active_config_field: Option<ConfigField>,
     config_return_mode: Option<InputMode>,
+    choice_menu: Option<ChoiceMenuState>,
     advanced_fields: Vec<ConfigField>,
     advanced_selection: usize,
     file_browser_path: PathBuf,
@@ -732,6 +814,7 @@ impl App {
             config_edit_buffer: String::new(),
             active_config_field: None,
             config_return_mode: None,
+            choice_menu: None,
             advanced_fields: Vec::new(),
             advanced_selection: 0,
             file_browser_path: std::env::current_dir().unwrap_or_default(),
@@ -2040,6 +2123,9 @@ impl App {
     }
 
     pub fn start_config_edit(&mut self, field: ConfigField) {
+        if self.start_choice_menu_if_applicable(field) {
+            return;
+        }
         let origin_mode = self.input_mode;
         self.config_return_mode = Some(origin_mode);
         self.input_mode = match origin_mode {
@@ -2098,6 +2184,135 @@ impl App {
         }
     }
 
+    fn start_choice_menu_if_applicable(&mut self, field: ConfigField) -> bool {
+        let Some(options) = self.build_config_choices(field) else {
+            return false;
+        };
+        if options.is_empty() {
+            return false;
+        }
+        let origin_mode = self.input_mode;
+        self.config_return_mode = Some(origin_mode);
+        self.input_mode = InputMode::SelectingConfigOption;
+        self.active_config_field = Some(field);
+        let current = self.config_field_value(field);
+        let normalized = current.trim().to_lowercase();
+        let mut selected = options
+            .iter()
+            .position(|choice| {
+                choice.value.to_lowercase() == normalized
+                    || choice.label.to_lowercase() == normalized
+            })
+            .unwrap_or(0);
+        if !options.is_empty() && selected >= options.len() {
+            selected = options.len() - 1;
+        }
+        self.choice_menu = Some(ChoiceMenuState {
+            field,
+            options,
+            selected,
+        });
+        true
+    }
+
+    pub fn move_choice_selection(&mut self, delta: isize) {
+        if let Some(menu) = self.choice_menu.as_mut() {
+            if menu.options.is_empty() {
+                return;
+            }
+            let len = menu.options.len() as isize;
+            let mut idx = menu.selected as isize + delta;
+            idx = ((idx % len) + len) % len;
+            menu.selected = idx as usize;
+        }
+    }
+
+    pub fn confirm_choice_selection(&mut self) -> Result<()> {
+        let (field, value) = match self.choice_menu.as_ref().and_then(|menu| {
+            menu.selected_choice()
+                .map(|choice| (menu.field, choice.value.clone()))
+        }) {
+            Some(pair) => pair,
+            None => return Ok(()),
+        };
+
+        match self
+            .set_config_field_value(field, &value)
+            .and_then(|_| self.persist_training_config())
+        {
+            Ok(_) => {
+                self.set_status("Configuration updated", StatusKind::Success);
+                self.exit_choice_menu();
+                self.update_validation_status();
+                Ok(())
+            }
+            Err(error) => {
+                self.set_status(
+                    format!("Failed to update config: {}", error),
+                    StatusKind::Error,
+                );
+                Ok(())
+            }
+        }
+    }
+
+    pub fn cancel_choice_selection(&mut self) {
+        self.exit_choice_menu();
+    }
+
+    fn exit_choice_menu(&mut self) {
+        self.choice_menu = None;
+        self.active_config_field = None;
+        let return_mode = self.config_return_mode.take().unwrap_or(InputMode::Normal);
+        self.input_mode = return_mode;
+        if matches!(
+            return_mode,
+            InputMode::AdvancedConfig | InputMode::EditingAdvancedConfig
+        ) {
+            self.rebuild_advanced_fields();
+        }
+    }
+
+    fn build_config_choices(&self, field: ConfigField) -> Option<Vec<ConfigChoice>> {
+        match field {
+            ConfigField::Sb3PolicyType | ConfigField::RllibPolicyType => Some(
+                POLICY_TYPE_LIST
+                    .iter()
+                    .map(|policy| {
+                        ConfigChoice::new(policy.label(), policy.as_str(), policy.summary())
+                    })
+                    .collect(),
+            ),
+            ConfigField::RllibAlgorithm => Some(
+                RLLIB_ALGORITHM_LIST
+                    .iter()
+                    .map(|algo| {
+                        ConfigChoice::new(algo.trainer_name(), algo.as_str(), algo.summary())
+                    })
+                    .collect(),
+            ),
+            ConfigField::RllibStopMode => Some(
+                RLLIB_STOP_MODE_CHOICES
+                    .iter()
+                    .map(|(value, label, desc)| ConfigChoice::new(*label, *value, *desc))
+                    .collect(),
+            ),
+            ConfigField::RllibBatchMode => Some(
+                RLLIB_BATCH_MODE_CHOICES
+                    .iter()
+                    .map(|(value, label, desc)| ConfigChoice::new(*label, *value, *desc))
+                    .collect(),
+            ),
+            ConfigField::RllibFramework => Some(
+                RLLIB_FRAMEWORK_CHOICES
+                    .iter()
+                    .map(|(value, label, desc)| ConfigChoice::new(*label, *value, *desc))
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
     pub fn active_config_field(&self) -> Option<ConfigField> {
         self.active_config_field
     }
@@ -2132,6 +2347,14 @@ impl App {
 
     pub fn advanced_fields(&self) -> &[ConfigField] {
         &self.advanced_fields
+    }
+
+    pub fn choice_menu(&self) -> Option<ChoiceMenuView<'_>> {
+        self.choice_menu.as_ref().map(|menu| ChoiceMenuView {
+            field: menu.field,
+            options: &menu.options,
+            selected: menu.selected,
+        })
     }
 
     pub fn advanced_selection(&self) -> usize {
@@ -2335,6 +2558,15 @@ impl App {
                 "false"
             }
             .to_string(),
+            ConfigField::RllibAlgorithm => self
+                .training_config
+                .rllib_algorithm
+                .trainer_name()
+                .to_string(),
+            ConfigField::RllibEnvActionRepeat => {
+                self.training_config.rllib_env_action_repeat.to_string()
+            }
+            ConfigField::RllibEnvSpeedup => self.training_config.rllib_env_speedup.to_string(),
             ConfigField::RllibNumWorkers => self.training_config.rllib_num_workers.to_string(),
             ConfigField::RllibNumEnvWorkers => {
                 self.training_config.rllib_num_envs_per_worker.to_string()
@@ -2360,6 +2592,8 @@ impl App {
                 .training_config
                 .rllib_rollout_fragment_length
                 .to_string(),
+            ConfigField::RllibNumGpus => format_f64(self.training_config.rllib_num_gpus),
+            ConfigField::RllibMaxSeqLen => self.training_config.rllib_max_seq_len.to_string(),
             ConfigField::RllibFcnetHiddens => {
                 format_usize_list(&self.training_config.rllib_fcnet_hiddens)
             }
@@ -2372,6 +2606,14 @@ impl App {
             ConfigField::RllibLstmCellSize => self.training_config.rllib_lstm_cell_size.to_string(),
             ConfigField::RllibLstmNumLayers => {
                 self.training_config.rllib_lstm_num_layers.to_string()
+            }
+            ConfigField::RllibLstmIncludePrevActions => {
+                if self.training_config.rllib_lstm_include_prev_actions {
+                    "true"
+                } else {
+                    "false"
+                }
+                .to_string()
             }
             ConfigField::RllibGrnHiddenSize => {
                 self.training_config.rllib_grn_hidden_size.to_string()
@@ -2966,6 +3208,31 @@ impl App {
                     true
                 }
             }
+            ConfigField::RllibAlgorithm => {
+                if self.training_config.rllib_algorithm == defaults.rllib_algorithm {
+                    false
+                } else {
+                    self.training_config.rllib_algorithm = defaults.rllib_algorithm;
+                    true
+                }
+            }
+            ConfigField::RllibEnvActionRepeat => {
+                if self.training_config.rllib_env_action_repeat == defaults.rllib_env_action_repeat
+                {
+                    false
+                } else {
+                    self.training_config.rllib_env_action_repeat = defaults.rllib_env_action_repeat;
+                    true
+                }
+            }
+            ConfigField::RllibEnvSpeedup => {
+                if self.training_config.rllib_env_speedup == defaults.rllib_env_speedup {
+                    false
+                } else {
+                    self.training_config.rllib_env_speedup = defaults.rllib_env_speedup;
+                    true
+                }
+            }
             ConfigField::RllibNumWorkers => {
                 if self.training_config.rllib_num_workers == defaults.rllib_num_workers {
                     false
@@ -3112,6 +3379,24 @@ impl App {
                     true
                 }
             }
+            ConfigField::RllibNumGpus => {
+                if (self.training_config.rllib_num_gpus - defaults.rllib_num_gpus).abs()
+                    < f64::EPSILON
+                {
+                    false
+                } else {
+                    self.training_config.rllib_num_gpus = defaults.rllib_num_gpus;
+                    true
+                }
+            }
+            ConfigField::RllibMaxSeqLen => {
+                if self.training_config.rllib_max_seq_len == defaults.rllib_max_seq_len {
+                    false
+                } else {
+                    self.training_config.rllib_max_seq_len = defaults.rllib_max_seq_len;
+                    true
+                }
+            }
             ConfigField::RllibFcnetHiddens => {
                 if self.training_config.rllib_fcnet_hiddens == defaults.rllib_fcnet_hiddens {
                     false
@@ -3150,6 +3435,17 @@ impl App {
                     false
                 } else {
                     self.training_config.rllib_lstm_num_layers = defaults.rllib_lstm_num_layers;
+                    true
+                }
+            }
+            ConfigField::RllibLstmIncludePrevActions => {
+                if self.training_config.rllib_lstm_include_prev_actions
+                    == defaults.rllib_lstm_include_prev_actions
+                {
+                    false
+                } else {
+                    self.training_config.rllib_lstm_include_prev_actions =
+                        defaults.rllib_lstm_include_prev_actions;
                     true
                 }
             }
@@ -3370,6 +3666,30 @@ impl App {
                 self.training_config.rllib_show_window =
                     matches!(trimmed.to_lowercase().as_str(), "true" | "yes" | "1" | "on");
             }
+            ConfigField::RllibAlgorithm => {
+                let Some(algo) = RllibAlgorithm::from_str(trimmed) else {
+                    bail!("Unknown RLlib algorithm '{trimmed}'");
+                };
+                self.training_config.rllib_algorithm = algo;
+            }
+            ConfigField::RllibEnvActionRepeat => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("Action repeat must be a positive integer")?;
+                if val == 0 {
+                    bail!("Action repeat must be at least 1");
+                }
+                self.training_config.rllib_env_action_repeat = val;
+            }
+            ConfigField::RllibEnvSpeedup => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("Speedup must be a positive integer")?;
+                if val == 0 {
+                    bail!("Speedup must be at least 1");
+                }
+                self.training_config.rllib_env_speedup = val;
+            }
             ConfigField::RllibNumWorkers => {
                 let val: u32 = trimmed
                     .parse()
@@ -3499,6 +3819,24 @@ impl App {
                 }
                 self.training_config.rllib_rollout_fragment_length = val;
             }
+            ConfigField::RllibNumGpus => {
+                let val: f64 = trimmed
+                    .parse()
+                    .wrap_err("Number of GPUs must be a number")?;
+                if val < 0.0 {
+                    bail!("Number of GPUs cannot be negative");
+                }
+                self.training_config.rllib_num_gpus = val;
+            }
+            ConfigField::RllibMaxSeqLen => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("Max sequence length must be a positive integer")?;
+                if val == 0 {
+                    bail!("Max sequence length must be at least 1");
+                }
+                self.training_config.rllib_max_seq_len = val;
+            }
             ConfigField::RllibFcnetHiddens => {
                 let layers = parse_usize_list(trimmed)?;
                 self.training_config.rllib_fcnet_hiddens = layers;
@@ -3533,6 +3871,10 @@ impl App {
                     bail!("Number of layers must be at least 1");
                 }
                 self.training_config.rllib_lstm_num_layers = val;
+            }
+            ConfigField::RllibLstmIncludePrevActions => {
+                self.training_config.rllib_lstm_include_prev_actions =
+                    matches!(trimmed.to_lowercase().as_str(), "true" | "yes" | "1" | "on");
             }
             ConfigField::RllibGrnHiddenSize => {
                 let val: usize = trimmed
@@ -3811,6 +4153,9 @@ impl App {
                     ConfigField::RllibStopTimeSeconds,
                     ConfigField::RllibResumeFrom,
                     ConfigField::RllibShowWindow,
+                    ConfigField::RllibAlgorithm,
+                    ConfigField::RllibEnvActionRepeat,
+                    ConfigField::RllibEnvSpeedup,
                     ConfigField::RllibPolicyType,
                     ConfigField::RllibFcnetHiddens,
                 ];
@@ -3819,11 +4164,14 @@ impl App {
                     PolicyType::Lstm => {
                         fields.push(ConfigField::RllibLstmCellSize);
                         fields.push(ConfigField::RllibLstmNumLayers);
+                        fields.push(ConfigField::RllibMaxSeqLen);
+                        fields.push(ConfigField::RllibLstmIncludePrevActions);
                     }
                     PolicyType::Grn => fields.push(ConfigField::RllibGrnHiddenSize),
                     PolicyType::Mlp => {}
                 }
                 fields.extend_from_slice(&[
+                    ConfigField::RllibNumGpus,
                     ConfigField::RllibNumWorkers,
                     ConfigField::RllibNumEnvWorkers,
                     ConfigField::RllibTrainBatchSize,
@@ -6597,7 +6945,8 @@ impl App {
         if self.try_parse_metric_line(&line) {
             return;
         }
-        self.append_training_line(line);
+        let sanitized = sanitize_console_line(&line);
+        self.append_training_line(sanitized);
     }
 
     fn try_parse_metric_line(&mut self, line: &str) -> bool {
@@ -7062,6 +7411,29 @@ impl App {
             self.interface_status_line = Some(summary);
         }
     }
+}
+
+fn sanitize_console_line(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if matches!(chars.peek(), Some('[')) {
+                chars.next();
+                while let Some(next) = chars.next() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+        match ch {
+            '\r' | '\x07' | '\x0b' | '\x0c' => continue,
+            _ => output.push(ch),
+        }
+    }
+    output
 }
 
 fn format_f64(value: f64) -> String {
@@ -7834,6 +8206,9 @@ fn write_rllib_config(path: &Path, config: &TrainingConfig) -> Result<()> {
     } else {
         "false"
     };
+    let algorithm = config.rllib_algorithm.trainer_name();
+    let action_repeat = config.rllib_env_action_repeat;
+    let speedup = config.rllib_env_speedup;
     let lr = format_f64(config.rllib_lr);
     let lambda = format_f64(config.rllib_lambda);
     let gamma = format_f64(config.rllib_gamma);
@@ -7850,6 +8225,7 @@ fn write_rllib_config(path: &Path, config: &TrainingConfig) -> Result<()> {
     let batch_mode = &config.rllib_batch_mode;
     let framework = &config.rllib_framework;
     let checkpoint_frequency = config.rllib_checkpoint_frequency;
+    let num_gpus = format_f64(config.rllib_num_gpus);
     let stop_line = match config.rllib_stop_mode {
         RllibStopMode::TimeSeconds => {
             format!("    time_total_s: {}", config.rllib_stop_time_seconds)
@@ -7874,6 +8250,11 @@ fn write_rllib_config(path: &Path, config: &TrainingConfig) -> Result<()> {
 
     let fcnet_hiddens = format_list(&config.rllib_fcnet_hiddens);
     let cnn_channels = format_list(&config.rllib_cnn_channels);
+    let include_prev_actions = if config.rllib_lstm_include_prev_actions {
+        "true"
+    } else {
+        "false"
+    };
     let model_block = match config.rllib_policy_type {
         PolicyType::Mlp => format!(
             "    model:\n        vf_share_layers: False\n        fcnet_hiddens: {fcnet_hiddens}\n"
@@ -7882,9 +8263,11 @@ fn write_rllib_config(path: &Path, config: &TrainingConfig) -> Result<()> {
             "    model:\n        vf_share_layers: False\n        custom_model: tui_cnn\n        custom_model_config:\n            channels: {cnn_channels}\n            fcnet_hiddens: {fcnet_hiddens}\n"
         ),
         PolicyType::Lstm => format!(
-            "    model:\n        vf_share_layers: False\n        custom_model: tui_lstm\n        custom_model_config:\n            hidden_size: {hidden}\n            num_layers: {layers}\n            fcnet_hiddens: {fcnet_hiddens}\n",
+            "    model:\n        vf_share_layers: False\n        max_seq_len: {max_seq_len}\n        custom_model: tui_lstm\n        custom_model_config:\n            hidden_size: {hidden}\n            num_layers: {layers}\n            fcnet_hiddens: {fcnet_hiddens}\n            include_prev_actions: {include_prev}\n",
             hidden = config.rllib_lstm_cell_size,
-            layers = config.rllib_lstm_num_layers
+            layers = config.rllib_lstm_num_layers,
+            max_seq_len = config.rllib_max_seq_len,
+            include_prev = include_prev_actions
         ),
         PolicyType::Grn => format!(
             "    model:\n        vf_share_layers: False\n        custom_model: tui_grn\n        custom_model_config:\n            hidden_size: {hidden}\n            fcnet_hiddens: {fcnet_hiddens}\n",
@@ -7893,7 +8276,7 @@ fn write_rllib_config(path: &Path, config: &TrainingConfig) -> Result<()> {
     };
 
     let content = format!(
-        "algorithm: PPO\n\n# Multi-agent-env setting:\n# If true:\n# - Any AIController with done = true will receive zeroes as action values until all AIControllers are done, an episode ends at that point.\n# - ai_controller.needs_reset will also be set to true every time a new episode begins (but you can ignore it in your env if needed).\n# If false:\n# - AIControllers auto-reset in Godot and will receive actions after setting done = true.\n# - Each AIController has its own episodes that can end/reset at any point.\n# Set to false if you have a single policy name for all agents set in AIControllers\nenv_is_multiagent: true\n\ncheckpoint_frequency: {checkpoint_frequency}\n\n# You can set one or more stopping criteria\nstop:\n    #episode_reward_mean: 0\n    #training_iteration: 1000\n    #timesteps_total: 10000\n{stop_line}\n\nconfig:\n    env: godot\n    env_config:\n      env_path: {escaped_env_path} # Set your env path here (exported executable from Godot) - e.g. env_path: 'env_path.exe' on Windows\n      action_repeat: 2 # Doesn't need to be set here, you can set this in sync node in Godot editor as well\n      show_window: {show_window} # Displays game window while training. Might be faster when false in some cases, turning off also reduces GPU usage if you don't need rendering.\n      speedup: 30 # Speeds up Godot physics\n\n    framework: {framework} # ONNX models exported with torch are compatible with the current Godot RL Agents Plugin\n\n    lr: {lr}\n    lambda: {lambda}\n    gamma: {gamma}\n\n    vf_loss_coeff: {vf_loss_coeff}\n    vf_clip_param: .inf\n    #clip_param: {clip_param_comment}\n    entropy_coeff: {entropy_coeff}\n    entropy_coeff_schedule: null\n    #grad_clip: {grad_clip_comment}\n\n    normalize_actions: False\n    clip_actions: True # During onnx inference we simply clip the actions to [-1.0, 1.0] range, set here to match\n\n    rollout_fragment_length: {rollout_fragment_length}\n    sgd_minibatch_size: {sgd_minibatch_size}\n    num_workers: {num_workers}\n    num_envs_per_worker: {num_envs_per_worker} # This will be set automatically if not multi-agent. If multi-agent, changing this changes how many envs to launch per worker.\n    train_batch_size: {train_batch_size}\n\n    num_sgd_iter: {num_sgd_iter}\n    batch_mode: {batch_mode}\n\n    num_gpus: 0\n{model_block}"
+        "algorithm: {algorithm}\n\n# Multi-agent-env setting:\n# If true:\n# - Any AIController with done = true will receive zeroes as action values until all AIControllers are done, an episode ends at that point.\n# - ai_controller.needs_reset will also be set to true every time a new episode begins (but you can ignore it in your env if needed).\n# If false:\n# - AIControllers auto-reset in Godot and will receive actions after setting done = true.\n# - Each AIController has its own episodes that can end/reset at any point.\n# Set to false if you have a single policy name for all agents set in AIControllers\nenv_is_multiagent: true\n\ncheckpoint_frequency: {checkpoint_frequency}\n\n# You can set one or more stopping criteria\nstop:\n    #episode_reward_mean: 0\n    #training_iteration: 1000\n    #timesteps_total: 10000\n{stop_line}\n\nconfig:\n    env: godot\n    env_config:\n      env_path: {escaped_env_path} # Set your env path here (exported executable from Godot) - e.g. env_path: 'env_path.exe' on Windows\n      action_repeat: {action_repeat} # Doesn't need to be set here, you can set this in sync node in Godot editor as well\n      show_window: {show_window} # Displays game window while training. Might be faster when false in some cases, turning off also reduces GPU usage if you don't need rendering.\n      speedup: {speedup} # Speeds up Godot physics\n\n    framework: {framework} # ONNX models exported with torch are compatible with the current Godot RL Agents Plugin\n\n    lr: {lr}\n    lambda: {lambda}\n    gamma: {gamma}\n\n    vf_loss_coeff: {vf_loss_coeff}\n    vf_clip_param: .inf\n    #clip_param: {clip_param_comment}\n    entropy_coeff: {entropy_coeff}\n    entropy_coeff_schedule: null\n    #grad_clip: {grad_clip_comment}\n\n    normalize_actions: False\n    clip_actions: True # During onnx inference we simply clip the actions to [-1.0, 1.0] range, set here to match\n\n    rollout_fragment_length: {rollout_fragment_length}\n    sgd_minibatch_size: {sgd_minibatch_size}\n    num_workers: {num_workers}\n    num_envs_per_worker: {num_envs_per_worker} # This will be set automatically if not multi-agent. If multi-agent, changing this changes how many envs to launch per worker.\n    train_batch_size: {train_batch_size}\n\n    num_sgd_iter: {num_sgd_iter}\n    batch_mode: {batch_mode}\n\n    num_gpus: {num_gpus}\n{model_block}"
     );
 
     fs::write(path, content)
