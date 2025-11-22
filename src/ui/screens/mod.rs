@@ -3737,6 +3737,12 @@ pub fn render_advanced_config(frame: &mut Frame<'_>, app: &App) {
                 if value.trim().is_empty() {
                     value = "<empty>".to_string();
                 }
+                let error = app.advanced_field_error(*field);
+                let value_style = if error.is_some() {
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
                 let spans = vec![
                     Span::styled(
                         field.label(),
@@ -3745,7 +3751,17 @@ pub fn render_advanced_config(frame: &mut Frame<'_>, app: &App) {
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(": ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(value, Style::default().fg(Color::White)),
+                    Span::styled(value, value_style),
+                    error
+                        .map(|msg| {
+                            Span::styled(
+                                format!("  ⚠ {msg}"),
+                                Style::default()
+                                    .fg(Color::Red)
+                                    .add_modifier(Modifier::ITALIC),
+                            )
+                        })
+                        .unwrap_or_else(|| Span::raw("")),
                 ];
                 ListItem::new(Line::from(spans))
             })
@@ -3783,6 +3799,15 @@ pub fn render_advanced_config(frame: &mut Frame<'_>, app: &App) {
                 field.description(),
                 Style::default().fg(Color::White),
             )),
+            app.advanced_field_error(field).map_or_else(
+                || Line::from(Span::raw("")),
+                |msg| {
+                    Line::from(Span::styled(
+                        format!("⚠ {msg}"),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ))
+                },
+            ),
         ],
         None => vec![Line::from(Span::styled(
             "Select a field to view its details.",
