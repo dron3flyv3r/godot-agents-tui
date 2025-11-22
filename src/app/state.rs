@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -606,6 +607,7 @@ pub struct App {
 
     training_config: TrainingConfig,
     training_config_valid: bool,
+    advanced_validation_errors: HashMap<ConfigField, String>,
     training_output: Vec<String>,
     training_output_scroll: usize,
     training_receiver: Option<Receiver<TrainingEvent>>,
@@ -748,6 +750,7 @@ impl App {
             status: None,
             training_config: TrainingConfig::default(),
             training_config_valid: false,
+            advanced_validation_errors: HashMap::new(),
             training_output: Vec::new(),
             training_output_scroll: 0,
             training_receiver: None,
@@ -1990,7 +1993,9 @@ impl App {
     }
 
     pub fn update_validation_status(&mut self) {
-        self.training_config_valid = self.validate_training_config().is_ok();
+        self.advanced_validation_errors = self.collect_advanced_validation_errors();
+        self.training_config_valid =
+            self.validate_training_config().is_ok() && self.advanced_validation_errors.is_empty();
     }
 
     pub fn toggle_training_mode(&mut self) {
@@ -2136,6 +2141,12 @@ impl App {
 
     pub fn advanced_selection(&self) -> usize {
         self.advanced_selection
+    }
+
+    pub fn advanced_field_error(&self, field: ConfigField) -> Option<&str> {
+        self.advanced_validation_errors
+            .get(&field)
+            .map(|s| s.as_str())
     }
 
     pub fn selected_advanced_field(&self) -> Option<ConfigField> {
@@ -3773,6 +3784,184 @@ impl App {
         } else if self.advanced_selection >= self.advanced_fields.len() {
             self.advanced_selection = self.advanced_fields.len() - 1;
         }
+    }
+
+    fn collect_advanced_validation_errors(&self) -> HashMap<ConfigField, String> {
+        let mut errors = HashMap::new();
+
+        if self.training_config.mode != TrainingMode::MultiAgent {
+            return errors;
+        }
+
+        let cfg = &self.training_config;
+        let total_envs = std::cmp::max(1, cfg.rllib_num_workers) * cfg.rllib_num_envs_per_worker;
+        let min_expected_batch = cfg.rllib_rollout_fragment_length.saturating_mul(total_envs);
+
+        fn check_range(
+            errors: &mut HashMap<ConfigField, String>,
+            field: ConfigField,
+            value: f64,
+            min: f64,
+            max: f64,
+            label: &str,
+        ) {
+            if value < min || value > max {
+                errors.insert(field, format!("{label} should be between {min} and {max}"));
+            }
+        }
+
+        if cfg.rllib_num_workers > 64 {
+            errors.insert(
+                ConfigField::RllibNumWorkers,
+                "Workers should be between 0 and 64".to_string(),
+            );
+        }
+
+        if !(1..=16).contains(&cfg.rllib_num_envs_per_worker) {
+            errors.insert(
+                ConfigField::RllibNumEnvWorkers,
+                "Envs per worker should be between 1 and 16".to_string(),
+            );
+        }
+
+        if !(50..=1000).contains(&cfg.rllib_rollout_fragment_length) {
+            errors.insert(
+                ConfigField::RllibRolloutFragmentLength,
+                "Rollout fragment length should be between 50 and 1000".to_string(),
+            );
+        }
+
+        if !(1000..=100_000).contains(&cfg.rllib_train_batch_size) {
+            errors.insert(
+                ConfigField::RllibTrainBatchSize,
+                "Train batch size should be between 1000 and 100000".to_string(),
+            );
+        }
+
+        if !(64..=1024).contains(&cfg.rllib_sgd_minibatch_size) {
+            errors.insert(
+                ConfigField::RllibSgdMinibatchSize,
+                "Minibatch size should be between 64 and 1024".to_string(),
+            );
+        }
+
+        if cfg.rllib_sgd_minibatch_size > cfg.rllib_train_batch_size {
+            errors.insert(
+                ConfigField::RllibSgdMinibatchSize,
+                "Minibatch size cannot exceed the train batch size".to_string(),
+            );
+        } else if cfg.rllib_train_batch_size % cfg.rllib_sgd_minibatch_size != 0 {
+            errors.insert(
+                ConfigField::RllibTrainBatchSize,
+                "Train batch size must be divisible by the minibatch size".to_string(),
+            );
+        }
+
+        if cfg.rllib_train_batch_size < min_expected_batch {
+            errors.insert(
+                ConfigField::RllibTrainBatchSize,
+                format!(
+                    "Train batch should cover at least rollout_fragment_length × workers × envs ({}), currently {}",
+                    min_expected_batch, cfg.rllib_train_batch_size
+                ),
+            );
+        }
+
+        if !(1..=50).contains(&cfg.rllib_num_sgd_iter) {
+            errors.insert(
+                ConfigField::RllibNumSgdIter,
+                "SGD iterations should be between 1 and 50".to_string(),
+            );
+        }
+
+        check_range(
+            &mut errors,
+            ConfigField::RllibLr,
+            cfg.rllib_lr,
+            0.00001,
+            0.01,
+            "Learning rate",
+        );
+        check_range(
+            &mut errors,
+            ConfigField::RllibGamma,
+            cfg.rllib_gamma,
+            0.9,
+            0.9999,
+            "Gamma",
+        );
+        check_range(
+            &mut errors,
+            ConfigField::RllibLambda,
+            cfg.rllib_lambda,
+            0.8,
+            1.0,
+            "Lambda",
+        );
+        check_range(
+            &mut errors,
+            ConfigField::RllibClipParam,
+            cfg.rllib_clip_param,
+            0.1,
+            0.3,
+            "Clip param",
+        );
+        check_range(
+            &mut errors,
+            ConfigField::RllibEntropyCoeff,
+            cfg.rllib_entropy_coeff,
+            0.0,
+            0.1,
+            "Entropy coeff",
+        );
+        check_range(
+            &mut errors,
+            ConfigField::RllibVfLossCoeff,
+            cfg.rllib_vf_loss_coeff,
+            0.1,
+            1.0,
+            "VF loss coeff",
+        );
+        check_range(
+            &mut errors,
+            ConfigField::RllibGradClip,
+            cfg.rllib_grad_clip,
+            0.1,
+            10.0,
+            "Grad clip",
+        );
+
+        let framework = cfg.rllib_framework.to_lowercase();
+        if framework != "torch" && framework != "tf2" {
+            errors.insert(
+                ConfigField::RllibFramework,
+                "Framework should be 'torch' or 'tf2'".to_string(),
+            );
+        }
+
+        let activation = cfg.rllib_activation.to_lowercase();
+        if activation != "relu" && activation != "tanh" && activation != "elu" {
+            errors.insert(
+                ConfigField::RllibActivation,
+                "Activation should be relu, tanh, or elu".to_string(),
+            );
+        }
+
+        if cfg.rllib_checkpoint_frequency > 1000 {
+            errors.insert(
+                ConfigField::RllibCheckpointFrequency,
+                "Checkpoint frequency should be between 1 and 1000 (0 disables)".to_string(),
+            );
+        }
+
+        if cfg.rllib_stop_mode == RllibStopMode::TimeSeconds && cfg.rllib_stop_time_seconds == 0 {
+            errors.insert(
+                ConfigField::RllibStopTimeSeconds,
+                "Time limit must be at least 1 second".to_string(),
+            );
+        }
+
+        errors
     }
 
     fn build_advanced_fields(&self) -> Vec<ConfigField> {
