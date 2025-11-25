@@ -133,6 +133,7 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
                     app::StatusKind::Info,
                 );
             }
+            KeyCode::Char('l') | KeyCode::Char('L') => app.clear_training_output(),
             KeyCode::Char('p') | KeyCode::Char('P') if !app.is_training_running() => {
                 app.start_config_edit(app::ConfigField::EnvPath);
             }

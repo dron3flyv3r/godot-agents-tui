@@ -1296,6 +1296,16 @@ impl App {
         self.training_output_scroll = 0;
     }
 
+    pub fn clear_training_output(&mut self) {
+        if self.training_output.is_empty() {
+            self.set_status("Training output is already clear", StatusKind::Info);
+            return;
+        }
+        self.training_output.clear();
+        self.training_output_scroll = 0;
+        self.set_status("Training output cleared", StatusKind::Info);
+    }
+
     fn drop_archived_run_view(&mut self) -> bool {
         if self.archived_run_view.take().is_some() {
             self.metrics_history_index = 0;

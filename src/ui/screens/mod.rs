@@ -548,7 +548,7 @@ fn render_training_output(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut paragraph = Paragraph::new(output_text)
         .block(output_block)
         .alignment(Alignment::Left)
-        .wrap(Wrap { trim: false })
+        .wrap(Wrap { trim: true })
         .style(Style::default().fg(Color::White));
 
     if !app.training_output().is_empty() {
@@ -3042,7 +3042,7 @@ fn render_training_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 "Advanced config: ↑/↓ navigate • Enter: edit • a/Esc: close"
             }
             _ => {
-                "t: start training • m: toggle mode • d: run demo • g: write RLlib config • p/s/n: edit basics • a: advanced panel • b: browse • ↑/↓: scroll • PgUp/PgDn: fast scroll"
+                "t: start training • m: toggle mode • d: run demo • g: write RLlib config • p/s/n: edit basics • a: advanced panel • b: browse • l: clear log • ↑/↓: scroll • PgUp/PgDn: fast scroll"
             }
         }
     };
@@ -3523,7 +3523,8 @@ fn build_help_sections(app: &App) -> Vec<(String, Vec<String>)> {
         vec![
             "h / F1   Toggle this help overlay".to_string(),
             "q / Esc  Quit (when idle) or back out of dialogs".to_string(),
-            "1-5      Jump to Home, Train, Metrics, Export, Settings".to_string(),
+            "1-7      Jump to Home, Train, Metrics, Simulator, Interface, Export, Settings".to_string(),
+            "Home/End Jump to Home or Settings tab".to_string(),
         ],
     ));
 
@@ -3566,6 +3567,7 @@ fn train_help_lines() -> Vec<String> {
         "p / s / n      Edit env path, timesteps, or experiment name".to_string(),
         "a              Open advanced settings (Esc to close)".to_string(),
         "b              Browse for the environment path".to_string(),
+        "l              Clear the training output log".to_string(),
         "Up/Down / j/k  Scroll training output".to_string(),
         "PgUp/PgDn      Fast-scroll training output".to_string(),
     ]
@@ -3585,6 +3587,7 @@ fn metrics_help_lines(app: &App) -> Vec<String> {
         "o                Toggle viewing the selected saved run".to_string(),
         "O                Cycle through loaded runs".to_string(),
         "v                Return to live metrics when viewing a run".to_string(),
+        "r                Apply the selected checkpoint to the training config".to_string(),
     ];
     if app.has_saved_run_overlays() {
         if let Some(label) = app.selected_overlay_label() {
@@ -3627,10 +3630,11 @@ fn export_help_lines() -> Vec<String> {
         "x              Start the export process".to_string(),
         "c              Cancel the running export".to_string(),
         "m              Toggle export mode (SB3 / RLlib)".to_string(),
-        "Tab / o        Switch focus between options and output log".to_string(),
+        "Tab / Shift+Tab / o  Switch focus between options and output log".to_string(),
         "Enter          Edit or toggle the selected option".to_string(),
         "Up/Down / j/k  Navigate options or scroll output".to_string(),
         "PgUp/PgDn      Fast-scroll the export log".to_string(),
+        "Backspace      Clear the selected option (when options are focused)".to_string(),
     ]
 }
 
@@ -3647,6 +3651,8 @@ fn file_browser_help_lines() -> Vec<String> {
         "Up/Down / j/k  Highlight entries".to_string(),
         "Enter          Select file or descend into directory".to_string(),
         "Backspace / h  Go up to the parent directory".to_string(),
+        "f              Finalize the current selection".to_string(),
+        "n              Create a new folder (when allowed)".to_string(),
         "Esc            Cancel file selection".to_string(),
     ]
 }
