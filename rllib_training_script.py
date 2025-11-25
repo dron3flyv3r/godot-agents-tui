@@ -7,6 +7,7 @@ import logging
 import os
 import pathlib
 import signal
+import shutil
 from datetime import datetime, timezone
 from numbers import Number
 from typing import Any, Optional
@@ -144,7 +145,10 @@ class NumpyObsGDRLPettingZooEnv(GDRLPettingZooEnv):
     def _format_action(self, space: spaces.Space, action: Any) -> Any:
         """Convert incoming action dict values to the expected dtype/shape."""
         if action is None:
-            logging.warning("Received None action; substituting zero action.")
+            # RLlib may send None when an agent just finished; warn only once to avoid spam.
+            if not getattr(self, "_none_action_warned", False):
+                logging.warning("Received None action; substituting zero action.")
+                self._none_action_warned = True
             return self._zero_action(space)
         try:
             if isinstance(space, spaces.Box):
@@ -589,10 +593,26 @@ if __name__ == "__main__":
     if resume_target:
         resume_dir = os.path.abspath(resume_target)
         tuner_state = os.path.join(resume_dir, "tuner.pkl")
+        legacy_tune_state = os.path.join(resume_dir, "tune.pkl")
+
         if not os.path.isfile(tuner_state):
-            parser.error(
-                f"Resume directory must contain tuner.pkl, but none found at {tuner_state}."
-            )
+            if os.path.isfile(legacy_tune_state):
+                try:
+                    shutil.copy2(legacy_tune_state, tuner_state)
+                    print(
+                        f"Detected legacy tune.pkl; copied to tuner.pkl for Ray restore: {tuner_state}",
+                        flush=True,
+                    )
+                except Exception as exc:  # pragma: no cover - filesystem specific
+                    print(
+                        f"Warning: found tune.pkl but failed to copy to tuner.pkl ({exc}); restore may fail.",
+                        flush=True,
+                    )
+            else:
+                parser.error(
+                    f"Resume directory must contain tuner.pkl (Ray AIR) or tune.pkl (legacy). "
+                    f"Checked: {tuner_state}"
+                )
         args.restore = resume_dir
     else:
         args.restore = None

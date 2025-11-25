@@ -696,6 +696,9 @@ pub struct App {
     training_cancel: Option<Sender<()>>,
     training_running: bool,
     training_metrics: Vec<MetricSample>,
+    metrics_timeline: Vec<MetricSample>,
+    metrics_resume_iteration: Option<u64>,
+    metrics_resume_label: Option<String>,
     saved_run_overlays: Vec<RunOverlay>,
     selected_overlay_index: Option<usize>,
     archived_run_view: Option<ArchivedRunView>,
@@ -840,6 +843,9 @@ impl App {
             training_running: false,
             training_cancel: None,
             training_metrics: Vec::new(),
+            metrics_timeline: Vec::new(),
+            metrics_resume_iteration: None,
+            metrics_resume_label: None,
             saved_run_overlays: Vec::new(),
             selected_overlay_index: None,
             archived_run_view: None,
@@ -1333,7 +1339,7 @@ impl App {
         if let Some(view) = &self.archived_run_view {
             view.metrics()
         } else {
-            &self.training_metrics
+            &self.metrics_timeline
         }
     }
 
@@ -1549,11 +1555,19 @@ impl App {
             return None;
         }
 
+        let max_points = max_points.max(1);
         let len = samples.len();
-        let start = len.saturating_sub(max_points);
+        let selected_idx = self.metrics_history_selected_index();
+        let selected_pos = len.saturating_sub(1).saturating_sub(selected_idx);
+        let start = if selected_pos + max_points >= len {
+            len.saturating_sub(max_points)
+        } else {
+            selected_pos
+        };
+        let end = (start + max_points).min(len);
         let mut points = Vec::new();
 
-        for (idx, sample) in samples.iter().enumerate().skip(start) {
+        for (idx, sample) in samples.iter().enumerate().take(end).skip(start) {
             if let Some(value) = App::chart_value_for_sample(sample, &metric) {
                 let x = sample
                     .training_iteration()
@@ -1577,6 +1591,24 @@ impl App {
         let sample = self.selected_metric_sample()?;
         let metric = self.current_chart_metric()?;
         App::chart_value_for_sample(sample, &metric)
+    }
+
+    pub fn resume_marker_iteration(&self) -> Option<u64> {
+        self.metrics_resume_iteration
+    }
+
+    pub fn resume_marker_value(&self, option: &ChartMetricOption) -> Option<f64> {
+        let iteration = self.metrics_resume_iteration?;
+        let sample = self
+            .training_metrics_history()
+            .iter()
+            .find(|s| s.training_iteration() == Some(iteration))?;
+        App::chart_value_for_sample(sample, option)
+    }
+
+    pub fn latest_chart_value(&self, option: &ChartMetricOption) -> Option<f64> {
+        let sample = self.training_metrics_history().last()?;
+        App::chart_value_for_sample(sample, option)
     }
 
     fn chart_value_for_sample(sample: &MetricSample, option: &ChartMetricOption) -> Option<f64> {
@@ -1847,6 +1879,183 @@ impl App {
                 }
             }
         }
+    }
+
+    fn project_relative_display(&self, path: &Path) -> String {
+        if let Some(project) = &self.active_project {
+            if let Ok(relative) = path.strip_prefix(&project.root_path) {
+                return relative.to_string_lossy().to_string();
+            }
+        }
+        path.to_string_lossy().to_string()
+    }
+
+    fn find_rllib_trial_dir(&self, sample: &MetricSample) -> Option<PathBuf> {
+        let project = self.active_project.as_ref()?;
+        let base = project.logs_path.join("rllib");
+        let trial_hint = sample.trial_id().map(|s| s.to_string());
+        let mut newest: Option<(SystemTime, PathBuf)> = None;
+
+        let experiments = fs::read_dir(&base).ok()?;
+        for experiment in experiments.flatten() {
+            let path = experiment.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let trials = match fs::read_dir(&path) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+            for entry in trials.flatten() {
+                let trial_path = entry.path();
+                if !trial_path.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if let Some(ref hint) = trial_hint {
+                    if name.contains(hint) {
+                        return Some(trial_path);
+                    }
+                }
+                if let Ok(meta) = entry.metadata() {
+                    if let Ok(modified) = meta.modified() {
+                        if newest.as_ref().map(|(ts, _)| modified > *ts).unwrap_or(true) {
+                            newest = Some((modified, trial_path.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        newest.map(|(_, path)| path)
+    }
+
+    fn select_checkpoint_dir(
+        &mut self,
+        sample: &MetricSample,
+        trial_dir: &Path,
+    ) -> Result<Option<(PathBuf, u32)>> {
+        let mut checkpoints: Vec<(u32, PathBuf)> = Vec::new();
+        let entries = match fs::read_dir(trial_dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                self.set_status(
+                    format!(
+                        "Failed to read trial directory {}: {error}",
+                        trial_dir.display()
+                    ),
+                    StatusKind::Error,
+                );
+                return Ok(None);
+            }
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if let Some(number) = Self::checkpoint_number_from_path(&path) {
+                checkpoints.push((number, path));
+            }
+        }
+
+        if checkpoints.is_empty() {
+            return Ok(None);
+        }
+
+        checkpoints.sort_by_key(|(num, _)| *num);
+        let target = sample.checkpoints().map(|n| n as u32);
+        let chosen = if let Some(t) = target {
+            checkpoints
+                .iter()
+                .rev()
+                .find(|(num, _)| *num <= t)
+                .cloned()
+                .unwrap_or_else(|| checkpoints.last().cloned().unwrap())
+        } else {
+            checkpoints.last().cloned().unwrap()
+        };
+
+        let (num, path) = chosen;
+        Ok(Some((path, num)))
+    }
+
+    pub fn apply_selected_checkpoint_to_config(&mut self) -> Result<()> {
+        if self.training_config.mode != TrainingMode::MultiAgent {
+            self.set_status(
+                "Resume shortcut is available for RLlib runs only.",
+                StatusKind::Warning,
+            );
+            return Ok(());
+        }
+
+        if self.active_project.is_none() {
+            self.set_status("Select a project first", StatusKind::Warning);
+            return Ok(());
+        }
+
+        let sample = match self.selected_metric_sample().cloned() {
+            Some(sample) => sample,
+            None => {
+                self.set_status(
+                    "Select a metric sample in the history to choose a checkpoint.",
+                    StatusKind::Warning,
+                );
+                return Ok(());
+            }
+        };
+
+        let trial_dir = match self.find_rllib_trial_dir(&sample) {
+            Some(path) => path,
+            None => {
+                self.set_status(
+                    "Could not locate a matching RLlib run directory for this sample.",
+                    StatusKind::Warning,
+                );
+                return Ok(());
+            }
+        };
+
+        let (checkpoint_dir, checkpoint_number) = match self.select_checkpoint_dir(&sample, &trial_dir)?
+        {
+            Some((dir, num)) => (dir, num),
+            None => {
+                self.set_status(
+                    "No checkpoints found in the matched RLlib run directory.",
+                    StatusKind::Warning,
+                );
+                return Ok(());
+            }
+        };
+
+        let resume_dir = trial_dir.parent().unwrap_or(&trial_dir).to_path_buf();
+        let resume_display = self.project_relative_display(&resume_dir);
+        let checkpoint_display = self.project_relative_display(&checkpoint_dir);
+
+        self.training_config.rllib_resume_from = resume_dir.to_string_lossy().to_string();
+        self.export_config.rllib_checkpoint_path = checkpoint_dir.to_string_lossy().to_string();
+        self.export_config.rllib_checkpoint_number = Some(checkpoint_number);
+        if let Some(iteration) = sample.training_iteration() {
+            self.metrics_resume_iteration = Some(iteration);
+        } else {
+            let freq = self.training_config.rllib_checkpoint_frequency as u64;
+            if freq > 0 {
+                self.metrics_resume_iteration = Some(checkpoint_number as u64 * freq);
+            }
+        }
+        self.metrics_resume_label = Some(format!(
+            "checkpoint #{checkpoint_number} ({checkpoint_display})"
+        ));
+
+        self.set_status(
+            format!(
+                "Resume config updated → run: {resume_display}, checkpoint: #{checkpoint_number} ({checkpoint_display})"
+            ),
+            StatusKind::Success,
+        );
+
+        Ok(())
     }
 
     pub fn toggle_current_setting(&mut self) {
@@ -4137,7 +4346,8 @@ impl App {
 
         let cfg = &self.training_config;
         let total_envs = std::cmp::max(1, cfg.rllib_num_workers) * cfg.rllib_num_envs_per_worker;
-        let min_expected_batch = cfg.rllib_rollout_fragment_length.saturating_mul(total_envs);
+        let expected_batch_size =
+            cfg.rllib_rollout_fragment_length.saturating_mul(total_envs);
 
         fn check_range(
             errors: &mut HashMap<ConfigField, String>,
@@ -4166,17 +4376,17 @@ impl App {
             );
         }
 
-        if !(50..=1000).contains(&cfg.rllib_rollout_fragment_length) {
+        if !(32..=4096).contains(&cfg.rllib_rollout_fragment_length) {
             errors.insert(
                 ConfigField::RllibRolloutFragmentLength,
-                "Rollout fragment length should be between 50 and 1000".to_string(),
+                "Rollout fragment length should be between 32 and 4096".to_string(),
             );
         }
 
-        if !(1000..=100_000).contains(&cfg.rllib_train_batch_size) {
+        if !(128..=200_000).contains(&cfg.rllib_train_batch_size) {
             errors.insert(
                 ConfigField::RllibTrainBatchSize,
-                "Train batch size should be between 1000 and 100000".to_string(),
+                "Train batch size should be between 128 and 200000".to_string(),
             );
         }
 
@@ -4187,24 +4397,25 @@ impl App {
             );
         }
 
-        if cfg.rllib_sgd_minibatch_size > cfg.rllib_train_batch_size {
-            errors.insert(
-                ConfigField::RllibSgdMinibatchSize,
-                "Minibatch size cannot exceed the train batch size".to_string(),
-            );
-        } else if cfg.rllib_train_batch_size % cfg.rllib_sgd_minibatch_size != 0 {
-            errors.insert(
-                ConfigField::RllibTrainBatchSize,
-                "Train batch size must be divisible by the minibatch size".to_string(),
-            );
-        }
-
-        if cfg.rllib_train_batch_size < min_expected_batch {
+        if cfg.rllib_train_batch_size < expected_batch_size
+            || cfg.rllib_train_batch_size % expected_batch_size != 0
+        {
+            let next_multiple = ((cfg.rllib_train_batch_size.max(expected_batch_size)
+                + expected_batch_size
+                - 1)
+                / expected_batch_size)
+                * expected_batch_size;
             errors.insert(
                 ConfigField::RllibTrainBatchSize,
                 format!(
-                    "Train batch should cover at least rollout_fragment_length × workers × envs ({}), currently {}",
-                    min_expected_batch, cfg.rllib_train_batch_size
+                    "Train batch must be a multiple of rollout_fragment_length × workers × envs ({} × {} × {}) = {}. Currently {}. Try {} or {}.",
+                    cfg.rllib_rollout_fragment_length,
+                    std::cmp::max(1, cfg.rllib_num_workers),
+                    cfg.rllib_num_envs_per_worker,
+                    expected_batch_size,
+                    cfg.rllib_train_batch_size,
+                    next_multiple,
+                    next_multiple + expected_batch_size
                 ),
             );
         }
@@ -4272,6 +4483,30 @@ impl App {
             10.0,
             "Grad clip",
         );
+
+        if cfg.rllib_policy_type == PolicyType::Lstm
+            && cfg.rllib_max_seq_len > cfg.rllib_rollout_fragment_length
+        {
+            errors.insert(
+                ConfigField::RllibRolloutFragmentLength,
+                format!(
+                    "Rollout fragment length ({}) should be at least the LSTM max_seq_len ({})",
+                    cfg.rllib_rollout_fragment_length, cfg.rllib_max_seq_len
+                ),
+            );
+        }
+
+        if cfg.rllib_policy_type == PolicyType::Lstm
+            && cfg.rllib_sgd_minibatch_size <= cfg.rllib_max_seq_len
+        {
+            errors.insert(
+                ConfigField::RllibSgdMinibatchSize,
+                format!(
+                    "Minibatch size ({}) must be greater than the LSTM max_seq_len ({})",
+                    cfg.rllib_sgd_minibatch_size, cfg.rllib_max_seq_len
+                ),
+            );
+        }
 
         let framework = cfg.rllib_framework.to_lowercase();
         if framework != "torch" && framework != "tf2" {
@@ -5208,9 +5443,10 @@ impl App {
                     bail!("Resume path must be a directory: {}", resume_path.display());
                 }
                 let tuner_file = resume_path.join("tuner.pkl");
-                if !tuner_file.is_file() {
+                let legacy_tune_file = resume_path.join("tune.pkl");
+                if !tuner_file.is_file() && !legacy_tune_file.is_file() {
                     bail!(
-                        "Resume directory is missing tuner.pkl: {}",
+                        "Resume directory is missing tuner.pkl (Ray AIR) or tune.pkl (legacy): {}",
                         tuner_file.display()
                     );
                 }
@@ -5584,10 +5820,31 @@ impl App {
             return Ok(());
         }
 
+        let resuming_multi =
+            self.training_config.mode == TrainingMode::MultiAgent
+                && !self.training_config.rllib_resume_from.trim().is_empty();
+        let resume_baseline = if resuming_multi {
+            let mut data = self.training_metrics_history().to_vec();
+            if data.len() > TRAINING_METRIC_HISTORY_LIMIT {
+                let excess = data.len() - TRAINING_METRIC_HISTORY_LIMIT;
+                data.drain(0..excess);
+            }
+            data
+        } else {
+            Vec::new()
+        };
         self.drop_archived_run_view();
         self.training_receiver = None;
         self.training_cancel = None;
         self.training_running = true;
+        if resuming_multi {
+            // Keep a copy of the pre-resume metrics so the chart can show the full timeline.
+            self.metrics_timeline = resume_baseline;
+        } else {
+            self.metrics_timeline.clear();
+            self.metrics_resume_iteration = None;
+            self.metrics_resume_label = None;
+        }
         self.training_metrics.clear();
         self.current_run_start = Some(SystemTime::now());
         self.metrics_history_index = 0;
@@ -5677,11 +5934,49 @@ impl App {
                     format!("--config_file={}", self.training_config.rllib_config_file),
                     format!("--experiment_dir={}", rllib_logs.to_string_lossy()),
                 ];
-                if !self.training_config.rllib_resume_from.trim().is_empty() {
-                    args.push(format!(
-                        "--resume={}",
-                        self.training_config.rllib_resume_from
-                    ));
+                let resume_path = if resuming_multi {
+                    let trimmed = self.training_config.rllib_resume_from.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(self.resolve_project_path(project, trimmed))
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(ref path) = resume_path {
+                    if let Some(backup_path) = self.backup_resume_directory(path)? {
+                        let display = self.project_relative_display(&backup_path);
+                        self.set_status(
+                            format!("Backed up resume run to {}", display),
+                            StatusKind::Info,
+                        );
+                    }
+                    if self.metrics_resume_iteration.is_none() {
+                        if let Some(number) = self.export_config.rllib_checkpoint_number {
+                            let freq = self.training_config.rllib_checkpoint_frequency as u64;
+                            if freq > 0 {
+                                self.metrics_resume_iteration = Some(number as u64 * freq);
+                            } else if let Some(iter) = self
+                                .metrics_timeline
+                                .last()
+                                .and_then(|s| s.training_iteration())
+                            {
+                                self.metrics_resume_iteration = Some(iter);
+                            }
+                        } else if let Some(iter) = self
+                            .metrics_timeline
+                            .last()
+                            .and_then(|s| s.training_iteration())
+                        {
+                            self.metrics_resume_iteration = Some(iter);
+                        }
+                    }
+                    let display = self.project_relative_display(path);
+                    self.metrics_resume_label =
+                        Some(format!("Resume baseline from {}", display));
+                    args.push(format!("--resume={}", path.to_string_lossy()));
                 }
                 (script, args)
             }
@@ -5716,6 +6011,9 @@ impl App {
         self.training_receiver = None;
         self.training_cancel = None;
         self.training_running = true;
+        self.metrics_timeline.clear();
+        self.metrics_resume_iteration = None;
+        self.metrics_resume_label = None;
         self.training_metrics.clear();
         self.current_run_start = Some(SystemTime::now());
         self.metrics_history_index = 0;
@@ -6753,11 +7051,55 @@ impl App {
         }
     }
 
+    fn backup_resume_directory(&self, resume_path: &Path) -> Result<Option<PathBuf>> {
+        let Some(name) = resume_path.file_name().and_then(|n| n.to_str()) else {
+            return Ok(None);
+        };
+        let Some(parent) = resume_path.parent() else {
+            return Ok(None);
+        };
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let backup_path = parent.join(format!("{name}_backup_{stamp}"));
+        if backup_path.exists() {
+            return Ok(None);
+        }
+
+        self.copy_dir_recursive(resume_path, &backup_path)?;
+        Ok(Some(backup_path))
+    }
+
+    fn copy_dir_recursive(&self, src: &Path, dst: &Path) -> Result<()> {
+        fs::create_dir_all(dst)
+            .wrap_err_with(|| format!("failed to create backup dir {}", dst.display()))?;
+        for entry in fs::read_dir(src)
+            .wrap_err_with(|| format!("failed to read directory {}", src.display()))?
+        {
+            let entry = entry.wrap_err_with(|| format!("failed to read entry in {}", src.display()))?;
+            let path = entry.path();
+            let target = dst.join(entry.file_name());
+            let file_type = entry
+                .file_type()
+                .wrap_err_with(|| format!("failed to read file type for {}", path.display()))?;
+            if file_type.is_dir() {
+                self.copy_dir_recursive(&path, &target)?;
+            } else if file_type.is_file() {
+                fs::copy(&path, &target).wrap_err_with(|| {
+                    format!("failed to copy {} to {}", path.display(), target.display())
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     fn persist_completed_run(&mut self) {
         let Some(project) = self.active_project.as_ref() else {
             return;
         };
-        if self.training_metrics.is_empty() {
+        if self.metrics_timeline.is_empty() {
             return;
         }
 
@@ -6800,7 +7142,7 @@ impl App {
             },
             timestamp,
             duration_seconds,
-            self.training_metrics.clone(),
+            self.metrics_timeline.clone(),
             self.training_output.clone(),
         );
 
@@ -7178,18 +7520,25 @@ impl App {
 
         self.metric_last_sample_time = Some(now);
         let previous_offset = self.metrics_history_index;
-        self.training_metrics.push(sample);
+        self.training_metrics.push(sample.clone());
+        self.metrics_timeline.push(sample);
+
         if self.training_metrics.len() > TRAINING_METRIC_HISTORY_LIMIT {
             let excess = self.training_metrics.len() - TRAINING_METRIC_HISTORY_LIMIT;
             self.training_metrics.drain(0..excess);
         }
+        if self.metrics_timeline.len() > TRAINING_METRIC_HISTORY_LIMIT {
+            let excess = self.metrics_timeline.len() - TRAINING_METRIC_HISTORY_LIMIT;
+            self.metrics_timeline.drain(0..excess);
+        }
         if previous_offset != 0 {
             self.metrics_history_index = previous_offset.saturating_add(1);
         }
-        if self.training_metrics.is_empty() {
+        let history_len = self.training_metrics_history().len();
+        if history_len == 0 {
             self.metrics_history_index = 0;
-        } else if self.metrics_history_index >= self.training_metrics.len() {
-            self.metrics_history_index = self.training_metrics.len().saturating_sub(1);
+        } else if self.metrics_history_index >= history_len {
+            self.metrics_history_index = history_len.saturating_sub(1);
         }
         self.ensure_chart_metric_index();
     }
@@ -8465,7 +8814,7 @@ fn write_rllib_config(path: &Path, config: &TrainingConfig) -> Result<()> {
     };
 
     let content = format!(
-        "algorithm: {algorithm}\n\n# Multi-agent-env setting:\n# If true:\n# - Any AIController with done = true will receive zeroes as action values until all AIControllers are done, an episode ends at that point.\n# - ai_controller.needs_reset will also be set to true every time a new episode begins (but you can ignore it in your env if needed).\n# If false:\n# - AIControllers auto-reset in Godot and will receive actions after setting done = true.\n# - Each AIController has its own episodes that can end/reset at any point.\n# Set to false if you have a single policy name for all agents set in AIControllers\nenv_is_multiagent: true\n\ncheckpoint_frequency: {checkpoint_frequency}\n\n# You can set one or more stopping criteria\nstop:\n    #episode_reward_mean: 0\n    #training_iteration: 1000\n    #timesteps_total: 10000\n{stop_line}\n\nconfig:\n    env: godot\n    env_config:\n      env_path: {escaped_env_path} # Set your env path here (exported executable from Godot) - e.g. env_path: 'env_path.exe' on Windows\n      action_repeat: {action_repeat} # Doesn't need to be set here, you can set this in sync node in Godot editor as well\n      show_window: {show_window} # Displays game window while training. Might be faster when false in some cases, turning off also reduces GPU usage if you don't need rendering.\n      speedup: {speedup} # Speeds up Godot physics\n\n    framework: {framework} # ONNX models exported with torch are compatible with the current Godot RL Agents Plugin\n\n    lr: {lr}\n    lambda: {lambda}\n    gamma: {gamma}\n\n    vf_loss_coeff: {vf_loss_coeff}\n    vf_clip_param: .inf\n    #clip_param: {clip_param_comment}\n    entropy_coeff: {entropy_coeff}\n    entropy_coeff_schedule: null\n    #grad_clip: {grad_clip_comment}\n\n    normalize_actions: False\n    clip_actions: True # During onnx inference we simply clip the actions to [-1.0, 1.0] range, set here to match\n\n    rollout_fragment_length: {rollout_fragment_length}\n    sgd_minibatch_size: {sgd_minibatch_size}\n    num_workers: {num_workers}\n    num_envs_per_worker: {num_envs_per_worker} # This will be set automatically if not multi-agent. If multi-agent, changing this changes how many envs to launch per worker.\n    train_batch_size: {train_batch_size}\n\n    num_sgd_iter: {num_sgd_iter}\n    batch_mode: {batch_mode}\n\n    num_gpus: {num_gpus}\n{model_block}"
+        "algorithm: {algorithm}\n\n# Multi-agent-env setting:\n# If true:\n# - Any AIController with done = true will receive zeroes as action values until all AIControllers are done, an episode ends at that point.\n# - ai_controller.needs_reset will also be set to true every time a new episode begins (but you can ignore it in your env if needed).\n# If false:\n# - AIControllers auto-reset in Godot and will receive actions after setting done = true.\n# - Each AIController has its own episodes that can end/reset at any point.\n# Set to false if you have a single policy name for all agents set in AIControllers\nenv_is_multiagent: true\n\ncheckpoint_frequency: {checkpoint_frequency}\n\n# You can set one or more stopping criteria\nstop:\n    #episode_reward_mean: 0\n    #training_iteration: 1000\n    #timesteps_total: 10000\n{stop_line}\n\nconfig:\n    env: godot\n    env_config:\n      env_path: {escaped_env_path} # Set your env path here (exported executable from Godot) - e.g. env_path: 'env_path.exe' on Windows\n      action_repeat: {action_repeat} # Doesn't need to be set here, you can set this in sync node in Godot editor as well\n      show_window: {show_window} # Displays game window while training. Might be faster when false in some cases, turning off also reduces GPU usage if you don't need rendering.\n      speedup: {speedup} # Speeds up Godot physics\n\n    framework: {framework} # ONNX models exported with torch are compatible with the current Godot RL Agents Plugin\n\n    lr: {lr}\n    lambda: {lambda}\n    gamma: {gamma}\n\n    vf_loss_coeff: {vf_loss_coeff}\n    vf_clip_param: .inf\n    #clip_param: {clip_param_comment}\n    entropy_coeff: {entropy_coeff}\n    entropy_coeff_schedule: null\n    #grad_clip: {grad_clip_comment}\n\n    normalize_actions: False\n    clip_actions: True # During onnx inference we simply clip the actions to [-1.0, 1.0] range, set here to match\n\n    rollout_fragment_length: {rollout_fragment_length}\n    sgd_minibatch_size: {sgd_minibatch_size}\n    minibatch_size: {sgd_minibatch_size}\n    num_workers: {num_workers}\n    num_envs_per_worker: {num_envs_per_worker} # This will be set automatically if not multi-agent. If multi-agent, changing this changes how many envs to launch per worker.\n    sample_timeout_s: 120\n    train_batch_size: {train_batch_size}\n\n    num_sgd_iter: {num_sgd_iter}\n    batch_mode: {batch_mode}\n\n    num_gpus: {num_gpus}\n{model_block}"
     );
 
     fs::write(path, content)

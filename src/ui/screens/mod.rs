@@ -33,6 +33,70 @@ fn focused_border_color(app: &App, focused: bool) -> Color {
     }
 }
 
+fn format_axis_value(value: f64, prefer_integers: bool) -> String {
+    let (scaled, suffix) = {
+        let abs = value.abs();
+        if abs >= 1_000_000_000.0 {
+            (value / 1_000_000_000.0, "b")
+        } else if abs >= 1_000_000.0 {
+            (value / 1_000_000.0, "m")
+        } else if abs >= 1_000.0 {
+            (value / 1_000.0, "k")
+        } else {
+            (value, "")
+        }
+    };
+
+    if prefer_integers || scaled.abs() >= 10.0 {
+        format!("{scaled:.0}{suffix}")
+    } else if scaled.abs() >= 1.0 {
+        format!("{scaled:.1}{suffix}")
+    } else {
+        format!("{scaled:.2}{suffix}")
+    }
+}
+
+fn compute_tick_step(min: f64, max: f64, target: usize) -> f64 {
+    if !min.is_finite() || !max.is_finite() || target == 0 {
+        return 1.0;
+    }
+    let range = (max - min).abs().max(1e-9);
+    let rough = range / target as f64;
+    if !rough.is_finite() {
+        return 1.0;
+    }
+    let power = rough.log10().floor();
+    let base = 10f64.powf(power);
+    for factor in [1.0, 2.0, 5.0, 10.0] {
+        let candidate = base * factor;
+        if candidate >= rough {
+            return candidate;
+        }
+    }
+    base
+}
+
+fn build_axis_labels(min: f64, max: f64, slots: usize, prefer_integers: bool) -> Vec<Span<'static>> {
+    if !min.is_finite() || !max.is_finite() || slots == 0 {
+        return Vec::new();
+    }
+
+    let target = slots.clamp(3, 7);
+    let step = compute_tick_step(min, max, target);
+    let start = (min / step).floor() * step;
+    let end = (max / step).ceil() * step;
+
+    let mut labels = Vec::new();
+    let mut value = start;
+    let max_labels = target + 2;
+    while value <= end + step * 0.25 && labels.len() < max_labels {
+        labels.push(Span::raw(format_axis_value(value, prefer_integers)));
+        value += step;
+    }
+
+    labels
+}
+
 pub fn render_home(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let constraints = if area.height >= 16 {
         [
@@ -1720,6 +1784,20 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if let Some(label) = app.viewed_run_label() {
         title.push_str(&format!(" • Saved run: {label}"));
     }
+    if let Some(iter) = app.resume_marker_iteration() {
+        let metric_opt = app.current_chart_metric();
+        let pre = metric_opt
+            .as_ref()
+            .and_then(|m| app.resume_marker_value(m))
+            .map(|v| format!("{v:.3}"))
+            .unwrap_or_else(|| "-".to_string());
+        let post = metric_opt
+            .as_ref()
+            .and_then(|m| app.latest_chart_value(m))
+            .map(|v| format!("{v:.3}"))
+            .unwrap_or_else(|| "-".to_string());
+        title.push_str(&format!(" • Resume @ {iter} (pre {pre} → live {post})"));
+    }
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1764,6 +1842,8 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut y_max = f64::NEG_INFINITY;
     let mut x_min = f64::INFINITY;
     let mut x_max = f64::NEG_INFINITY;
+    let mut resume_line = Vec::new();
+    let mut resume_marker = Vec::new();
 
     let mut update_bounds = |points: &[(f64, f64)]| {
         for &(x, y) in points {
@@ -1800,6 +1880,15 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
         );
     }
 
+    let selected_x = app
+        .selected_metric_sample()
+        .and_then(|sample| sample.training_iteration().map(|iter| iter as f64))
+        .or_else(|| Some(app.metrics_history_selected_index() as f64));
+    let selected_y = app.selected_chart_value();
+    let mut selection_line = Vec::new();
+    let mut selection_marker = Vec::new();
+    let resume_x = app.resume_marker_iteration().map(|iter| iter as f64);
+
     if !y_min.is_finite() || !y_max.is_finite() {
         y_min = 0.0;
         y_max = 1.0;
@@ -1813,15 +1902,103 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
         x_min = 0.0;
         x_max = 1.0;
     }
+    if let Some(x) = resume_x {
+        if x.is_finite() {
+            x_min = x_min.min(x);
+            x_max = x_max.max(x);
+        }
+    }
     if (x_max - x_min).abs() < 1e-3 {
         x_max = x_min + 1.0;
     }
+
+    if let Some(x) = selected_x {
+        if x.is_finite() && x >= x_min && x <= x_max {
+            selection_line.push((x, y_min));
+            selection_line.push((x, y_max));
+            if let Some(y) = selected_y {
+                if y.is_finite() {
+                    selection_marker.push((x, y));
+                }
+            }
+        }
+    }
+
+    if let Some(x) = resume_x {
+        if x.is_finite() && x >= x_min && x <= x_max {
+            resume_line.push((x, y_min));
+            resume_line.push((x, y_max));
+            if let Some(metric_option) = app.current_chart_metric() {
+                if let Some(y) = app.resume_marker_value(&metric_option) {
+                    if y.is_finite() {
+                        resume_marker.push((x, y));
+                    }
+                }
+            }
+        }
+    }
+
+    if !selection_line.is_empty() {
+        datasets.push(
+            Dataset::default()
+                .name("Selected")
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(Color::LightYellow))
+                .data(&selection_line),
+        );
+    }
+
+    if !selection_marker.is_empty() {
+        datasets.push(
+            Dataset::default()
+                .name("Here")
+                .marker(Marker::Block)
+                .graph_type(GraphType::Scatter)
+                .style(Style::default().fg(Color::Yellow))
+                .data(&selection_marker),
+        );
+    }
+    if !resume_line.is_empty() {
+        datasets.push(
+            Dataset::default()
+                .name("Resume")
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(Color::LightMagenta))
+                .data(&resume_line),
+        );
+    }
+    if !resume_marker.is_empty() {
+        datasets.push(
+            Dataset::default()
+                .name("Resumed here")
+                .marker(Marker::Block)
+                .graph_type(GraphType::Scatter)
+                .style(Style::default().fg(Color::Magenta))
+                .data(&resume_marker),
+        );
+    }
+
+    let x_labels = build_axis_labels(
+        x_min,
+        x_max,
+        area.width.saturating_sub(6) as usize / 12,
+        true,
+    );
+    let y_labels = build_axis_labels(
+        y_min,
+        y_max,
+        area.height.saturating_sub(4) as usize / 6,
+        false,
+    );
 
     let x_axis = Axis::default()
         .title(Span::styled(
             "Iteration",
             Style::default().fg(Color::DarkGray),
         ))
+        .labels(x_labels)
         .bounds([x_min, x_max]);
 
     let y_axis = Axis::default()
@@ -1829,6 +2006,7 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
             metric_option.label(),
             Style::default().fg(Color::DarkGray),
         ))
+        .labels(y_labels)
         .bounds([y_min, y_max]);
 
     let chart = Chart::new(datasets)
@@ -1862,6 +2040,8 @@ fn render_multi_series_chart(
     let mut y_max = f64::NEG_INFINITY;
     let mut x_min = f64::INFINITY;
     let mut x_max = f64::NEG_INFINITY;
+    let resume_x = app.resume_marker_iteration().map(|iter| iter as f64);
+    let mut resume_line = Vec::new();
 
     for (_, points) in &multi_data {
         for &(x, y) in points {
@@ -1873,6 +2053,12 @@ fn render_multi_series_chart(
                 y_min = y_min.min(y);
                 y_max = y_max.max(y);
             }
+        }
+    }
+    if let Some(x) = resume_x {
+        if x.is_finite() {
+            x_min = x_min.min(x);
+            x_max = x_max.max(x);
         }
     }
 
@@ -1911,7 +2097,7 @@ fn render_multi_series_chart(
     ];
 
     // Create datasets for each policy
-    let datasets: Vec<Dataset> = multi_data
+    let mut datasets: Vec<Dataset> = multi_data
         .iter()
         .enumerate()
         .map(|(idx, (policy_id, points))| {
@@ -1925,11 +2111,64 @@ fn render_multi_series_chart(
         })
         .collect();
 
+    let selected_x = app
+        .selected_metric_sample()
+        .and_then(|sample| sample.training_iteration().map(|iter| iter as f64))
+        .or_else(|| Some(app.metrics_history_selected_index() as f64));
+    let mut selection_line = Vec::new();
+    if let Some(x) = selected_x {
+        if x.is_finite() && x >= x_min && x <= x_max {
+            selection_line.push((x, y_min));
+            selection_line.push((x, y_max));
+        }
+    }
+
+    if !selection_line.is_empty() {
+        datasets.push(
+            Dataset::default()
+                .name("Selected")
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(Color::LightYellow))
+                .data(&selection_line),
+        );
+    }
+    if let Some(x) = resume_x {
+        if x.is_finite() && x >= x_min && x <= x_max {
+            resume_line.push((x, y_min));
+            resume_line.push((x, y_max));
+        }
+    }
+    if !resume_line.is_empty() {
+        datasets.push(
+            Dataset::default()
+                .name("Resume")
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(Color::LightMagenta))
+                .data(&resume_line),
+        );
+    }
+
+    let x_labels = build_axis_labels(
+        x_min,
+        x_max,
+        area.width.saturating_sub(6) as usize / 12,
+        true,
+    );
+    let y_labels = build_axis_labels(
+        y_min,
+        y_max,
+        area.height.saturating_sub(4) as usize / 6,
+        false,
+    );
+
     let x_axis = Axis::default()
         .title(Span::styled(
             "Iteration",
             Style::default().fg(Color::DarkGray),
         ))
+        .labels(x_labels)
         .bounds([x_min, x_max]);
 
     // Get metric label from option
@@ -1943,6 +2182,7 @@ fn render_multi_series_chart(
 
     let y_axis = Axis::default()
         .title(Span::styled(y_label, Style::default().fg(Color::DarkGray)))
+        .labels(y_labels)
         .bounds([y_min, y_max]);
 
     let chart = Chart::new(datasets)
@@ -2037,6 +2277,11 @@ fn render_metrics_chart_info(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(Color::DarkGray),
         )]));
     }
+
+    lines.push(Line::from(vec![Span::styled(
+        "r: use selected checkpoint to prefill resume + export paths",
+        Style::default().fg(Color::LightGreen),
+    )]));
 
     if app.has_saved_run_overlays() {
         if let Some(label) = app.selected_overlay_label() {

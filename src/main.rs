@@ -246,6 +246,9 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
             KeyCode::Char('v') | KeyCode::Char('V') => {
                 app.clear_archived_run_view();
             }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                app.apply_selected_checkpoint_to_config()?;
+            }
             _ => {}
         }
     } else if app.active_tab().id == TabId::Simulator {

@@ -45,8 +45,13 @@ impl PolicyMetrics {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MetricSample {
     timestamp: Option<String>,
+    date: Option<String>,
+    trial_id: Option<String>,
+    experiment_id: Option<String>,
+    experiment_tag: Option<String>,
     training_iteration: Option<u64>,
     timesteps_total: Option<u64>,
     episodes_total: Option<u64>,
@@ -90,6 +95,22 @@ impl MetricSample {
                 .get("timestamp")
                 .and_then(Value::as_str)
                 .map(|s| s.to_string()),
+            date: value
+                .get("date")
+                .and_then(Value::as_str)
+                .map(|s| s.to_string()),
+            trial_id: value
+                .get("trial_id")
+                .and_then(Value::as_str)
+                .map(|s| s.to_string()),
+            experiment_id: value
+                .get("experiment_id")
+                .and_then(Value::as_str)
+                .map(|s| s.to_string()),
+            experiment_tag: value
+                .get("experiment_tag")
+                .and_then(Value::as_str)
+                .map(|s| s.to_string()),
             training_iteration,
             timesteps_total,
             episodes_total: value.get("episodes_total").and_then(value_as_u64),
@@ -120,6 +141,10 @@ impl MetricSample {
 
     pub fn timestamp(&self) -> Option<&str> {
         self.timestamp.as_deref()
+    }
+
+    pub fn trial_id(&self) -> Option<&str> {
+        self.trial_id.as_deref()
     }
 
     pub fn training_iteration(&self) -> Option<u64> {
@@ -204,6 +229,37 @@ impl MetricSample {
 
     pub(crate) fn set_time_this_iter_s(&mut self, value: f64) {
         self.time_this_iter_s = Some(value);
+    }
+}
+
+impl Default for MetricSample {
+    fn default() -> Self {
+        Self {
+            timestamp: None,
+            date: None,
+            trial_id: None,
+            experiment_id: None,
+            experiment_tag: None,
+            training_iteration: None,
+            timesteps_total: None,
+            episodes_total: None,
+            episodes_this_iter: None,
+            episode_reward_mean: None,
+            episode_reward_min: None,
+            episode_reward_max: None,
+            episode_len_mean: None,
+            time_this_iter_s: None,
+            time_total_s: None,
+            env_steps_this_iter: None,
+            env_throughput: None,
+            num_env_steps_sampled: None,
+            num_env_steps_trained: None,
+            num_agent_steps_sampled: None,
+            num_agent_steps_trained: None,
+            custom_metrics: BTreeMap::new(),
+            policies: BTreeMap::new(),
+            checkpoints: None,
+        }
     }
 }
 
