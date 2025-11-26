@@ -1,0 +1,71 @@
+{
+  "source": "1",
+  "kind": "iteration",
+  "timestamp": "2025-11-26T13:35:15.539227+00:00",
+  "training_iteration": 1,
+  "timesteps_total": 4800,
+  "time_this_iter_s": 16.69775915145874,
+  "time_total_s": 16.69775915145874,
+  "episodes_total": null,
+  "episodes_this_iter": null,
+  "episode_reward_mean": null,
+  "episode_reward_min": null,
+  "episode_reward_max": null,
+  "episode_len_mean": null,
+  "num_env_steps_sampled": 4800,
+  "num_env_steps_trained": 4800,
+  "num_agent_steps_sampled": 9600,
+  "num_agent_steps_trained": 9600,
+  "env_steps_this_iter": 4800,
+  "env_throughput": 287.51578146756975,
+  "num_workers": 4,
+  "custom_metrics": {},
+  "policies": {
+    "BLUE": {
+      "reward_mean": null,
+      "reward_min": null,
+      "reward_max": null,
+      "episode_len_mean": null,
+      "completed_episodes": null,
+      "learner": {
+        "num_agent_steps_trained": 240.0,
+        "num_grad_updates_lifetime": 300.5,
+        "diff_num_grad_updates_vs_sampler_policy": 299.5,
+        "allreduce_latency": 0.0,
+        "grad_gnorm": 1.130974889198939,
+        "cur_kl_coeff": 0.2,
+        "cur_lr": 0.0003,
+        "total_loss": 0.016837160193050902,
+        "policy_loss": -0.020590553088501717,
+        "vf_loss": 0.23745352587352198,
+        "vf_explained_var": 0.0944963256518046,
+        "kl": 0.09837000861143072,
+        "entropy": 5.048652667999267,
+        "entropy_coeff": 0.02
+      }
+    },
+    "RED": {
+      "reward_mean": null,
+      "reward_min": null,
+      "reward_max": null,
+      "episode_len_mean": null,
+      "completed_episodes": null,
+      "learner": {
+        "num_agent_steps_trained": 240.0,
+        "num_grad_updates_lifetime": 300.5,
+        "diff_num_grad_updates_vs_sampler_policy": 299.5,
+        "allreduce_latency": 0.0,
+        "grad_gnorm": 0.9686131324867407,
+        "cur_kl_coeff": 0.2,
+        "cur_lr": 0.0003,
+        "total_loss": -0.02608177878893912,
+        "policy_loss": -0.027155680327365796,
+        "vf_loss": 0.16708926742275557,
+        "vf_explained_var": -0.13702439179023107,
+        "kl": 0.09785311197241148,
+        "entropy": 5.1020677916208905,
+        "entropy_coeff": 0.02
+      }
+    }
+  }
+}

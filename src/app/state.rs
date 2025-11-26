@@ -8811,9 +8811,8 @@ fn write_rllib_config(path: &Path, config: &TrainingConfig) -> Result<()> {
             "    model:\n        vf_share_layers: False\n        custom_model: tui_cnn\n        custom_model_config:\n            channels: {cnn_channels}\n            fcnet_hiddens: {fcnet_hiddens}\n"
         ),
         PolicyType::Lstm => format!(
-            "    model:\n        vf_share_layers: False\n        max_seq_len: {max_seq_len}\n        custom_model: tui_lstm\n        custom_model_config:\n            hidden_size: {hidden}\n            num_layers: {layers}\n            fcnet_hiddens: {fcnet_hiddens}\n            include_prev_actions: {include_prev}\n",
+            "    _disable_action_flattening: true\n    model:\n        vf_share_layers: False\n        use_lstm: true\n        max_seq_len: {max_seq_len}\n        lstm_cell_size: {hidden}\n        lstm_use_prev_action: {include_prev}\n        lstm_use_prev_reward: false\n        fcnet_hiddens: {fcnet_hiddens}\n",
             hidden = config.rllib_lstm_cell_size,
-            layers = config.rllib_lstm_num_layers,
             max_seq_len = config.rllib_max_seq_len,
             include_prev = include_prev_actions
         ),

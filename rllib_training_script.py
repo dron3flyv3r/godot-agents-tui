@@ -236,11 +236,16 @@ class NumpyObsGDRLPettingZooEnv(GDRLPettingZooEnv):
         godot_obs, godot_rewards, godot_dones, godot_truncations, godot_infos = (
             self.godot_env.step(godot_actions, order_ij=True)
         )
-        active_agents = actions.keys()
+        active_agents = list(actions.keys())
         obs = {agent: godot_obs[agent] for agent in active_agents}
         rewards = {agent: godot_rewards[agent] for agent in active_agents}
         terminations = {agent: godot_dones[agent] for agent in active_agents}
         truncations = {agent: False for agent in active_agents}
+        # RLlib expects a special "__all__" flag indicating whether the entire episode ended.
+        # Without it, episode accounting stays at zero and rewards never show up.
+        done_all = all(bool(flag) for flag in terminations.values())
+        terminations["__all__"] = done_all
+        truncations["__all__"] = False
         infos = {agent: godot_infos[agent] for agent in active_agents}
 
         return self._convert_obs(obs), rewards, terminations, truncations, infos
@@ -322,7 +327,7 @@ class ControllerMetricsCallback(tune.Callback):
     def _emit_result(self, result: dict[str, Any]) -> None:
         if not self._source:
             return
-
+        
         def _to_float(val: Any) -> Optional[float]:
             if val is None:
                 return None
@@ -529,6 +534,9 @@ class ControllerMetricsCallback(tune.Callback):
             if numeric is not None:
                 return numeric
             return str(obj)
+        
+        with open("/home/kasper/GameProjects/agents/debug_result.json", "w") as f:
+            json.dump(_sanitize(payload), f, indent=2)
 
         print(f"{METRIC_PREFIX}{json.dumps(_sanitize(payload))}", flush=True)
 
@@ -642,6 +650,30 @@ if __name__ == "__main__":
 
     model_cfg = config_dict.get("model") or {}
     custom_model = model_cfg.get("custom_model")
+
+    if custom_model == "tui_lstm":
+        converted = dict(model_cfg)
+        custom_cfg = model_cfg.get("custom_model_config") or {}
+        config_dict["_disable_action_flattening"] = True
+        converted["use_lstm"] = True
+        if "lstm_cell_size" not in converted and custom_cfg.get("hidden_size") is not None:
+            converted["lstm_cell_size"] = int(custom_cfg["hidden_size"])
+        include_prev = custom_cfg.get("include_prev_actions")
+        if "lstm_use_prev_action" not in converted:
+            converted["lstm_use_prev_action"] = True if include_prev is None else bool(include_prev)
+        converted.setdefault("lstm_use_prev_reward", False)
+        if "fcnet_hiddens" not in converted and custom_cfg.get("fcnet_hiddens") is not None:
+            converted["fcnet_hiddens"] = custom_cfg["fcnet_hiddens"]
+        converted.pop("custom_model", None)
+        converted.pop("custom_model_config", None)
+        config_dict["model"] = converted
+        model_cfg = converted
+        custom_model = model_cfg.get("custom_model")
+        print(
+            "Converted tui_lstm custom model config to RLlib built-in LSTM settings.",
+            flush=True,
+        )
+
     algorithm_name = str(exp.get("algorithm") or "").upper()
     sac_like_algorithms = {"SAC"}
     if custom_model and algorithm_name in sac_like_algorithms:

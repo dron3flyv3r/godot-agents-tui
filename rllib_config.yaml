@@ -55,12 +55,12 @@ config:
     batch_mode: truncate_episodes
 
     num_gpus: 1
+    _disable_action_flattening: true
     model:
         vf_share_layers: False
+        use_lstm: true
         max_seq_len: 240
-        custom_model: tui_lstm
-        custom_model_config:
-            hidden_size: 128
-            num_layers: 2
-            fcnet_hiddens: [128, 128]
-            include_prev_actions: true
+        lstm_cell_size: 128
+        lstm_use_prev_action: true
+        lstm_use_prev_reward: false
+        fcnet_hiddens: [128, 128]
