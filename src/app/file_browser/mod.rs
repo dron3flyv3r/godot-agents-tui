@@ -10,6 +10,7 @@ pub enum FileBrowserTarget {
     SavedRun,
     SimulatorEnvPath,
     InterfaceAgentPath,
+    ChartExport,
 }
 
 #[derive(Debug, Clone)]

@@ -5,16 +5,16 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, List, ListItem, ListState,
-    Paragraph, Row, Table, Wrap,
+    Axis, Block, BorderType, Borders, Cell, Chart, Clear, Dataset, GraphType, List, ListItem,
+    ListState, Paragraph, Row, Table, Wrap,
 };
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    config::RLLIB_ALGORITHM_LIST, AgentType, App, ConfigField, FileBrowserEntry, FileBrowserKind,
-    FileBrowserState, InputMode, InterfaceFocus, MetricSample, MetricsFocus, SimulatorFocus,
-    StatusKind, TabId,
+    config::RLLIB_ALGORITHM_LIST, AgentType, App, ChartExportOptionField, ConfigField,
+    FileBrowserEntry, FileBrowserKind, FileBrowserState, InputMode, InterfaceFocus, MetricSample,
+    MetricsFocus, SimulatorFocus, StatusKind, TabId,
 };
 
 use super::utils::alphanumeric_sort_key;
@@ -76,7 +76,12 @@ fn compute_tick_step(min: f64, max: f64, target: usize) -> f64 {
     base
 }
 
-fn build_axis_labels(min: f64, max: f64, slots: usize, prefer_integers: bool) -> Vec<Span<'static>> {
+fn build_axis_labels(
+    min: f64,
+    max: f64,
+    slots: usize,
+    prefer_integers: bool,
+) -> Vec<Span<'static>> {
     if !min.is_finite() || !max.is_finite() || slots == 0 {
         return Vec::new();
     }
@@ -354,7 +359,9 @@ fn render_home_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         InputMode::BrowsingFiles
         | InputMode::Help
         | InputMode::ConfirmQuit
-        | InputMode::AdvancedConfig => {
+        | InputMode::AdvancedConfig
+        | InputMode::ChartExportOptions
+        | InputMode::EditingChartExportOption => {
             // These modes have their own full-screen renders
         }
     }
@@ -399,6 +406,10 @@ pub fn render_train(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_training_config(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if app.is_experimental() {
+        render_mars_training_config(frame, area, app);
+        return;
+    }
     let config = app.training_config();
     let input_mode = app.input_mode();
     let active_field = app.active_config_field();
@@ -589,6 +600,217 @@ pub fn render_metrics(frame: &mut Frame<'_>, area: Rect, app: &App) {
         // Large terminal - three column layout with chart on top
         render_metrics_large(frame, area, app);
     }
+}
+
+fn render_mars_training_config(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let cfg = app.mars_config();
+    let input_mode = app.input_mode();
+    let active_field = app.active_config_field();
+
+    let validation_icon = if app.is_training_config_valid() {
+        Span::styled("✓ ", Style::default().fg(Color::Green))
+    } else {
+        Span::styled("⚠ ", Style::default().fg(Color::Red))
+    };
+
+    let mut lines = vec![
+        Line::from(vec![
+            validation_icon,
+            Span::styled("Mode: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "MARS (experimental)",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Godot env: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if cfg.env_path.is_empty() {
+                    "<not set>"
+                } else {
+                    &cfg.env_path
+                },
+                {
+                    let base_color = if cfg.env_path.is_empty() {
+                        Color::Red
+                    } else {
+                        Color::White
+                    };
+                    let mut style = Style::default().fg(base_color);
+                    if input_mode == InputMode::EditingConfig
+                        && active_field == Some(ConfigField::MarsEnvPath)
+                    {
+                        style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+                    }
+                    style
+                },
+            ),
+            Span::styled(" (p:edit, b:browse)", Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(vec![
+            Span::styled("Method: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&cfg.method, {
+                let mut style = Style::default().fg(Color::White);
+                if input_mode == InputMode::SelectingConfigOption
+                    && active_field == Some(ConfigField::MarsMethod)
+                {
+                    style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+                }
+                style
+            }),
+            Span::styled("  •  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Algorithm: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&cfg.algorithm, {
+                let mut style = Style::default().fg(Color::White);
+                if input_mode == InputMode::SelectingConfigOption
+                    && active_field == Some(ConfigField::MarsAlgorithm)
+                {
+                    style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+                }
+                style
+            }),
+            Span::styled(" (m:method, o:algo)", Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(vec![
+            Span::styled("Episodes: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{}", cfg.max_episodes), {
+                let mut style = Style::default().fg(Color::White);
+                if input_mode == InputMode::EditingConfig
+                    && active_field == Some(ConfigField::MarsMaxEpisodes)
+                {
+                    style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+                }
+                style
+            }),
+            Span::styled("  •  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Steps/ep: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{}", cfg.max_steps_per_episode), {
+                let mut style = Style::default().fg(Color::White);
+                if input_mode == InputMode::EditingConfig
+                    && active_field == Some(ConfigField::MarsMaxStepsPerEpisode)
+                {
+                    style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+                }
+                style
+            }),
+            Span::styled(
+                " (e:episodes, s:steps)",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Batch: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{}", cfg.batch_size), {
+                let mut style = Style::default().fg(Color::White);
+                if input_mode == InputMode::EditingConfig
+                    && active_field == Some(ConfigField::MarsBatchSize)
+                {
+                    style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+                }
+                style
+            }),
+            Span::styled("  •  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("LR: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{}", cfg.learning_rate), {
+                let mut style = Style::default().fg(Color::White);
+                if input_mode == InputMode::EditingConfig
+                    && active_field == Some(ConfigField::MarsLearningRate)
+                {
+                    style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+                }
+                style
+            }),
+            Span::styled("  •  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Seed: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{}", cfg.seed), {
+                let mut style = Style::default().fg(Color::White);
+                if input_mode == InputMode::EditingConfig
+                    && active_field == Some(ConfigField::MarsSeed)
+                {
+                    style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+                }
+                style
+            }),
+            Span::styled(
+                " (edit via advanced settings for more)",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Save id: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&cfg.save_id, {
+                let mut style = Style::default().fg(Color::White);
+                if input_mode == InputMode::EditingConfig
+                    && active_field == Some(ConfigField::MarsSaveId)
+                {
+                    style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+                }
+                style
+            }),
+            Span::styled("  •  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Log interval: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{}", cfg.log_interval), {
+                let mut style = Style::default().fg(Color::White);
+                if input_mode == InputMode::EditingConfig
+                    && active_field == Some(ConfigField::MarsLogInterval)
+                {
+                    style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+                }
+                style
+            }),
+            Span::styled(" (advanced to edit)", Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(vec![
+            Span::styled("Press ", Style::default().fg(Color::DarkGray)),
+            Span::styled("p/m/o/e/s", Style::default().fg(Color::Yellow)),
+            Span::styled(" to edit basics, ", Style::default().fg(Color::DarkGray)),
+            Span::styled("a", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                " for advanced settings, ",
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled("h", Style::default().fg(Color::Yellow)),
+            Span::styled(" for help", Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+
+    if matches!(
+        input_mode,
+        InputMode::EditingConfig | InputMode::EditingAdvancedConfig
+    ) {
+        if let Some(field) = active_field {
+            let field_name = field.label();
+            lines.push(Line::from(vec![
+                Span::styled("Editing ", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    field_name,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(": {}", app.config_edit_buffer()),
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+            lines.push(Line::from(Span::styled(
+                "Enter: save • Esc: cancel • Backspace: delete",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title("Training (MARS)");
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
 }
 
 pub fn render_simulator(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -965,20 +1187,18 @@ fn render_interface_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Color::DarkGray
     };
 
-    let mut lines = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled("Status: ", label_style),
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(area);
+
+    let mut summary = Vec::new();
+    summary.push(Line::from(vec![
+        Span::styled("Run: ", label_style),
         Span::styled(
             if running { "Running" } else { "Idle" },
             Style::default()
                 .fg(status_color)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  Agent: ", label_style),
-        Span::styled(
-            config.agent_type.label(),
-            Style::default()
-                .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("  Mode: ", label_style),
@@ -988,16 +1208,73 @@ fn render_interface_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .fg(Color::LightCyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  Window: ", label_style),
+        Span::styled("  Agent: ", label_style),
         Span::styled(
-            if config.show_window {
-                "Visible"
-            } else {
-                "Headless"
-            },
+            config.agent_type.label(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  Artifact: ", label_style),
+        Span::styled(
+            config.model_format.label(),
             Style::default().fg(Color::Yellow),
         ),
-        Span::styled("  Auto-Restart: ", label_style),
+        Span::styled("  Python: workspace", label_style),
+    ]));
+
+    let agent_display = if config.agent_path.trim().is_empty() {
+        "<agent path not set>"
+    } else {
+        config.agent_path.trim()
+    };
+    summary.push(Line::from(vec![
+        Span::styled("Model Path: ", label_style),
+        Span::styled(
+            agent_display,
+            Style::default().fg(if config.agent_path.trim().is_empty() {
+                Color::LightRed
+            } else {
+                Color::White
+            }),
+        ),
+    ]));
+
+    match config.agent_type {
+        AgentType::StableBaselines3 => {
+            let algo_display = if config.sb3_algo.trim().is_empty() {
+                "auto"
+            } else {
+                config.sb3_algo.trim()
+            };
+            summary.push(Line::from(vec![
+                Span::styled("SB3 Algo: ", label_style),
+                Span::styled(algo_display, Style::default().fg(Color::White)),
+            ]));
+        }
+        AgentType::Rllib => {
+            let checkpoint = config
+                .rllib_checkpoint_number
+                .map(|n| format!("checkpoint_{n:06}"))
+                .unwrap_or_else(|| "latest".into());
+            summary.push(Line::from(vec![
+                Span::styled("RLlib Policy: ", label_style),
+                Span::styled(
+                    if config.rllib_policy_id.trim().is_empty() {
+                        "<default>"
+                    } else {
+                        config.rllib_policy_id.trim()
+                    },
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled("  Checkpoint: ", label_style),
+                Span::styled(checkpoint, Style::default().fg(Color::White)),
+            ]));
+        }
+    }
+
+    summary.push(Line::from(vec![
+        Span::styled("Auto-Restart: ", label_style),
         Span::styled(
             if config.auto_restart { "On" } else { "Off" },
             Style::default().fg(if config.auto_restart {
@@ -1017,66 +1294,15 @@ fn render_interface_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ),
     ]));
 
-    let agent_display = if config.agent_path.trim().is_empty() {
-        "<agent path not set>"
-    } else {
-        config.agent_path.trim()
-    };
-
-    lines.push(Line::from(vec![
-        Span::styled("Agent Path: ", label_style),
+    summary.push(Line::from(vec![
+        Span::styled("Delays: ", label_style),
         Span::styled(
-            agent_display,
-            Style::default().fg(if config.agent_path.trim().is_empty() {
-                Color::LightRed
-            } else {
-                Color::White
-            }),
-        ),
-    ]));
-
-    match config.agent_type {
-        AgentType::StableBaselines3 => {
-            let algo_display = if config.sb3_algo.trim().is_empty() {
-                "auto"
-            } else {
-                config.sb3_algo.trim()
-            };
-            lines.push(Line::from(vec![
-                Span::styled("SB3 Algo: ", label_style),
-                Span::styled(algo_display, Style::default().fg(Color::White)),
-            ]));
-        }
-        AgentType::Rllib => {
-            let checkpoint = config
-                .rllib_checkpoint_number
-                .map(|n| format!("checkpoint_{n:06}"))
-                .unwrap_or_else(|| "latest".into());
-            lines.push(Line::from(vec![
-                Span::styled("RLlib Policy: ", label_style),
-                Span::styled(
-                    if config.rllib_policy_id.trim().is_empty() {
-                        "<default>"
-                    } else {
-                        config.rllib_policy_id.trim()
-                    },
-                    Style::default().fg(Color::White),
-                ),
-                Span::styled("  Checkpoint: ", label_style),
-                Span::styled(checkpoint, Style::default().fg(Color::White)),
-            ]));
-        }
-    }
-
-    lines.push(Line::from(vec![
-        Span::styled("Step Delay: ", label_style),
-        Span::styled(
-            format!("{:.2}s", config.step_delay),
+            format!("step {:.2}s", config.step_delay),
             Style::default().fg(Color::Gray),
         ),
-        Span::styled("  Restart Delay: ", label_style),
+        Span::raw("  "),
         Span::styled(
-            format!("{:.1}s", config.restart_delay),
+            format!("restart {:.1}s", config.restart_delay),
             Style::default().fg(Color::Gray),
         ),
         Span::styled("  Focus: ", label_style),
@@ -1089,56 +1315,64 @@ fn render_interface_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ),
     ]));
 
-    lines.push(Line::from(vec![
-        Span::styled("Controls: ", label_style),
-        Span::styled("s", Style::default().fg(Color::Yellow)),
-        Span::styled("tart  ", label_style),
-        Span::styled("c", Style::default().fg(Color::Yellow)),
-        Span::styled("ancel  ", label_style),
-        Span::styled("m", Style::default().fg(Color::Yellow)),
-        Span::styled("ode  ", label_style),
-        Span::styled("w", Style::default().fg(Color::Yellow)),
-        Span::styled("indow  ", label_style),
-        Span::styled("a", Style::default().fg(Color::Yellow)),
-        Span::styled("uto  ", label_style),
-        Span::styled("t", Style::default().fg(Color::Yellow)),
-        Span::styled("ype  ", label_style),
-        Span::styled("T", Style::default().fg(Color::Yellow)),
-        Span::styled("racebacks  ", label_style),
-        Span::styled("p", Style::default().fg(Color::Yellow)),
-        Span::styled("ick  ", label_style),
-        Span::styled("y", Style::default().fg(Color::Yellow)),
-        Span::styled(" sync", label_style),
-    ]));
-
-    lines.push(Line::from(vec![
-        Span::styled("Focus & view: ", label_style),
-        Span::styled("f", Style::default().fg(Color::Yellow)),
-        Span::styled("/Tab switch  ", label_style),
-        Span::styled("v", Style::default().fg(Color::Yellow)),
-        Span::styled(" compact", label_style),
-    ]));
-
-    lines.push(Line::from(vec![
-        Span::styled("Delays: ", label_style),
-        Span::styled("[ / ]", Style::default().fg(Color::Yellow)),
-        Span::styled(" step  ", label_style),
-        Span::styled("- / =", Style::default().fg(Color::Yellow)),
-        Span::styled(" restart", label_style),
-    ]));
-
     if let Some(latest) = app.interface_status_line() {
-        lines.push(Line::from(vec![
+        summary.push(Line::from(vec![
             Span::styled("Latest: ", label_style),
             Span::styled(latest, Style::default().fg(Color::White)),
         ]));
     }
 
-    let block = Block::default()
+    let summary_block = Block::default()
         .borders(Borders::ALL)
         .title("Interface Overview");
-    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
-    frame.render_widget(paragraph, area);
+    let summary_paragraph = Paragraph::new(summary)
+        .block(summary_block)
+        .wrap(Wrap { trim: true });
+    frame.render_widget(summary_paragraph, cols[0]);
+
+    let mut controls = Vec::new();
+    controls.push(Line::from(vec![
+        Span::styled("s", Style::default().fg(Color::Yellow)),
+        Span::raw(" start   "),
+        Span::styled("c", Style::default().fg(Color::Yellow)),
+        Span::raw(" cancel   "),
+        Span::styled("b", Style::default().fg(Color::Yellow)),
+        Span::raw(" pick model   "),
+        Span::styled("y", Style::default().fg(Color::Yellow)),
+        Span::raw(" sync export"),
+    ]));
+    controls.push(Line::from(vec![
+        Span::styled("t", Style::default().fg(Color::Yellow)),
+        Span::raw(" agent type   "),
+        Span::styled("r", Style::default().fg(Color::Yellow)),
+        Span::raw(" artifact   "),
+        Span::styled("m", Style::default().fg(Color::Yellow)),
+        Span::raw(" mode"),
+    ]));
+    controls.push(Line::from(vec![
+        Span::styled("a", Style::default().fg(Color::Yellow)),
+        Span::raw(" auto-restart   "),
+        Span::styled("T", Style::default().fg(Color::Yellow)),
+        Span::raw(" tracebacks   "),
+        Span::styled("[/]", Style::default().fg(Color::Yellow)),
+        Span::raw(" step delay   "),
+        Span::styled("-/=", Style::default().fg(Color::Yellow)),
+        Span::raw(" restart delay"),
+    ]));
+    controls.push(Line::from(vec![
+        Span::styled("f/Tab", Style::default().fg(Color::Yellow)),
+        Span::raw(" focus   "),
+        Span::styled("v", Style::default().fg(Color::Yellow)),
+        Span::raw(" compact view"),
+    ]));
+
+    let controls_block = Block::default()
+        .borders(Borders::ALL)
+        .title("Quick Controls");
+    let controls_paragraph = Paragraph::new(controls)
+        .block(controls_block)
+        .wrap(Wrap { trim: true });
+    frame.render_widget(controls_paragraph, cols[1]);
 }
 
 fn render_interface_events(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -1777,7 +2011,7 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let is_focused = app.metrics_focus() == MetricsFocus::Chart;
     let border_color = focused_border_color(app, is_focused);
     let mut title = if is_focused {
-        "Metric Chart [FOCUSED - Enter to view policies, Tab to switch]".to_string()
+        "Metric Chart [FOCUSED - Enter to view policies, x to export, Tab to switch]".to_string()
     } else {
         "Metric Chart [Enter to view policies]".to_string()
     };
@@ -2208,12 +2442,15 @@ fn render_metrics_chart_info(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .map(|v| format!("{v:.4}"))
         .unwrap_or_else(|| "—".to_string());
 
-    let available_width = area.width.saturating_sub(4) as usize;
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(area);
+
+    let available_width = columns[0].width.saturating_sub(4) as usize;
     let mut lines = Vec::new();
 
-    // First line: metric info - smart wrap based on width
     if available_width >= 60 {
-        // Wide enough for one line
         lines.push(Line::from(vec![
             Span::styled("Metric: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
@@ -2235,7 +2472,6 @@ fn render_metrics_chart_info(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Span::styled(policy_label, Style::default().fg(Color::Yellow)),
         ]));
     } else {
-        // Narrow - split into two lines
         lines.push(Line::from(vec![
             Span::styled("Metric: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
@@ -2259,7 +2495,6 @@ fn render_metrics_chart_info(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ]));
     }
 
-    // Second line: controls - adaptive based on width
     if available_width >= 90 {
         lines.push(Line::from(vec![Span::styled(
             "↑/↓: navigate history  •  PgUp/PgDn: jump 10  •  Home/End: edges  •  , / . : cycle metric",
@@ -2267,13 +2502,12 @@ fn render_metrics_chart_info(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )]));
     } else if available_width >= 60 {
         lines.push(Line::from(vec![Span::styled(
-            "↑/↓: history  •  PgUp/Dn: jump  •  Home/End: edges  •  ,/.: metric",
+            "↑/↓: history  •  PgUp/Dn: jump + move marker  •  Home/End: edges  •  ,/.: metric",
             Style::default().fg(Color::DarkGray),
         )]));
     } else {
-        // Very narrow - show minimal controls
         lines.push(Line::from(vec![Span::styled(
-            "↑/↓: history  •  ,/.: metric",
+            "↑/↓: history  •  PgUp/Dn: jump marker  •  ,/.: metric",
             Style::default().fg(Color::DarkGray),
         )]));
     }
@@ -2299,16 +2533,130 @@ fn render_metrics_chart_info(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )]));
     }
 
-    let paragraph = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Controls")
-                .border_style(Style::default().fg(Color::DarkGray)),
-        )
-        .alignment(Alignment::Left)
-        .wrap(Wrap { trim: true });
-    frame.render_widget(paragraph, area);
+    let is_focused = app.metrics_focus() == MetricsFocus::Chart;
+    let border_color = focused_border_color(app, is_focused);
+    let mut title = if is_focused {
+        "Chart Info [FOCUSED - ↑/↓ to navigate]".to_string()
+    } else {
+        "Chart Info".to_string()
+    };
+    if let Some(source) = app.metrics_source_hint() {
+        title.push_str(&format!(" • {source}"));
+    }
+
+    let info_block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(border_color));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(info_block)
+            .alignment(Alignment::Left)
+            .wrap(Wrap { trim: true }),
+        columns[0],
+    );
+
+    let stats_block = Block::default()
+        .borders(Borders::ALL)
+        .title("Marker Stats")
+        .border_style(Style::default().fg(border_color));
+    frame.render_widget(
+        Paragraph::new(marker_stats_lines(app))
+            .block(stats_block)
+            .alignment(Alignment::Left)
+            .wrap(Wrap { trim: true }),
+        columns[1],
+    );
+}
+
+fn marker_stats_lines(app: &App) -> Vec<Line<'static>> {
+    let sample = match app.selected_metric_sample() {
+        Some(s) => s,
+        None => {
+            return vec![Line::from(Span::styled(
+                "No data yet.",
+                Style::default().fg(Color::DarkGray),
+            ))]
+        }
+    };
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("Iter: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format_option_u64(sample.training_iteration()),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::raw("  "),
+        Span::styled("Steps: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format_option_u64(sample.timesteps_total()),
+            Style::default().fg(Color::LightGreen),
+        ),
+    ]));
+
+    lines.push(Line::from(vec![
+        Span::styled("Reward: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format_option_f64(sample.episode_reward_mean()),
+            Style::default().fg(Color::LightMagenta),
+        ),
+        Span::raw("  "),
+        Span::styled("Len: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format_option_f64(sample.episode_len_mean()),
+            Style::default().fg(Color::LightBlue),
+        ),
+    ]));
+
+    lines.push(Line::from(vec![
+        Span::styled("Throughput: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format_option_rate(sample.env_throughput(), " steps/s"),
+            Style::default().fg(Color::LightYellow),
+        ),
+    ]));
+
+    lines.push(Line::from(vec![
+        Span::styled("Episodes: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format_option_u64(sample.episodes_total()),
+            Style::default().fg(Color::White),
+        ),
+    ]));
+
+    if let Some(metric) = app.current_chart_metric() {
+        if let Some(policy_id) = metric.policy_id() {
+            if let Some(policy) = sample.policies().get(policy_id) {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{policy_id} reward: "),
+                        Style::default()
+                            .fg(Color::LightCyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format_option_f64(policy.reward_mean()),
+                        Style::default().fg(Color::White),
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{policy_id} len: "),
+                        Style::default()
+                            .fg(Color::LightCyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format_option_f64(policy.episode_len_mean()),
+                        Style::default().fg(Color::White),
+                    ),
+                ]));
+            }
+        }
+    }
+
+    lines
 }
 
 fn render_metrics_policies(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -3523,7 +3871,8 @@ fn build_help_sections(app: &App) -> Vec<(String, Vec<String>)> {
         vec![
             "h / F1   Toggle this help overlay".to_string(),
             "q / Esc  Quit (when idle) or back out of dialogs".to_string(),
-            "1-7      Jump to Home, Train, Metrics, Simulator, Interface, Export, Settings".to_string(),
+            "1-7      Jump to Home, Train, Metrics, Simulator, Interface, Export, Settings"
+                .to_string(),
             "Home/End Jump to Home or Settings tab".to_string(),
         ],
     ));
@@ -3578,10 +3927,13 @@ fn metrics_help_lines(app: &App) -> Vec<String> {
         "Tab / Shift+Tab  Move focus between History, Summary, Policies, Chart".to_string(),
         "Enter            Expand/collapse the policies panel".to_string(),
         "Up/Down / j/k    Scroll the focused panel (History navigates entries)".to_string(),
-        "PgUp/PgDn        Fast scroll or jump 10 items".to_string(),
+        "PgUp/PgDn        Fast scroll or jump 10 items (also moves chart marker)".to_string(),
         "Home / End       Jump to newest / oldest metric".to_string(),
-        "Left / Right     Scroll expanded policies horizontally".to_string(),
+        "Left / Right     Scroll expanded policies, or move chart marker when chart is focused"
+            .to_string(),
         ", / .            Cycle the active chart metric".to_string(),
+        "x (chart focus)  Export chart as PNG (adjust options after choosing path)".to_string(),
+        "l                Load a saved run as the primary view (no overlays)".to_string(),
         "c                Load a saved run overlay from disk".to_string(),
         "C                Clear all overlays".to_string(),
         "o                Toggle viewing the selected saved run".to_string(),
@@ -3614,9 +3966,9 @@ fn simulator_help_lines() -> Vec<String> {
 fn interface_help_lines() -> Vec<String> {
     vec![
         "s / c          Start or cancel the agent interface".to_string(),
-        "m / w / a      Toggle mode, window visibility, auto-restart".to_string(),
-        "t / T          Toggle agent type / tracebacks".to_string(),
-        "p / y          Pick agent file or sync path from Export tab".to_string(),
+        "m / a          Toggle mode or auto-restart".to_string(),
+        "t / r / T      Toggle agent type, artifact, or tracebacks".to_string(),
+        "b / y          Pick agent file or sync path from Export tab".to_string(),
         "f / Tab        Switch focus between Events and Actions panes".to_string(),
         "v              Toggle compact agent table layout".to_string(),
         "[ / ]          Decrease / increase the step delay".to_string(),
@@ -3630,7 +3982,7 @@ fn export_help_lines() -> Vec<String> {
         "x              Start the export process".to_string(),
         "c              Cancel the running export".to_string(),
         "m              Toggle export mode (SB3 / RLlib)".to_string(),
-        "Tab / Shift+Tab / o  Switch focus between options and output log".to_string(),
+        "Tab / Shift+Tab / o / O  Switch focus between options and output log".to_string(),
         "Enter          Edit or toggle the selected option".to_string(),
         "Up/Down / j/k  Navigate options or scroll output".to_string(),
         "PgUp/PgDn      Fast-scroll the export log".to_string(),
@@ -3912,6 +4264,145 @@ pub fn render_file_browser(frame: &mut Frame<'_>, app: &App) {
         .block(inst_block)
         .alignment(Alignment::Left);
     frame.render_widget(inst_para, instructions_chunk);
+}
+
+pub fn render_chart_export_options(frame: &mut Frame<'_>, app: &App) {
+    let Some(opts) = app.chart_export_options() else {
+        return;
+    };
+
+    let area = frame.area();
+    let vertical_margin = area.height / 8;
+    let horizontal_margin = area.width / 8;
+    let overlay_area = Rect {
+        x: horizontal_margin,
+        y: vertical_margin,
+        width: area.width.saturating_sub(horizontal_margin * 2),
+        height: area.height.saturating_sub(vertical_margin * 2),
+    };
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Min(6),
+            Constraint::Length(4),
+        ])
+        .split(overlay_area);
+
+    let header_lines = vec![
+        Line::from(Span::styled(
+            "Chart Export",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            format!("Destination: {}", opts.path.display()),
+            Style::default().fg(Color::White),
+        )),
+    ];
+    let header_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Export Options ")
+        .title_alignment(Alignment::Center)
+        .border_style(Style::default().fg(Color::Cyan));
+    frame.render_widget(
+        Paragraph::new(header_lines)
+            .block(header_block)
+            .alignment(Alignment::Left)
+            .wrap(Wrap { trim: true }),
+        layout[0],
+    );
+
+    let fields = app.chart_export_fields();
+    let items: Vec<ListItem> = fields
+        .iter()
+        .map(|field| {
+            let label = match field {
+                ChartExportOptionField::FileName => "File name",
+                ChartExportOptionField::Theme => "Theme",
+                ChartExportOptionField::ShowLegend => "Legend",
+                ChartExportOptionField::LegendPosition => "Legend position",
+                ChartExportOptionField::ShowResumeMarker => "Resume marker",
+                ChartExportOptionField::ShowSelectionMarker => "Selection marker",
+                ChartExportOptionField::ShowStatsBox => "Stats box",
+                ChartExportOptionField::ShowCaption => "Caption",
+                ChartExportOptionField::ShowGrid => "Grid",
+                ChartExportOptionField::XAxisTitle => "X axis title",
+                ChartExportOptionField::YAxisTitle => "Y axis title",
+            };
+            let value = app
+                .chart_export_option_value(*field)
+                .unwrap_or_else(|| "-".to_string());
+            let value_style = Style::default().fg(Color::Yellow);
+            let spans = vec![
+                Span::styled(
+                    format!("{label}: "),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(value, value_style),
+            ];
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(app.chart_export_selection()));
+    let list_block = Block::default().borders(Borders::ALL);
+    let list = List::new(items)
+        .block(list_block)
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("› ");
+
+    frame.render_stateful_widget(list, layout[1], &mut list_state);
+
+    let instructions = if matches!(app.input_mode(), InputMode::EditingChartExportOption) {
+        vec![
+            Line::from(vec![
+                Span::styled("Editing: ", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!("{}_", app.chart_export_edit_buffer()),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(Span::styled(
+                "Enter: save • Esc: cancel • Backspace: delete",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]
+    } else {
+        vec![
+            Line::from(Span::styled(
+                "↑/↓: navigate • Enter/Space: toggle or edit • s: save PNG • Esc: cancel",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                "Theme toggles dark/light; edit axis titles or file name before saving.",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]
+    };
+
+    let footer_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Instructions ")
+        .title_alignment(Alignment::Center);
+    frame.render_widget(
+        Paragraph::new(instructions)
+            .block(footer_block)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true }),
+        layout[2],
+    );
 }
 
 pub fn render_advanced_config(frame: &mut Frame<'_>, app: &App) {

@@ -150,6 +150,7 @@ const RLLIB_ALGO_DESCRIPTION: &str = "Select which RLlib trainer to run.\n\
 - IMPALA: Distributed importance-sampling trainer for large discrete problems; excellent for many parallel actors, cannot operate on continuous actions.";
 
 pub const TRAINING_CONFIG_FILENAME: &str = "training_config.json";
+pub const MARS_TRAINING_CONFIG_FILENAME: &str = "mars_training_config.json";
 pub const EXPORT_CONFIG_FILENAME: &str = "export_config.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,6 +158,46 @@ pub const EXPORT_CONFIG_FILENAME: &str = "export_config.json";
 pub enum TrainingMode {
     SingleAgent,
     MultiAgent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MarsTrainingConfig {
+    pub env_path: String,
+    pub env_name: String,
+    pub method: String,
+    pub algorithm: String,
+    pub max_episodes: u32,
+    pub max_steps_per_episode: u32,
+    pub num_envs: u32,
+    pub num_process: u32,
+    pub batch_size: u32,
+    pub learning_rate: f64,
+    pub seed: i64,
+    pub save_id: String,
+    pub save_path: String,
+    pub log_interval: u32,
+}
+
+impl Default for MarsTrainingConfig {
+    fn default() -> Self {
+        Self {
+            env_path: String::new(),
+            env_name: "godot_env".to_string(),
+            method: "nfsp".to_string(),
+            algorithm: "PPO".to_string(),
+            max_episodes: 10_000,
+            max_steps_per_episode: 1_000,
+            num_envs: 1,
+            num_process: 1,
+            batch_size: 128,
+            learning_rate: 1e-4,
+            seed: 0,
+            save_id: "run_0".to_string(),
+            save_path: "logs/mars".to_string(),
+            log_interval: 20,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -354,6 +395,22 @@ pub enum ConfigField {
     RllibResumeFrom,
     RllibStopMode,
     RllibStopTimeSeconds,
+
+    // MARS experimental fields
+    MarsEnvPath,
+    MarsEnvName,
+    MarsMethod,
+    MarsAlgorithm,
+    MarsMaxEpisodes,
+    MarsMaxStepsPerEpisode,
+    MarsNumEnvs,
+    MarsNumProcess,
+    MarsBatchSize,
+    MarsLearningRate,
+    MarsSeed,
+    MarsSaveId,
+    MarsSavePath,
+    MarsLogInterval,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -558,6 +615,20 @@ impl ConfigField {
             ConfigField::RllibResumeFrom => "RLlib Resume Directory",
             ConfigField::RllibStopMode => "RLlib Stop Mode",
             ConfigField::RllibStopTimeSeconds => "RLlib Time Limit (s)",
+            ConfigField::MarsEnvPath => "MARS Godot Env Path",
+            ConfigField::MarsEnvName => "MARS Env Name",
+            ConfigField::MarsMethod => "MARS Method",
+            ConfigField::MarsAlgorithm => "MARS Algorithm",
+            ConfigField::MarsMaxEpisodes => "MARS Max Episodes",
+            ConfigField::MarsMaxStepsPerEpisode => "MARS Steps per Episode",
+            ConfigField::MarsNumEnvs => "MARS Parallel Envs",
+            ConfigField::MarsNumProcess => "MARS Processes",
+            ConfigField::MarsBatchSize => "MARS Batch Size",
+            ConfigField::MarsLearningRate => "MARS Learning Rate",
+            ConfigField::MarsSeed => "MARS Seed",
+            ConfigField::MarsSaveId => "MARS Save ID",
+            ConfigField::MarsSavePath => "MARS Save Path",
+            ConfigField::MarsLogInterval => "MARS Log Interval",
         }
     }
 
@@ -676,6 +747,22 @@ impl ConfigField {
             ConfigField::RllibStopTimeSeconds => {
                 "Target duration in seconds when using time-based stopping."
             }
+            ConfigField::MarsEnvPath => {
+                "Executable path to the exported Godot environment (required for MARS)."
+            }
+            ConfigField::MarsEnvName => "Name used for the environment within MARS runs.",
+            ConfigField::MarsMethod => "Multi-agent training method used by MARS.",
+            ConfigField::MarsAlgorithm => "Underlying algorithm class MARS instantiates.",
+            ConfigField::MarsMaxEpisodes => "Maximum number of episodes to run.",
+            ConfigField::MarsMaxStepsPerEpisode => "Maximum steps per episode before reset.",
+            ConfigField::MarsNumEnvs => "Number of parallel environments to sample.",
+            ConfigField::MarsNumProcess => "Processes to launch for sampling/updating.",
+            ConfigField::MarsBatchSize => "Batch size for optimizer updates.",
+            ConfigField::MarsLearningRate => "Learning rate for the chosen algorithm.",
+            ConfigField::MarsSeed => "Random seed for reproducibility.",
+            ConfigField::MarsSaveId => "Identifier appended to model/log directories.",
+            ConfigField::MarsSavePath => "Root path where MARS writes logs/checkpoints.",
+            ConfigField::MarsLogInterval => "How often (episodes) to log and emit metrics.",
         }
     }
 }

@@ -6,7 +6,7 @@ mod ui;
 use std::io::{self, Stdout};
 use std::time::Duration;
 
-use app::{App, ExportFocus, FileBrowserKind, FileBrowserState, InputMode, TabId};
+use app::{App, AppMode, ExportFocus, FileBrowserKind, FileBrowserState, InputMode, TabId};
 use clap::Parser;
 use cli::Cli;
 use color_eyre::Result;
@@ -48,6 +48,8 @@ fn handle_key_event(app: &mut App, key: KeyCode) -> Result<()> {
         InputMode::Help => handle_help_input(app, key)?,
         InputMode::ConfirmQuit => handle_confirm_quit_input(app, key)?,
         InputMode::EditingExport => handle_export_edit_input(app, key)?,
+        InputMode::ChartExportOptions => handle_chart_export_options_input(app, key)?,
+        InputMode::EditingChartExportOption => handle_chart_export_option_edit_input(app, key)?,
         InputMode::Normal => handle_normal_mode_key(app, key)?,
     }
     Ok(())
@@ -109,60 +111,103 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
             _ => {}
         }
     } else if app.active_tab().id == TabId::Train {
-        match key {
-            KeyCode::Char('t') | KeyCode::Char('T') => app.start_training()?,
-            KeyCode::Char('d') | KeyCode::Char('D') => app.start_demo_training()?,
-            KeyCode::Char('m') | KeyCode::Char('M') => {
-                app.toggle_training_mode();
-                app.set_status(
-                    format!(
-                        "Training mode: {}",
-                        match app.training_config().mode {
-                            app::TrainingMode::SingleAgent => "Single-Agent (SB3)",
-                            app::TrainingMode::MultiAgent => "Multi-Agent (RLlib)",
-                        }
-                    ),
-                    app::StatusKind::Info,
-                );
-            }
-            KeyCode::Char('c') | KeyCode::Char('C') => app.cancel_training(),
-            KeyCode::Char('g') | KeyCode::Char('G') => app.generate_rllib_config()?,
-            KeyCode::Char('e') | KeyCode::Char('E') => {
-                app.set_status(
-                    "Training config editing: p (path), s (steps), n (name), a (advanced)",
-                    app::StatusKind::Info,
-                );
-            }
-            KeyCode::Char('l') | KeyCode::Char('L') => app.clear_training_output(),
-            KeyCode::Char('p') | KeyCode::Char('P') if !app.is_training_running() => {
-                app.start_config_edit(app::ConfigField::EnvPath);
-            }
-            KeyCode::Char('s') | KeyCode::Char('S') if !app.is_training_running() => {
-                app.start_config_edit(app::ConfigField::Timesteps);
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') if !app.is_training_running() => {
-                app.start_config_edit(app::ConfigField::ExperimentName);
-            }
-            KeyCode::Char('b') | KeyCode::Char('B') => {
-                app.start_config_file_browser(app::ConfigField::EnvPath);
-            }
-            KeyCode::Char('a') | KeyCode::Char('A') => {
-                if app.is_training_running() {
-                    app.set_status(
-                        "Cannot edit advanced settings while training is running",
-                        app::StatusKind::Warning,
-                    );
-                } else {
-                    app.open_advanced_config();
+        if app.is_experimental() {
+            match key {
+                KeyCode::Char('t') | KeyCode::Char('T') => app.start_training()?,
+                KeyCode::Char('c') | KeyCode::Char('C') => app.cancel_training(),
+                KeyCode::Char('l') | KeyCode::Char('L') => app.clear_training_output(),
+                KeyCode::Char('p') | KeyCode::Char('P') if !app.is_training_running() => {
+                    app.start_config_edit(app::ConfigField::MarsEnvPath);
                 }
+                KeyCode::Char('b') | KeyCode::Char('B') => {
+                    app.start_config_file_browser(app::ConfigField::MarsEnvPath);
+                }
+                KeyCode::Char('m') | KeyCode::Char('M') if !app.is_training_running() => {
+                    app.start_config_edit(app::ConfigField::MarsMethod);
+                }
+                KeyCode::Char('o') | KeyCode::Char('O') if !app.is_training_running() => {
+                    app.start_config_edit(app::ConfigField::MarsAlgorithm);
+                }
+                KeyCode::Char('e') | KeyCode::Char('E') if !app.is_training_running() => {
+                    app.start_config_edit(app::ConfigField::MarsMaxEpisodes);
+                }
+                KeyCode::Char('s') | KeyCode::Char('S') if !app.is_training_running() => {
+                    app.start_config_edit(app::ConfigField::MarsMaxStepsPerEpisode);
+                }
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    if app.is_training_running() {
+                        app.set_status(
+                            "Cannot edit advanced settings while training is running",
+                            app::StatusKind::Warning,
+                        );
+                    } else {
+                        app.open_advanced_config();
+                    }
+                }
+                KeyCode::Up => app.scroll_training_output_up(1),
+                KeyCode::Down => app.scroll_training_output_down(1),
+                KeyCode::PageUp => app.scroll_training_output_up(10),
+                KeyCode::PageDown => app.scroll_training_output_down(10),
+                KeyCode::Char('k') | KeyCode::Char('K') => app.scroll_training_output_up(1),
+                KeyCode::Char('j') | KeyCode::Char('J') => app.scroll_training_output_down(1),
+                _ => {}
             }
-            KeyCode::Up => app.scroll_training_output_up(1),
-            KeyCode::Down => app.scroll_training_output_down(1),
-            KeyCode::PageUp => app.scroll_training_output_up(10),
-            KeyCode::PageDown => app.scroll_training_output_down(10),
-            KeyCode::Char('k') | KeyCode::Char('K') => app.scroll_training_output_up(1),
-            KeyCode::Char('j') | KeyCode::Char('J') => app.scroll_training_output_down(1),
-            _ => {}
+        } else {
+            match key {
+                KeyCode::Char('t') | KeyCode::Char('T') => app.start_training()?,
+                KeyCode::Char('d') | KeyCode::Char('D') => app.start_demo_training()?,
+                KeyCode::Char('m') | KeyCode::Char('M') => {
+                    app.toggle_training_mode();
+                    app.set_status(
+                        format!(
+                            "Training mode: {}",
+                            match app.training_config().mode {
+                                app::TrainingMode::SingleAgent => "Single-Agent (SB3)",
+                                app::TrainingMode::MultiAgent => "Multi-Agent (RLlib)",
+                            }
+                        ),
+                        app::StatusKind::Info,
+                    );
+                }
+                KeyCode::Char('c') | KeyCode::Char('C') => app.cancel_training(),
+                KeyCode::Char('g') | KeyCode::Char('G') => app.generate_rllib_config()?,
+                KeyCode::Char('e') | KeyCode::Char('E') => {
+                    app.set_status(
+                        "Training config editing: p (path), s (steps), n (name), a (advanced)",
+                        app::StatusKind::Info,
+                    );
+                }
+                KeyCode::Char('l') | KeyCode::Char('L') => app.clear_training_output(),
+                KeyCode::Char('p') | KeyCode::Char('P') if !app.is_training_running() => {
+                    app.start_config_edit(app::ConfigField::EnvPath);
+                }
+                KeyCode::Char('s') | KeyCode::Char('S') if !app.is_training_running() => {
+                    app.start_config_edit(app::ConfigField::Timesteps);
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') if !app.is_training_running() => {
+                    app.start_config_edit(app::ConfigField::ExperimentName);
+                }
+                KeyCode::Char('b') | KeyCode::Char('B') => {
+                    app.start_config_file_browser(app::ConfigField::EnvPath);
+                }
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    if app.is_training_running() {
+                        app.set_status(
+                            "Cannot edit advanced settings while training is running",
+                            app::StatusKind::Warning,
+                        );
+                    } else {
+                        app.open_advanced_config();
+                    }
+                }
+                KeyCode::Up => app.scroll_training_output_up(1),
+                KeyCode::Down => app.scroll_training_output_down(1),
+                KeyCode::PageUp => app.scroll_training_output_up(10),
+                KeyCode::PageDown => app.scroll_training_output_down(10),
+                KeyCode::Char('k') | KeyCode::Char('K') => app.scroll_training_output_up(1),
+                KeyCode::Char('j') | KeyCode::Char('J') => app.scroll_training_output_down(1),
+                _ => {}
+            }
         }
     } else if app.active_tab().id == TabId::Metrics {
         match key {
@@ -181,14 +226,18 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
                 }
             }
             KeyCode::Left => {
-                // Horizontal scroll in expanded policies view
-                if app.metrics_policies_expanded() {
+                // If chart is focused, move marker to newer sample; otherwise scroll expanded policies
+                if app.metrics_focus() == app::MetricsFocus::Chart {
+                    app.metrics_history_move_newer();
+                } else if app.metrics_policies_expanded() {
                     app.metrics_scroll_policies_left();
                 }
             }
             KeyCode::Right => {
-                // Horizontal scroll in expanded policies view
-                if app.metrics_policies_expanded() {
+                // If chart is focused, move marker to older sample; otherwise scroll expanded policies
+                if app.metrics_focus() == app::MetricsFocus::Chart {
+                    app.metrics_history_move_older();
+                } else if app.metrics_policies_expanded() {
                     app.metrics_scroll_policies_right();
                 }
             }
@@ -213,12 +262,16 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
             KeyCode::PageUp => {
                 if app.metrics_focus() == app::MetricsFocus::History {
                     app.metrics_history_page_newer(10);
+                } else if app.metrics_focus() == app::MetricsFocus::Chart {
+                    app.metrics_history_page_newer(10);
                 } else {
                     app.metrics_scroll_up(5);
                 }
             }
             KeyCode::PageDown => {
                 if app.metrics_focus() == app::MetricsFocus::History {
+                    app.metrics_history_page_older(10);
+                } else if app.metrics_focus() == app::MetricsFocus::Chart {
                     app.metrics_history_page_older(10);
                 } else {
                     app.metrics_scroll_down(5);
@@ -232,11 +285,17 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
             KeyCode::Char('.') | KeyCode::Char('>') => {
                 app.cycle_chart_metric_next();
             }
+            KeyCode::Char('x') | KeyCode::Char('X') => {
+                app.start_chart_export();
+            }
             KeyCode::Char('c') => {
                 app.start_run_overlay_browser()?;
             }
             KeyCode::Char('C') => {
                 app.clear_run_overlays();
+            }
+            KeyCode::Char('l') | KeyCode::Char('L') => {
+                app.start_run_view_only_browser()?;
             }
             KeyCode::Char('o') => {
                 app.toggle_selected_overlay_view();
@@ -285,11 +344,11 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
             KeyCode::Char('s') | KeyCode::Char('S') => app.start_interface()?,
             KeyCode::Char('c') | KeyCode::Char('C') => app.cancel_interface(),
             KeyCode::Char('m') | KeyCode::Char('M') => app.toggle_interface_mode(),
-            KeyCode::Char('w') | KeyCode::Char('W') => app.toggle_interface_window(),
             KeyCode::Char('a') | KeyCode::Char('A') => app.toggle_interface_auto_restart(),
             KeyCode::Char('t') => app.toggle_interface_agent_type(),
             KeyCode::Char('T') => app.toggle_interface_tracebacks(),
-            KeyCode::Char('p') | KeyCode::Char('P') => app.start_interface_agent_browser(),
+            KeyCode::Char('r') | KeyCode::Char('R') => app.toggle_interface_model_format(),
+            KeyCode::Char('b') | KeyCode::Char('B') => app.start_interface_agent_browser(),
             KeyCode::Char('y') | KeyCode::Char('Y') => app.interface_use_export_agent_path(),
             KeyCode::Char('f') | KeyCode::Char('F') | KeyCode::Tab => {
                 app.cycle_interface_focus();
@@ -405,6 +464,37 @@ fn handle_export_edit_input(app: &mut App, key: KeyCode) -> Result<()> {
     Ok(())
 }
 
+fn handle_chart_export_options_input(app: &mut App, key: KeyCode) -> Result<()> {
+    match key {
+        KeyCode::Esc => app.cancel_chart_export(),
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
+            app.select_previous_chart_export_field();
+        }
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+            app.select_next_chart_export_field();
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            app.toggle_chart_export_field();
+        }
+        KeyCode::Char('s') | KeyCode::Char('S') => {
+            app.confirm_chart_export();
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_chart_export_option_edit_input(app: &mut App, key: KeyCode) -> Result<()> {
+    match key {
+        KeyCode::Enter => app.confirm_chart_export_edit(),
+        KeyCode::Esc => app.cancel_chart_export_edit(),
+        KeyCode::Backspace => app.pop_chart_export_char(),
+        KeyCode::Char(ch) => app.push_chart_export_char(ch),
+        _ => {}
+    }
+    Ok(())
+}
+
 fn handle_file_browser_input(app: &mut App, key: KeyCode) -> Result<()> {
     match app.file_browser_state() {
         FileBrowserState::Browsing => match key {
@@ -493,14 +583,22 @@ fn handle_advanced_config_input(app: &mut App, key: KeyCode) -> Result<()> {
     Ok(())
 }
 
-fn run() -> Result<()> {
+fn run(mode: AppMode) -> Result<()> {
     let (mut terminal, _guard) = setup_terminal()?;
-    let mut app = App::new()?;
+    let mut app = App::new(mode)?;
+    let mut frame_counter: u32 = 0;
 
     while !app.should_quit() {
         app.process_background_tasks();
         app.clamp_all_metrics_scrolls();
+
+        // Every 60 frames, do a full redraw with buffer clearing
+        if frame_counter % 60 == 0 {
+            terminal.clear()?;
+        }
+
         terminal.draw(|frame| ui::render(frame, &app))?;
+        frame_counter = frame_counter.wrapping_add(1);
 
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key_event) = event::read()? {
@@ -519,7 +617,12 @@ fn main() -> Result<()> {
     if cli.command.is_some() {
         cli::handle_cli(cli)?;
     } else {
-        run()?;
+        let mode = if cli.exp {
+            AppMode::Experimental
+        } else {
+            AppMode::Standard
+        };
+        run(mode)?;
     }
 
     Ok(())

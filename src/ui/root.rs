@@ -17,6 +17,14 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         return;
     }
 
+    if matches!(
+        app.input_mode(),
+        InputMode::ChartExportOptions | InputMode::EditingChartExportOption
+    ) {
+        screens::render_chart_export_options(frame, app);
+        return;
+    }
+
     if app.input_mode() == InputMode::SelectingConfigOption {
         screens::render_choice_menu(frame, app);
         return;

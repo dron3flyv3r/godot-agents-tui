@@ -8,6 +8,7 @@ import os
 import pathlib
 import signal
 import shutil
+import sys
 from datetime import datetime, timezone
 from numbers import Number
 from typing import Any, Optional
@@ -98,6 +99,44 @@ def _uses_episode_replay_buffer(replay_cfg: Optional[dict]) -> bool:
         return isinstance(buffer_type, type) and issubclass(buffer_type, EpisodeReplayBuffer)
     except TypeError:
         return False
+
+
+def _resolve_env_path(raw_path: Optional[str]) -> Optional[str]:
+    """Resolve env_path to an existing file, adding platform suffix or searching folders."""
+    if raw_path is None or raw_path == "debug":
+        return raw_path
+
+    path = os.path.abspath(os.path.expanduser(str(raw_path)))
+    candidates: list[str] = [path]
+
+    suffix_map = {
+        "linux": ".x86_64",
+        "linux2": ".x86_64",
+        "darwin": ".app",
+        "win32": ".exe",
+    }
+    suffix = suffix_map.get(sys.platform, "")
+
+    # If no suffix was provided, try appending the platform suffix.
+    if suffix and pathlib.Path(path).suffix != suffix:
+        candidates.append(path + suffix)
+
+    # If the path is a directory, look for likely binaries inside.
+    if os.path.isdir(path):
+        dir_path = pathlib.Path(path)
+        candidates.append(str(dir_path / f"{dir_path.name}{suffix}"))
+        candidates.extend(str(p) for p in dir_path.glob(f"*{suffix}"))
+
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            if candidate != raw_path:
+                print(
+                    f"Resolved env_path from '{raw_path}' to '{candidate}'.",
+                    flush=True,
+                )
+            return candidate
+
+    raise FileNotFoundError(f"env_path '{raw_path}' not found. Tried: {candidates}")
 
 
 class NumpyObsGDRLPettingZooEnv(GDRLPettingZooEnv):
@@ -635,6 +674,24 @@ if __name__ == "__main__":
 
     config_dict: dict[str, Any] = exp.get("config") or {}
 
+    # RLlib 2.8+ renamed num_envs_per_worker -> num_envs_per_env_runner.
+    legacy_num_envs = config_dict.pop("num_envs_per_worker", None)
+    if legacy_num_envs is not None and "num_envs_per_env_runner" not in config_dict:
+        config_dict["num_envs_per_env_runner"] = legacy_num_envs
+        print(
+            "num_envs_per_worker is deprecated; using num_envs_per_env_runner instead.",
+            flush=True,
+        )
+
+    # Validate and normalize env_path early so Ray workers don't fail later.
+    env_cfg = config_dict.get("env_config") or {}
+    if "env_path" in env_cfg:
+        try:
+            env_cfg["env_path"] = _resolve_env_path(env_cfg["env_path"])
+        except FileNotFoundError as exc:
+            parser.error(str(exc))
+        config_dict["env_config"] = env_cfg
+
     def _force_classic_api_stack(reason: str) -> bool:
         """Disable RLModule/env-runner stack if currently enabled."""
         changed = False
@@ -735,7 +792,7 @@ if __name__ == "__main__":
 
     def env_creator(env_config):
         index = (
-            env_config.worker_index * exp["config"]["num_envs_per_worker"]
+            env_config.worker_index * exp["config"].get("num_envs_per_env_runner", 1)
             + env_config.vector_index
         )
         port = index + GodotEnv.DEFAULT_PORT
@@ -808,7 +865,7 @@ if __name__ == "__main__":
                 print(f"Debug panel failed: {exc}")
     else:  # Make temp env to get info needed for setting num_workers training config
         print(
-            "Starting a temporary env to get the number of envs and auto-set the num_envs_per_worker config value"
+            "Starting a temporary env to get the number of envs and auto-set the num_envs_per_env_runner config value"
         )
         tmp_env = GodotEnv(
             env_path=exp["config"]["env_config"]["env_path"], show_window=False
@@ -858,7 +915,7 @@ if __name__ == "__main__":
             "policy_mapping_fn": policy_mapping_fn,
         }
     else:
-        exp["config"]["num_envs_per_worker"] = num_envs
+        exp["config"]["num_envs_per_env_runner"] = num_envs
 
     tuner = None
     run_callbacks = []
@@ -875,11 +932,11 @@ if __name__ == "__main__":
         )
         if run_callbacks:
             run_config_kwargs["callbacks"] = run_callbacks
-
+        Algorithm.from_checkpoint
         tuner = tune.Tuner(
             trainable=exp["algorithm"],
             param_space=exp["config"],
-            run_config=RunConfig(**run_config_kwargs),
+            run_config=RunConfig(**run_config_kwargs), # type: ignore
         )
     else:
         tuner = tune.Tuner.restore(

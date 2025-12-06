@@ -18,6 +18,10 @@ const EMBEDDED_SCRIPT_ROOT: Option<&str> = option_env!("CONTROLLER_SCRIPTS_ROOT"
 #[command(name = "controller-mk2")]
 #[command(about = "Rust Controller for Godot RL Agents", long_about = None)]
 pub struct Cli {
+    /// Launch the experimental MARS-only controller UI
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub exp: bool,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }

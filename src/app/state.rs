@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::ops::Index;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -9,15 +9,21 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use chrono::{DateTime, Local};
 use color_eyre::{
     eyre::{bail, WrapErr},
     Result,
 };
+use plotters::prelude::{
+    BitMapBackend, ChartBuilder, Circle, IntoDrawingArea, IntoFont, LabelAreaPosition, LineSeries,
+    PathElement, RGBColor, SeriesLabelPosition, ShapeStyle, Text,
+};
 
 use super::config::{
     default_rllib_config_file, ConfigField, ExportConfig, ExportField, ExportMode, ExportState,
-    PolicyType, RllibAlgorithm, RllibStopMode, TrainingConfig, TrainingMode,
-    EXPORT_CONFIG_FILENAME, POLICY_TYPE_LIST, RLLIB_ALGORITHM_LIST, TRAINING_CONFIG_FILENAME,
+    MarsTrainingConfig, PolicyType, RllibAlgorithm, RllibStopMode, TrainingConfig, TrainingMode,
+    EXPORT_CONFIG_FILENAME, MARS_TRAINING_CONFIG_FILENAME, POLICY_TYPE_LIST, RLLIB_ALGORITHM_LIST,
+    TRAINING_CONFIG_FILENAME,
 };
 use super::file_browser::{FileBrowserEntry, FileBrowserKind, FileBrowserState, FileBrowserTarget};
 use super::metrics::{ChartData, ChartMetricKind, ChartMetricOption, MetricSample};
@@ -42,6 +48,7 @@ const SIM_INFO_VALUE_MAX_LEN: usize = 64;
 const SIM_ACTION_HISTORY_LIMIT: usize = 512;
 const EMBEDDED_PYTHON_BIN: Option<&str> = option_env!("CONTROLLER_PYTHON_BIN");
 const EMBEDDED_SCRIPT_ROOT: Option<&str> = option_env!("CONTROLLER_SCRIPTS_ROOT");
+const CONTROLLER_ROOT: Option<&str> = option_env!("CARGO_MANIFEST_DIR");
 const PROJECT_LOCATION_MAX_LEN: usize = 4096;
 const MAX_RUN_OVERLAYS: usize = 4;
 const OVERLAY_COLORS: [Color; 6] = [
@@ -92,6 +99,25 @@ const RLLIB_FRAMEWORK_CHOICES: [(&str, &str, &str); 2] = [
     ),
 ];
 
+const MARS_METHOD_CHOICES: &[(&str, &str)] = &[
+    ("Self-Play", "selfplay"),
+    ("Fictitious Self-Play", "fictitious_selfplay"),
+    ("Neural Fictitious Self-Play", "nfsp"),
+    ("Policy Space Response Oracle", "prso"),
+    ("Nash DQN", "nash_dqn"),
+    ("Nash DQN (Exploiter)", "nash_dqn_exploiter"),
+];
+
+const MARS_ALGO_CHOICES: &[&str] = &[
+    "PPO",
+    "DQN",
+    "NashDQN",
+    "NashDQNExploiter",
+    "NashPPO",
+    "NashActorCritic",
+    "NFSP",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabId {
     Home,
@@ -101,6 +127,12 @@ pub enum TabId {
     Interface,
     Export,
     Settings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppMode {
+    Standard,
+    Experimental,
 }
 
 #[derive(Debug, Clone)]
@@ -241,6 +273,82 @@ pub struct ChartOverlaySeries {
     pub points: Vec<(f64, f64)>,
 }
 
+#[derive(Debug, Clone)]
+struct ExportSeries {
+    label: String,
+    color: RGBColor,
+    points: Vec<(f64, f64)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChartExportStyle {
+    theme: ChartExportTheme,
+    show_legend: bool,
+    legend_position: ChartLegendPosition,
+    show_resume: bool,
+    show_selection: bool,
+    show_stats_box: bool,
+    show_caption: bool,
+    show_grid: bool,
+    x_label: String,
+    y_label: String,
+}
+
+impl Default for ChartExportStyle {
+    fn default() -> Self {
+        Self {
+            theme: ChartExportTheme::Dark,
+            show_legend: true,
+            legend_position: ChartLegendPosition::Auto,
+            show_resume: true,
+            show_selection: true,
+            show_stats_box: false,
+            show_caption: true,
+            show_grid: true,
+            x_label: String::from("Training iteration"),
+            y_label: String::from("Value"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChartExportTheme {
+    Dark,
+    Light,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ChartExportOptionField {
+    FileName,
+    Theme,
+    ShowLegend,
+    LegendPosition,
+    ShowResumeMarker,
+    ShowSelectionMarker,
+    ShowStatsBox,
+    ShowCaption,
+    ShowGrid,
+    XAxisTitle,
+    YAxisTitle,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChartExportOptions {
+    pub path: PathBuf,
+    pub file_name: String,
+    pub style: ChartExportStyle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChartLegendPosition {
+    Auto,
+    UpperLeft,
+    UpperRight,
+    LowerLeft,
+    LowerRight,
+    None,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
     Normal,
@@ -253,6 +361,14 @@ pub enum InputMode {
     Help,
     ConfirmQuit,
     EditingExport,
+    ChartExportOptions,
+    EditingChartExportOption,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunLoadMode {
+    Overlay,
+    ViewOnly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -401,13 +517,6 @@ impl AgentType {
         }
     }
 
-    fn arg(self) -> &'static str {
-        match self {
-            AgentType::StableBaselines3 => "sb3",
-            AgentType::Rllib => "rllib",
-        }
-    }
-
     fn toggle(&mut self) {
         *self = match self {
             AgentType::StableBaselines3 => AgentType::Rllib,
@@ -416,12 +525,34 @@ impl AgentType {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterfaceModelFormat {
+    Raw,
+    Onnx,
+}
+
+impl InterfaceModelFormat {
+    pub fn label(self) -> &'static str {
+        match self {
+            InterfaceModelFormat::Raw => "Raw checkpoint",
+            InterfaceModelFormat::Onnx => "ONNX export",
+        }
+    }
+
+    fn toggle(&mut self) {
+        *self = match self {
+            InterfaceModelFormat::Raw => InterfaceModelFormat::Onnx,
+            InterfaceModelFormat::Onnx => InterfaceModelFormat::Raw,
+        };
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct InterfaceConfig {
     pub agent_type: AgentType,
     pub agent_path: String,
+    pub model_format: InterfaceModelFormat,
     pub mode: SimulatorMode,
-    pub show_window: bool,
     pub step_delay: f64,
     pub restart_delay: f64,
     pub auto_restart: bool,
@@ -438,8 +569,8 @@ impl Default for InterfaceConfig {
         Self {
             agent_type: AgentType::StableBaselines3,
             agent_path: String::new(),
+            model_format: InterfaceModelFormat::Raw,
             mode: SimulatorMode::Single,
-            show_window: false,
             step_delay: 0.0,
             restart_delay: 2.0,
             auto_restart: true,
@@ -657,6 +788,7 @@ enum InterfaceEvent {
 }
 
 pub struct App {
+    mode: AppMode,
     tabs: Vec<Tab>,
     active_tab_index: usize,
     should_quit: bool,
@@ -688,7 +820,9 @@ pub struct App {
     status: Option<StatusMessage>,
 
     training_config: TrainingConfig,
+    mars_config: MarsTrainingConfig,
     training_config_valid: bool,
+    mars_config_valid: bool,
     advanced_validation_errors: HashMap<ConfigField, String>,
     training_output: Vec<String>,
     training_output_scroll: usize,
@@ -757,6 +891,14 @@ pub struct App {
     export_cancel: Option<Sender<()>>,
     export_running: bool,
 
+    chart_export_options: Option<ChartExportOptions>,
+    chart_export_selection: usize,
+    chart_export_edit_buffer: String,
+    active_chart_export_field: Option<ChartExportOptionField>,
+    chart_export_style: ChartExportStyle,
+    chart_export_last_dir: Option<PathBuf>,
+    run_load_mode: RunLoadMode,
+
     // Python environment check results
     python_sb3_available: Option<bool>,
     python_ray_available: Option<bool>,
@@ -765,10 +907,13 @@ pub struct App {
     controller_settings: ControllerSettings,
     settings_selection: usize,
     ui_animation_anchor: Instant,
+
+    session_start_time: DateTime<Local>,
+    training_log_session_written: bool,
 }
 
 impl App {
-    pub fn new() -> Result<Self> {
+    pub fn new(mode: AppMode) -> Result<Self> {
         let project_root = default_projects_root()?;
         let project_manager = ProjectManager::new(project_root)?;
         let projects = project_manager.list_projects()?;
@@ -805,6 +950,7 @@ impl App {
         ];
 
         let mut app = Self {
+            mode,
             tabs,
             active_tab_index: 0,
             should_quit: false,
@@ -835,7 +981,9 @@ impl App {
             file_browser_input: String::new(),
             status: None,
             training_config: TrainingConfig::default(),
+            mars_config: MarsTrainingConfig::default(),
             training_config_valid: false,
+            mars_config_valid: false,
             advanced_validation_errors: HashMap::new(),
             training_output: Vec::new(),
             training_output_scroll: 0,
@@ -903,6 +1051,14 @@ impl App {
             export_cancel: None,
             export_running: false,
 
+            chart_export_options: None,
+            chart_export_selection: 0,
+            chart_export_edit_buffer: String::new(),
+            active_chart_export_field: None,
+            chart_export_style: ChartExportStyle::default(),
+            chart_export_last_dir: None,
+            run_load_mode: RunLoadMode::Overlay,
+
             python_sb3_available: None,
             python_ray_available: None,
             python_check_user_triggered: false,
@@ -910,6 +1066,8 @@ impl App {
             controller_settings: ControllerSettings::default(),
             settings_selection: 0,
             ui_animation_anchor: Instant::now(),
+            session_start_time: Local::now(),
+            training_log_session_written: false,
         };
 
         app.ensure_selection_valid();
@@ -921,6 +1079,10 @@ impl App {
 
     pub fn tabs(&self) -> &[Tab] {
         &self.tabs
+    }
+
+    pub fn is_experimental(&self) -> bool {
+        matches!(self.mode, AppMode::Experimental)
     }
 
     pub fn active_index(&self) -> usize {
@@ -1764,6 +1926,414 @@ impl App {
         }
     }
 
+    fn chart_points_for_option(&self, option: &ChartMetricOption) -> Vec<(f64, f64)> {
+        let mut points = Vec::new();
+        for (idx, sample) in self.training_metrics_history().iter().enumerate() {
+            if let Some(value) = App::chart_value_for_sample(sample, option) {
+                let x = sample
+                    .training_iteration()
+                    .map(|iter| iter as f64)
+                    .unwrap_or_else(|| idx as f64);
+                points.push((x, value));
+            }
+        }
+        points
+    }
+
+    fn build_export_series(&self, option: &ChartMetricOption) -> Vec<ExportSeries> {
+        match option.kind() {
+            ChartMetricKind::AllPoliciesRewardMean
+            | ChartMetricKind::AllPoliciesEpisodeLenMean
+            | ChartMetricKind::AllPoliciesLearnerStat(_) => self
+                .chart_multi_series_data(option)
+                .into_iter()
+                .enumerate()
+                .filter_map(|(idx, (label, points))| {
+                    if points.is_empty() {
+                        None
+                    } else {
+                        Some(ExportSeries {
+                            label,
+                            color: export_palette_color(idx),
+                            points,
+                        })
+                    }
+                })
+                .collect(),
+            _ => {
+                let mut series = Vec::new();
+                let base_points = self.chart_points_for_option(option);
+                if !base_points.is_empty() {
+                    series.push(ExportSeries {
+                        label: option.label().to_string(),
+                        color: RGBColor(0, 196, 255),
+                        points: base_points,
+                    });
+                }
+                for (idx, overlay) in self
+                    .overlay_chart_series(option, usize::MAX)
+                    .into_iter()
+                    .enumerate()
+                {
+                    if overlay.points.is_empty() {
+                        continue;
+                    }
+                    let color = rgb_from_ratatui(overlay.color)
+                        .unwrap_or_else(|| export_palette_color(idx + 1));
+                    series.push(ExportSeries {
+                        label: overlay.label,
+                        color,
+                        points: overlay.points,
+                    });
+                }
+                series
+            }
+        }
+    }
+
+    fn default_chart_export_name(&self, option: &ChartMetricOption) -> String {
+        let mut parts = Vec::new();
+        let metric_slug = Self::slugify_label(option.label());
+        if !metric_slug.is_empty() {
+            parts.push(metric_slug);
+        }
+        if let Some(run_label) = self.viewed_run_label() {
+            let run_slug = Self::slugify_label(run_label);
+            if !run_slug.is_empty() {
+                parts.push(run_slug);
+            }
+        }
+        let base = if parts.is_empty() {
+            String::from("chart")
+        } else {
+            parts.join("-")
+        };
+        format!("{base}.png")
+    }
+
+    fn slugify_label(label: &str) -> String {
+        let mut output = String::new();
+        let mut last_sep = false;
+        for ch in label.chars() {
+            if ch.is_ascii_alphanumeric() {
+                output.push(ch);
+                last_sep = false;
+            } else if ch.is_ascii_whitespace() || ch == '-' || ch == '_' {
+                if !last_sep && !output.is_empty() {
+                    output.push('_');
+                }
+                last_sep = true;
+            } else if !last_sep && !output.is_empty() {
+                output.push('_');
+                last_sep = true;
+            }
+        }
+        output.trim_matches('_').to_string()
+    }
+
+    fn export_chart_image(&self, options: ChartExportOptions) -> Result<PathBuf> {
+        let Some(metric_option) = self.current_chart_metric() else {
+            bail!("No chart metric selected");
+        };
+
+        let series = self.build_export_series(&metric_option);
+        if series.is_empty() {
+            bail!("No chart data available to export");
+        }
+
+        let mut path = options.path.clone();
+        let has_png_extension = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("png"))
+            .unwrap_or(false);
+        if !has_png_extension {
+            path.set_extension("png");
+        }
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).wrap_err_with(|| {
+                format!("failed to create parent directory {}", parent.display())
+            })?;
+        }
+
+        let resume_x = if options.style.show_resume {
+            self.resume_marker_iteration().map(|iter| iter as f64)
+        } else {
+            None
+        };
+        let ((x_min, x_max), (y_min, y_max)) = Self::export_bounds(&series, resume_x)
+            .ok_or_else(|| color_eyre::eyre::eyre!("Chart has no finite datapoints to export"))?;
+
+        let palette = export_colors(options.style.theme);
+        let path_string = path.to_string_lossy().to_string();
+        let root_area = BitMapBackend::new(&path_string, (1920, 1080)).into_drawing_area();
+        root_area.fill(&palette.background)?;
+        let (full_w, _full_h) = root_area.dim_in_pixel();
+        let stats_width = if options.style.show_stats_box {
+            (full_w as f64 * 0.32).round() as i32
+        } else {
+            0
+        };
+        let chart_width = (full_w as i32).saturating_sub(stats_width.max(0));
+        let (chart_area, stats_area) = if stats_width > 0 {
+            let (left, right) = root_area.split_horizontally(chart_width);
+            (left, Some(right))
+        } else {
+            (root_area.clone(), None)
+        };
+
+        let caption = if options.style.show_caption {
+            Some(if let Some(project) = &self.active_project {
+                format!("{} — {}", metric_option.label(), project.name)
+            } else {
+                metric_option.label().to_string()
+            })
+        } else {
+            None
+        };
+
+        let mut builder = ChartBuilder::on(&chart_area);
+        builder.margin(30);
+        if let Some(text) = caption {
+            builder.caption(text, ("sans-serif", 36).into_font().color(&palette.caption));
+        }
+
+        let mut chart = builder
+            .set_label_area_size(LabelAreaPosition::Left, 70)
+            .set_label_area_size(LabelAreaPosition::Bottom, 60)
+            .build_cartesian_2d(x_min..x_max, y_min..y_max)?;
+
+        let mut mesh = chart.configure_mesh();
+        if options.style.show_grid {
+            mesh.light_line_style(&palette.grid);
+        } else {
+            mesh.disable_mesh();
+        }
+
+        mesh.x_desc(options.style.x_label.clone())
+            .y_desc(options.style.y_label.clone())
+            .axis_desc_style(("sans-serif", 24).into_font().color(&palette.axis_label))
+            .label_style(("sans-serif", 18).into_font().color(&palette.label))
+            .draw()?;
+
+        for series_item in &series {
+            let color = series_item.color;
+            chart
+                .draw_series(LineSeries::new(
+                    series_item.points.clone(),
+                    ShapeStyle::from(&color).stroke_width(3),
+                ))?
+                .label(series_item.label.clone())
+                .legend(move |(x, y)| {
+                    PathElement::new(
+                        vec![(x, y), (x + 24, y)],
+                        ShapeStyle::from(&color).stroke_width(3),
+                    )
+                });
+        }
+
+        if let Some(x) = resume_x {
+            chart.draw_series(LineSeries::new(
+                vec![(x, y_min), (x, y_max)],
+                ShapeStyle::from(&palette.resume).stroke_width(2),
+            ))?;
+        }
+
+        if options.style.show_selection {
+            if let Some((sel_x, sel_y)) = self.selected_chart_point(&metric_option) {
+                chart.draw_series(LineSeries::new(
+                    vec![(sel_x, y_min), (sel_x, y_max)],
+                    ShapeStyle::from(&palette.selection_line).stroke_width(2),
+                ))?;
+                chart.draw_series(std::iter::once(Circle::new(
+                    (sel_x, sel_y),
+                    6,
+                    ShapeStyle::from(&palette.selection).filled(),
+                )))?;
+            }
+        }
+
+        if options.style.show_legend && series.len() > 1 {
+            if let Some(pos) = legend_position(options.style.legend_position) {
+                chart
+                    .configure_series_labels()
+                    .border_style(&palette.legend_border)
+                    .background_style(palette.legend_bg)
+                    .label_font(("sans-serif", 18).into_font().color(&palette.label))
+                    .position(pos)
+                    .draw()?;
+            }
+        }
+
+        if let (Some(area), Some(sel_sample)) = (stats_area, self.selected_metric_sample().cloned())
+        {
+            let overlay_sample = self.selected_overlay_sample().cloned();
+            let lines =
+                self.build_export_stats_lines(&metric_option, &sel_sample, overlay_sample.as_ref());
+            area.fill(&palette.background)?;
+            let text_style = ("sans-serif", 18).into_font().color(&palette.label);
+            for (idx, line) in lines.into_iter().enumerate() {
+                let y = 30 + (idx as i32 * 24);
+                let _ = area.draw(&Text::new(line, (10, y), text_style.clone()));
+            }
+        }
+
+        root_area.present()?;
+        Ok(path)
+    }
+
+    fn selected_chart_point(&self, option: &ChartMetricOption) -> Option<(f64, f64)> {
+        match option.kind() {
+            ChartMetricKind::AllPoliciesRewardMean
+            | ChartMetricKind::AllPoliciesEpisodeLenMean
+            | ChartMetricKind::AllPoliciesLearnerStat(_) => None,
+            _ => {
+                let sample = self.selected_metric_sample()?;
+                let y = App::chart_value_for_sample(sample, option)?;
+                let x = sample
+                    .training_iteration()
+                    .map(|iter| iter as f64)
+                    .unwrap_or(0.0);
+                Some((x, y))
+            }
+        }
+    }
+
+    fn export_bounds(
+        series: &[ExportSeries],
+        extra_x: Option<f64>,
+    ) -> Option<((f64, f64), (f64, f64))> {
+        let mut x_min = f64::INFINITY;
+        let mut x_max = f64::NEG_INFINITY;
+        let mut y_min = f64::INFINITY;
+        let mut y_max = f64::NEG_INFINITY;
+
+        for set in series {
+            for &(x, y) in &set.points {
+                if x.is_finite() {
+                    x_min = x_min.min(x);
+                    x_max = x_max.max(x);
+                }
+                if y.is_finite() {
+                    y_min = y_min.min(y);
+                    y_max = y_max.max(y);
+                }
+            }
+        }
+
+        if let Some(x) = extra_x {
+            if x.is_finite() {
+                x_min = x_min.min(x);
+                x_max = x_max.max(x);
+            }
+        }
+
+        if !x_min.is_finite() || !x_max.is_finite() || !y_min.is_finite() || !y_max.is_finite() {
+            return None;
+        }
+
+        if (x_max - x_min).abs() < 1e-6 {
+            x_max = x_min + 1.0;
+        }
+        if (y_max - y_min).abs() < 1e-6 {
+            let delta = (y_max.abs().max(1.0)) * 0.1;
+            y_min -= delta;
+            y_max += delta;
+        }
+
+        Some(((x_min, x_max), (y_min, y_max)))
+    }
+
+    fn build_export_stats_lines(
+        &self,
+        option: &ChartMetricOption,
+        sample: &MetricSample,
+        overlay_sample: Option<&MetricSample>,
+    ) -> Vec<String> {
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "Iter: {}   Steps: {}",
+            sample
+                .training_iteration()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "—".into()),
+            sample
+                .timesteps_total()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "—".into())
+        ));
+        lines.push(format!(
+            "Reward: {}   Len: {}",
+            format_opt_f(sample.episode_reward_mean()),
+            format_opt_f(sample.episode_len_mean())
+        ));
+        if let Some(tp) = sample.env_throughput() {
+            lines.push(format!("Throughput: {:.2} steps/s", tp));
+        }
+
+        let overlay_val = overlay_sample.and_then(|ov| App::chart_value_for_sample(ov, option));
+        if let Some(val) = App::chart_value_for_sample(sample, option) {
+            let base = format!("Metric: {:.4}", val);
+            let delta = overlay_val.map(|ov| format_delta(val - ov));
+            if let Some(d) = delta {
+                lines.push(format!("{base}   Δ {d}"));
+            } else {
+                lines.push(base);
+            }
+        }
+
+        match option.kind() {
+            ChartMetricKind::AllPoliciesRewardMean
+            | ChartMetricKind::AllPoliciesEpisodeLenMean
+            | ChartMetricKind::AllPoliciesLearnerStat(_) => {
+                let mut policies: Vec<_> = sample.policies().iter().collect();
+                policies.sort_by(|a, b| a.0.cmp(b.0));
+                for (id, metrics) in policies.into_iter().take(6) {
+                    let base_reward = metrics.reward_mean();
+                    let overlay_delta = overlay_sample.and_then(|ov| {
+                        ov.policies()
+                            .get(id)
+                            .and_then(|m| base_reward.zip(m.reward_mean()).map(|(a, b)| a - b))
+                    });
+                    let reward_str = format_opt_f(base_reward);
+                    let delta_str = overlay_delta.map(format_delta).unwrap_or_default();
+                    lines.push(format!("{id}: reward {reward_str} {delta_str}"));
+                }
+            }
+            _ => {
+                if let Some(policy_id) = option.policy_id() {
+                    if let Some(policy) = sample.policies().get(policy_id) {
+                        lines.push(format!(
+                            "{policy_id} reward: {}",
+                            format_opt_f(policy.reward_mean())
+                        ));
+                        lines.push(format!(
+                            "{policy_id} len: {}",
+                            format_opt_f(policy.episode_len_mean())
+                        ));
+                        if let Some(overlay) = overlay_sample {
+                            if let Some(overlay_policy) = overlay.policies().get(policy_id) {
+                                if let Some(delta) = policy
+                                    .reward_mean()
+                                    .zip(overlay_policy.reward_mean())
+                                    .map(|(a, b)| a - b)
+                                {
+                                    lines.push(format!(
+                                        "{policy_id} Δ reward: {}",
+                                        format_delta(delta)
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        lines
+    }
+
     pub fn policy_comparison(&self, policy_id: &str) -> Option<PolicyComparisonData> {
         let overlay_sample = self.selected_overlay_sample()?;
         let overlay_metrics = overlay_sample.policies().get(policy_id)?;
@@ -1837,6 +2407,10 @@ impl App {
 
     pub fn settings_selection_index(&self) -> usize {
         self.settings_selection
+    }
+
+    pub fn chart_export_edit_buffer(&self) -> &str {
+        &self.chart_export_edit_buffer
     }
 
     pub fn current_settings_field(&self) -> SettingsField {
@@ -1929,7 +2503,11 @@ impl App {
                 }
                 if let Ok(meta) = entry.metadata() {
                     if let Ok(modified) = meta.modified() {
-                        if newest.as_ref().map(|(ts, _)| modified > *ts).unwrap_or(true) {
+                        if newest
+                            .as_ref()
+                            .map(|(ts, _)| modified > *ts)
+                            .unwrap_or(true)
+                        {
                             newest = Some((modified, trial_path.clone()));
                         }
                     }
@@ -2027,17 +2605,17 @@ impl App {
             }
         };
 
-        let (checkpoint_dir, checkpoint_number) = match self.select_checkpoint_dir(&sample, &trial_dir)?
-        {
-            Some((dir, num)) => (dir, num),
-            None => {
-                self.set_status(
-                    "No checkpoints found in the matched RLlib run directory.",
-                    StatusKind::Warning,
-                );
-                return Ok(());
-            }
-        };
+        let (checkpoint_dir, checkpoint_number) =
+            match self.select_checkpoint_dir(&sample, &trial_dir)? {
+                Some((dir, num)) => (dir, num),
+                None => {
+                    self.set_status(
+                        "No checkpoints found in the matched RLlib run directory.",
+                        StatusKind::Warning,
+                    );
+                    return Ok(());
+                }
+            };
 
         let resume_dir = trial_dir.parent().unwrap_or(&trial_dir).to_path_buf();
         let resume_display = self.project_relative_display(&resume_dir);
@@ -2097,35 +2675,35 @@ impl App {
     }
 
     pub fn metrics_cycle_focus_next(&mut self) {
-        self.metrics_focus = match self.metrics_focus {
-            MetricsFocus::History => MetricsFocus::Policies,
-            MetricsFocus::Policies => MetricsFocus::History,
-            MetricsFocus::Chart => MetricsFocus::History,
-            MetricsFocus::Summary => MetricsFocus::History,
-        };
-
         // self.metrics_focus = match self.metrics_focus {
-        //     MetricsFocus::History => MetricsFocus::Summary,
-        //     MetricsFocus::Summary => MetricsFocus::Policies,
-        //     MetricsFocus::Policies => MetricsFocus::Chart,
+        //     MetricsFocus::History => MetricsFocus::Policies,
+        //     MetricsFocus::Policies => MetricsFocus::History,
         //     MetricsFocus::Chart => MetricsFocus::History,
+        //     MetricsFocus::Summary => MetricsFocus::History,
         // };
+
+        self.metrics_focus = match self.metrics_focus {
+            MetricsFocus::History => MetricsFocus::Summary,
+            MetricsFocus::Summary => MetricsFocus::Policies,
+            MetricsFocus::Policies => MetricsFocus::Chart,
+            MetricsFocus::Chart => MetricsFocus::History,
+        };
     }
 
     pub fn metrics_cycle_focus_previous(&mut self) {
-        self.metrics_focus = match self.metrics_focus {
-            MetricsFocus::History => MetricsFocus::Policies,
-            MetricsFocus::Policies => MetricsFocus::History,
-            MetricsFocus::Chart => MetricsFocus::History,
-            MetricsFocus::Summary => MetricsFocus::History,
-        };
-
         // self.metrics_focus = match self.metrics_focus {
-        //     MetricsFocus::History => MetricsFocus::Chart,
-        //     MetricsFocus::Chart => MetricsFocus::Policies,
-        //     MetricsFocus::Policies => MetricsFocus::Summary,
+        //     MetricsFocus::History => MetricsFocus::Policies,
+        //     MetricsFocus::Policies => MetricsFocus::History,
+        //     MetricsFocus::Chart => MetricsFocus::History,
         //     MetricsFocus::Summary => MetricsFocus::History,
         // };
+
+        self.metrics_focus = match self.metrics_focus {
+            MetricsFocus::History => MetricsFocus::Chart,
+            MetricsFocus::Chart => MetricsFocus::Policies,
+            MetricsFocus::Policies => MetricsFocus::Summary,
+            MetricsFocus::Summary => MetricsFocus::History,
+        };
     }
 
     pub fn metrics_summary_scroll(&self) -> usize {
@@ -2207,6 +2785,287 @@ impl App {
         }
     }
 
+    pub fn start_chart_export(&mut self) {
+        if self.metrics_focus != MetricsFocus::Chart {
+            self.set_status(
+                "Focus the chart first (Tab to switch) before exporting",
+                StatusKind::Warning,
+            );
+            return;
+        }
+
+        let Some(option) = self.current_chart_metric() else {
+            self.set_status("Select a metric before exporting", StatusKind::Warning);
+            return;
+        };
+
+        let series = self.build_export_series(&option);
+        if series.is_empty() {
+            self.set_status("No chart data available to export yet", StatusKind::Warning);
+            return;
+        }
+
+        let default_name = self.default_chart_export_name(&option);
+        self.start_file_browser(
+            FileBrowserTarget::ChartExport,
+            FileBrowserKind::OutputFile {
+                extension: Some("png".into()),
+            },
+            Some(default_name),
+        );
+        self.set_status("Choose a filename to save the chart PNG", StatusKind::Info);
+    }
+
+    fn start_chart_export_options(&mut self, path: PathBuf) {
+        let Some(option) = self.current_chart_metric() else {
+            self.set_status("No chart metric selected", StatusKind::Warning);
+            return;
+        };
+
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("chart.png")
+            .to_string();
+        let parent = path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let mut final_path = parent.clone();
+        final_path.push(&file_name);
+
+        let mut style = self.chart_export_style.clone();
+        if style.y_label.is_empty() || style.y_label == "Value" {
+            style.y_label = option.label().to_string();
+        }
+        self.chart_export_last_dir = Some(
+            final_path
+                .parent()
+                .unwrap_or_else(|| parent.as_path())
+                .to_path_buf(),
+        );
+        let options = ChartExportOptions {
+            path: final_path,
+            file_name,
+            style,
+        };
+
+        self.chart_export_options = Some(options);
+        self.chart_export_selection = 0;
+        self.chart_export_edit_buffer.clear();
+        self.active_chart_export_field = None;
+        self.input_mode = InputMode::ChartExportOptions;
+        self.set_status(
+            "Adjust export options, press s to save or Esc to cancel",
+            StatusKind::Info,
+        );
+    }
+
+    pub fn chart_export_fields(&self) -> [ChartExportOptionField; 11] {
+        [
+            ChartExportOptionField::FileName,
+            ChartExportOptionField::Theme,
+            ChartExportOptionField::ShowLegend,
+            ChartExportOptionField::LegendPosition,
+            ChartExportOptionField::ShowResumeMarker,
+            ChartExportOptionField::ShowSelectionMarker,
+            ChartExportOptionField::ShowStatsBox,
+            ChartExportOptionField::ShowCaption,
+            ChartExportOptionField::ShowGrid,
+            ChartExportOptionField::XAxisTitle,
+            ChartExportOptionField::YAxisTitle,
+        ]
+    }
+
+    pub fn chart_export_selection(&self) -> usize {
+        self.chart_export_selection
+    }
+
+    pub fn chart_export_options(&self) -> Option<&ChartExportOptions> {
+        self.chart_export_options.as_ref()
+    }
+
+    pub fn chart_export_option_value(&self, field: ChartExportOptionField) -> Option<String> {
+        let opts = self.chart_export_options.as_ref()?;
+        let value = match field {
+            ChartExportOptionField::FileName => opts.file_name.clone(),
+            ChartExportOptionField::Theme => match opts.style.theme {
+                ChartExportTheme::Dark => "Dark".to_string(),
+                ChartExportTheme::Light => "Light".to_string(),
+            },
+            ChartExportOptionField::ShowLegend => format_bool(opts.style.show_legend),
+            ChartExportOptionField::LegendPosition => format!("{:?}", opts.style.legend_position),
+            ChartExportOptionField::ShowResumeMarker => format_bool(opts.style.show_resume),
+            ChartExportOptionField::ShowSelectionMarker => format_bool(opts.style.show_selection),
+            ChartExportOptionField::ShowStatsBox => format_bool(opts.style.show_stats_box),
+            ChartExportOptionField::ShowCaption => format_bool(opts.style.show_caption),
+            ChartExportOptionField::ShowGrid => format_bool(opts.style.show_grid),
+            ChartExportOptionField::XAxisTitle => opts.style.x_label.clone(),
+            ChartExportOptionField::YAxisTitle => opts.style.y_label.clone(),
+        };
+        Some(value)
+    }
+
+    pub fn select_next_chart_export_field(&mut self) {
+        let fields = self.chart_export_fields();
+        if fields.is_empty() {
+            return;
+        }
+        self.chart_export_selection = (self.chart_export_selection + 1) % fields.len();
+    }
+
+    pub fn select_previous_chart_export_field(&mut self) {
+        let fields = self.chart_export_fields();
+        if fields.is_empty() {
+            return;
+        }
+        if self.chart_export_selection == 0 {
+            self.chart_export_selection = fields.len() - 1;
+        } else {
+            self.chart_export_selection -= 1;
+        }
+    }
+
+    pub fn toggle_chart_export_field(&mut self) {
+        let field = self.chart_export_fields()[self.chart_export_selection];
+        let Some(opts) = self.chart_export_options.as_mut() else {
+            return;
+        };
+        match field {
+            ChartExportOptionField::Theme => {
+                opts.style.theme = match opts.style.theme {
+                    ChartExportTheme::Dark => ChartExportTheme::Light,
+                    ChartExportTheme::Light => ChartExportTheme::Dark,
+                };
+            }
+            ChartExportOptionField::ShowLegend => opts.style.show_legend = !opts.style.show_legend,
+            ChartExportOptionField::LegendPosition => {
+                opts.style.legend_position = match opts.style.legend_position {
+                    ChartLegendPosition::Auto => ChartLegendPosition::UpperRight,
+                    ChartLegendPosition::UpperRight => ChartLegendPosition::UpperLeft,
+                    ChartLegendPosition::UpperLeft => ChartLegendPosition::LowerRight,
+                    ChartLegendPosition::LowerRight => ChartLegendPosition::LowerLeft,
+                    ChartLegendPosition::LowerLeft => ChartLegendPosition::None,
+                    ChartLegendPosition::None => ChartLegendPosition::Auto,
+                };
+            }
+            ChartExportOptionField::ShowResumeMarker => {
+                opts.style.show_resume = !opts.style.show_resume
+            }
+            ChartExportOptionField::ShowSelectionMarker => {
+                opts.style.show_selection = !opts.style.show_selection
+            }
+            ChartExportOptionField::ShowStatsBox => {
+                opts.style.show_stats_box = !opts.style.show_stats_box
+            }
+            ChartExportOptionField::ShowCaption => {
+                opts.style.show_caption = !opts.style.show_caption
+            }
+            ChartExportOptionField::ShowGrid => opts.style.show_grid = !opts.style.show_grid,
+            ChartExportOptionField::FileName
+            | ChartExportOptionField::XAxisTitle
+            | ChartExportOptionField::YAxisTitle => {
+                self.start_chart_export_field_edit(field);
+            }
+        }
+    }
+
+    fn start_chart_export_field_edit(&mut self, field: ChartExportOptionField) {
+        if let Some(opts) = self.chart_export_options.as_ref() {
+            let value = match field {
+                ChartExportOptionField::FileName => opts.file_name.clone(),
+                ChartExportOptionField::XAxisTitle => opts.style.x_label.clone(),
+                ChartExportOptionField::YAxisTitle => opts.style.y_label.clone(),
+                _ => return,
+            };
+            self.active_chart_export_field = Some(field);
+            self.chart_export_edit_buffer = value;
+            self.input_mode = InputMode::EditingChartExportOption;
+        }
+    }
+
+    pub fn push_chart_export_char(&mut self, ch: char) {
+        if self.chart_export_edit_buffer.len() < 256 && !ch.is_control() {
+            self.chart_export_edit_buffer.push(ch);
+        }
+    }
+
+    pub fn pop_chart_export_char(&mut self) {
+        self.chart_export_edit_buffer.pop();
+    }
+
+    pub fn cancel_chart_export_edit(&mut self) {
+        self.chart_export_edit_buffer.clear();
+        self.active_chart_export_field = None;
+        self.input_mode = InputMode::ChartExportOptions;
+    }
+
+    pub fn confirm_chart_export_edit(&mut self) {
+        let Some(field) = self.active_chart_export_field.take() else {
+            self.cancel_chart_export_edit();
+            return;
+        };
+        if let Some(opts) = self.chart_export_options.as_mut() {
+            match field {
+                ChartExportOptionField::FileName => {
+                    let mut name = self.chart_export_edit_buffer.trim().to_string();
+                    if name.is_empty() {
+                        name = "chart.png".into();
+                    }
+                    if !name.to_lowercase().ends_with(".png") {
+                        name.push_str(".png");
+                    }
+                    let mut new_path = opts.path.clone();
+                    new_path.set_file_name(&name);
+                    opts.file_name = name;
+                    opts.path = new_path;
+                }
+                ChartExportOptionField::XAxisTitle => {
+                    opts.style.x_label = self.chart_export_edit_buffer.clone();
+                }
+                ChartExportOptionField::YAxisTitle => {
+                    opts.style.y_label = self.chart_export_edit_buffer.clone();
+                }
+                _ => {}
+            }
+        }
+        self.chart_export_edit_buffer.clear();
+        self.input_mode = InputMode::ChartExportOptions;
+    }
+
+    pub fn confirm_chart_export(&mut self) {
+        let Some(opts) = self.chart_export_options.clone() else {
+            self.set_status("No export options to apply", StatusKind::Warning);
+            return;
+        };
+        self.input_mode = InputMode::Normal;
+        match self.export_chart_image(opts.clone()) {
+            Ok(path) => {
+                self.set_status(
+                    format!("Chart saved to {}", path.display()),
+                    StatusKind::Success,
+                );
+                self.chart_export_style = opts.style;
+            }
+            Err(error) => {
+                self.set_status(format!("Failed to save chart: {error}"), StatusKind::Error);
+            }
+        }
+        self.chart_export_options = None;
+        self.chart_export_selection = 0;
+        self.chart_export_edit_buffer.clear();
+        self.active_chart_export_field = None;
+    }
+
+    pub fn cancel_chart_export(&mut self) {
+        self.chart_export_options = None;
+        self.chart_export_selection = 0;
+        self.chart_export_edit_buffer.clear();
+        self.active_chart_export_field = None;
+        self.input_mode = InputMode::Normal;
+        self.set_status("Chart export cancelled", StatusKind::Info);
+    }
+
     pub fn metrics_policies_expanded(&self) -> bool {
         self.metrics_policies_expanded
     }
@@ -2282,6 +3141,10 @@ impl App {
         &self.training_config
     }
 
+    pub fn mars_config(&self) -> &MarsTrainingConfig {
+        &self.mars_config
+    }
+
     // pub fn training_config_mut(&mut self) -> &mut TrainingConfig {
     //     &mut self.training_config
     // }
@@ -2291,16 +3154,31 @@ impl App {
     }
 
     pub fn is_training_config_valid(&self) -> bool {
-        self.training_config_valid
+        if self.is_experimental() {
+            self.mars_config_valid
+        } else {
+            self.training_config_valid
+        }
     }
 
     pub fn update_validation_status(&mut self) {
-        self.advanced_validation_errors = self.collect_advanced_validation_errors();
-        self.training_config_valid =
-            self.validate_training_config().is_ok() && self.advanced_validation_errors.is_empty();
+        if self.is_experimental() {
+            self.mars_config_valid = self.validate_mars_config().is_ok();
+        } else {
+            self.advanced_validation_errors = self.collect_advanced_validation_errors();
+            self.training_config_valid = self.validate_training_config().is_ok()
+                && self.advanced_validation_errors.is_empty();
+        }
     }
 
     pub fn toggle_training_mode(&mut self) {
+        if self.is_experimental() {
+            self.set_status(
+                "Training mode is fixed to MARS in experimental controller",
+                StatusKind::Info,
+            );
+            return;
+        }
         self.training_config.mode = match self.training_config.mode {
             TrainingMode::SingleAgent => TrainingMode::MultiAgent,
             TrainingMode::MultiAgent => TrainingMode::SingleAgent,
@@ -2531,6 +3409,18 @@ impl App {
                 RLLIB_FRAMEWORK_CHOICES
                     .iter()
                     .map(|(value, label, desc)| ConfigChoice::new(*label, *value, *desc))
+                    .collect(),
+            ),
+            ConfigField::MarsMethod => Some(
+                MARS_METHOD_CHOICES
+                    .iter()
+                    .map(|(label, value)| ConfigChoice::new(*label, *value, ""))
+                    .collect(),
+            ),
+            ConfigField::MarsAlgorithm => Some(
+                MARS_ALGO_CHOICES
+                    .iter()
+                    .map(|algo| ConfigChoice::new(*algo, *algo, ""))
                     .collect(),
             ),
             _ => None,
@@ -2859,6 +3749,22 @@ impl App {
             ConfigField::RllibStopTimeSeconds => {
                 self.training_config.rllib_stop_time_seconds.to_string()
             }
+            ConfigField::MarsEnvPath => self.mars_config.env_path.clone(),
+            ConfigField::MarsEnvName => self.mars_config.env_name.clone(),
+            ConfigField::MarsMethod => self.mars_config.method.clone(),
+            ConfigField::MarsAlgorithm => self.mars_config.algorithm.clone(),
+            ConfigField::MarsMaxEpisodes => self.mars_config.max_episodes.to_string(),
+            ConfigField::MarsMaxStepsPerEpisode => {
+                self.mars_config.max_steps_per_episode.to_string()
+            }
+            ConfigField::MarsNumEnvs => self.mars_config.num_envs.to_string(),
+            ConfigField::MarsNumProcess => self.mars_config.num_process.to_string(),
+            ConfigField::MarsBatchSize => self.mars_config.batch_size.to_string(),
+            ConfigField::MarsLearningRate => format_f64(self.mars_config.learning_rate),
+            ConfigField::MarsSeed => self.mars_config.seed.to_string(),
+            ConfigField::MarsSaveId => self.mars_config.save_id.clone(),
+            ConfigField::MarsSavePath => self.mars_config.save_path.clone(),
+            ConfigField::MarsLogInterval => self.mars_config.log_interval.to_string(),
         }
     }
 
@@ -3243,6 +4149,7 @@ impl App {
 
     fn reset_config_field_to_default(&mut self, field: ConfigField) -> Result<bool> {
         let defaults = TrainingConfig::default();
+        let mars_defaults = MarsTrainingConfig::default();
         let changed = match field {
             ConfigField::EnvPath => {
                 if self.training_config.env_path == defaults.env_path {
@@ -3723,6 +4630,120 @@ impl App {
                     true
                 }
             }
+            ConfigField::MarsEnvPath => {
+                if self.mars_config.env_path == mars_defaults.env_path {
+                    false
+                } else {
+                    self.mars_config.env_path = mars_defaults.env_path;
+                    true
+                }
+            }
+            ConfigField::MarsEnvName => {
+                if self.mars_config.env_name == mars_defaults.env_name {
+                    false
+                } else {
+                    self.mars_config.env_name = mars_defaults.env_name;
+                    true
+                }
+            }
+            ConfigField::MarsMethod => {
+                if self.mars_config.method == mars_defaults.method {
+                    false
+                } else {
+                    self.mars_config.method = mars_defaults.method;
+                    true
+                }
+            }
+            ConfigField::MarsAlgorithm => {
+                if self.mars_config.algorithm == mars_defaults.algorithm {
+                    false
+                } else {
+                    self.mars_config.algorithm = mars_defaults.algorithm;
+                    true
+                }
+            }
+            ConfigField::MarsMaxEpisodes => {
+                if self.mars_config.max_episodes == mars_defaults.max_episodes {
+                    false
+                } else {
+                    self.mars_config.max_episodes = mars_defaults.max_episodes;
+                    true
+                }
+            }
+            ConfigField::MarsMaxStepsPerEpisode => {
+                if self.mars_config.max_steps_per_episode == mars_defaults.max_steps_per_episode {
+                    false
+                } else {
+                    self.mars_config.max_steps_per_episode = mars_defaults.max_steps_per_episode;
+                    true
+                }
+            }
+            ConfigField::MarsNumEnvs => {
+                if self.mars_config.num_envs == mars_defaults.num_envs {
+                    false
+                } else {
+                    self.mars_config.num_envs = mars_defaults.num_envs;
+                    true
+                }
+            }
+            ConfigField::MarsNumProcess => {
+                if self.mars_config.num_process == mars_defaults.num_process {
+                    false
+                } else {
+                    self.mars_config.num_process = mars_defaults.num_process;
+                    true
+                }
+            }
+            ConfigField::MarsBatchSize => {
+                if self.mars_config.batch_size == mars_defaults.batch_size {
+                    false
+                } else {
+                    self.mars_config.batch_size = mars_defaults.batch_size;
+                    true
+                }
+            }
+            ConfigField::MarsLearningRate => {
+                if (self.mars_config.learning_rate - mars_defaults.learning_rate).abs()
+                    < f64::EPSILON
+                {
+                    false
+                } else {
+                    self.mars_config.learning_rate = mars_defaults.learning_rate;
+                    true
+                }
+            }
+            ConfigField::MarsSeed => {
+                if self.mars_config.seed == mars_defaults.seed {
+                    false
+                } else {
+                    self.mars_config.seed = mars_defaults.seed;
+                    true
+                }
+            }
+            ConfigField::MarsSaveId => {
+                if self.mars_config.save_id == mars_defaults.save_id {
+                    false
+                } else {
+                    self.mars_config.save_id = mars_defaults.save_id;
+                    true
+                }
+            }
+            ConfigField::MarsSavePath => {
+                if self.mars_config.save_path == mars_defaults.save_path {
+                    false
+                } else {
+                    self.mars_config.save_path = mars_defaults.save_path;
+                    true
+                }
+            }
+            ConfigField::MarsLogInterval => {
+                if self.mars_config.log_interval == mars_defaults.log_interval {
+                    false
+                } else {
+                    self.mars_config.log_interval = mars_defaults.log_interval;
+                    true
+                }
+            }
         };
 
         if changed {
@@ -4145,11 +5166,129 @@ impl App {
                 }
                 self.training_config.rllib_stop_time_seconds = val;
             }
+            ConfigField::MarsEnvPath => {
+                self.mars_config.env_path = trimmed.to_string();
+            }
+            ConfigField::MarsEnvName => {
+                if trimmed.is_empty() {
+                    bail!("Env name cannot be empty");
+                }
+                self.mars_config.env_name = trimmed.to_string();
+            }
+            ConfigField::MarsMethod => {
+                if trimmed.is_empty() {
+                    bail!("Method cannot be empty");
+                }
+                self.mars_config.method = trimmed.to_string();
+            }
+            ConfigField::MarsAlgorithm => {
+                if trimmed.is_empty() {
+                    bail!("Algorithm cannot be empty");
+                }
+                self.mars_config.algorithm = trimmed.to_string();
+            }
+            ConfigField::MarsMaxEpisodes => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("Max episodes must be a positive integer")?;
+                if val == 0 {
+                    bail!("Max episodes must be at least 1");
+                }
+                self.mars_config.max_episodes = val;
+            }
+            ConfigField::MarsMaxStepsPerEpisode => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("Max steps per episode must be a positive integer")?;
+                if val == 0 {
+                    bail!("Max steps per episode must be at least 1");
+                }
+                self.mars_config.max_steps_per_episode = val;
+            }
+            ConfigField::MarsNumEnvs => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("Number of envs must be a positive integer")?;
+                if val == 0 {
+                    bail!("Number of envs must be at least 1");
+                }
+                self.mars_config.num_envs = val;
+            }
+            ConfigField::MarsNumProcess => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("Number of processes must be a positive integer")?;
+                if val == 0 {
+                    bail!("Number of processes must be at least 1");
+                }
+                self.mars_config.num_process = val;
+            }
+            ConfigField::MarsBatchSize => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("Batch size must be a positive integer")?;
+                if val == 0 {
+                    bail!("Batch size must be at least 1");
+                }
+                self.mars_config.batch_size = val;
+            }
+            ConfigField::MarsLearningRate => {
+                let val: f64 = trimmed.parse().wrap_err("Learning rate must be a number")?;
+                if val <= 0.0 {
+                    bail!("Learning rate must be greater than 0");
+                }
+                self.mars_config.learning_rate = val;
+            }
+            ConfigField::MarsSeed => {
+                let val: i64 = trimmed.parse().wrap_err("Seed must be an integer")?;
+                self.mars_config.seed = val;
+            }
+            ConfigField::MarsSaveId => {
+                if trimmed.is_empty() {
+                    bail!("Save id cannot be empty");
+                }
+                self.mars_config.save_id = trimmed.to_string();
+            }
+            ConfigField::MarsSavePath => {
+                if trimmed.is_empty() {
+                    bail!("Save path cannot be empty");
+                }
+                self.mars_config.save_path = trimmed.to_string();
+            }
+            ConfigField::MarsLogInterval => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("Log interval must be a positive integer")?;
+                if val == 0 {
+                    bail!("Log interval must be at least 1");
+                }
+                self.mars_config.log_interval = val;
+            }
         }
         Ok(())
     }
 
     fn persist_training_config(&mut self) -> Result<()> {
+        if self.is_experimental() {
+            if let Some(path) = self.mars_config_path() {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).wrap_err_with(|| {
+                        format!("failed to create config directory {}", parent.display())
+                    })?;
+                }
+                let json = serde_json::to_string_pretty(&self.mars_config).wrap_err_with(|| {
+                    format!(
+                        "failed to serialize MARS training config for {}",
+                        path.display()
+                    )
+                })?;
+                fs::write(&path, json).wrap_err_with(|| {
+                    format!("failed to write MARS training config to {}", path.display())
+                })?;
+            }
+            return Ok(());
+        }
+
         if let Some(path) = self.training_config_path() {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).wrap_err_with(|| {
@@ -4175,7 +5314,19 @@ impl App {
         })
     }
 
+    fn mars_config_path(&self) -> Option<PathBuf> {
+        self.active_project.as_ref().map(|project| {
+            project
+                .root_path
+                .join(PROJECT_CONFIG_DIR)
+                .join(MARS_TRAINING_CONFIG_FILENAME)
+        })
+    }
+
     fn load_training_config_for_active_project(&mut self) -> bool {
+        if self.is_experimental() {
+            return self.load_mars_config_for_active_project();
+        }
         let mut had_error = false;
         if let Some(path) = self.training_config_path() {
             if path.exists() {
@@ -4237,6 +5388,51 @@ impl App {
             }
         } else {
             self.training_config = TrainingConfig::default();
+        }
+        self.rebuild_advanced_fields();
+        self.update_validation_status();
+        had_error
+    }
+
+    fn load_mars_config_for_active_project(&mut self) -> bool {
+        let mut had_error = false;
+        if let Some(path) = self.mars_config_path() {
+            if path.exists() {
+                match fs::read_to_string(&path) {
+                    Ok(contents) => match serde_json::from_str::<MarsTrainingConfig>(&contents) {
+                        Ok(config) => {
+                            self.mars_config = config;
+                        }
+                        Err(error) => {
+                            self.mars_config = MarsTrainingConfig::default();
+                            self.set_status(
+                                format!("Invalid MARS config, using defaults: {}", error),
+                                StatusKind::Warning,
+                            );
+                            had_error = true;
+                        }
+                    },
+                    Err(error) => {
+                        self.mars_config = MarsTrainingConfig::default();
+                        self.set_status(
+                            format!("Failed to read MARS config, using defaults: {}", error),
+                            StatusKind::Warning,
+                        );
+                        had_error = true;
+                    }
+                }
+            } else {
+                self.mars_config = MarsTrainingConfig::default();
+                if let Err(error) = self.persist_training_config() {
+                    self.set_status(
+                        format!("Failed to create MARS training config: {error}"),
+                        StatusKind::Error,
+                    );
+                    had_error = true;
+                }
+            }
+        } else {
+            self.mars_config = MarsTrainingConfig::default();
         }
         self.rebuild_advanced_fields();
         self.update_validation_status();
@@ -4350,14 +5546,17 @@ impl App {
     fn collect_advanced_validation_errors(&self) -> HashMap<ConfigField, String> {
         let mut errors = HashMap::new();
 
+        if self.is_experimental() {
+            return errors;
+        }
+
         if self.training_config.mode != TrainingMode::MultiAgent {
             return errors;
         }
 
         let cfg = &self.training_config;
         let total_envs = std::cmp::max(1, cfg.rllib_num_workers) * cfg.rllib_num_envs_per_worker;
-        let expected_batch_size =
-            cfg.rllib_rollout_fragment_length.saturating_mul(total_envs);
+        let expected_batch_size = cfg.rllib_rollout_fragment_length.saturating_mul(total_envs);
 
         fn check_range(
             errors: &mut HashMap<ConfigField, String>,
@@ -4410,11 +5609,10 @@ impl App {
         if cfg.rllib_train_batch_size < expected_batch_size
             || cfg.rllib_train_batch_size % expected_batch_size != 0
         {
-            let next_multiple = ((cfg.rllib_train_batch_size.max(expected_batch_size)
-                + expected_batch_size
-                - 1)
-                / expected_batch_size)
-                * expected_batch_size;
+            let next_multiple =
+                ((cfg.rllib_train_batch_size.max(expected_batch_size) + expected_batch_size - 1)
+                    / expected_batch_size)
+                    * expected_batch_size;
             errors.insert(
                 ConfigField::RllibTrainBatchSize,
                 format!(
@@ -4552,6 +5750,24 @@ impl App {
     }
 
     fn build_advanced_fields(&self) -> Vec<ConfigField> {
+        if self.is_experimental() {
+            return vec![
+                ConfigField::MarsEnvPath,
+                ConfigField::MarsEnvName,
+                ConfigField::MarsMethod,
+                ConfigField::MarsAlgorithm,
+                ConfigField::MarsMaxEpisodes,
+                ConfigField::MarsMaxStepsPerEpisode,
+                ConfigField::MarsNumEnvs,
+                ConfigField::MarsNumProcess,
+                ConfigField::MarsBatchSize,
+                ConfigField::MarsLearningRate,
+                ConfigField::MarsSeed,
+                ConfigField::MarsSaveId,
+                ConfigField::MarsSavePath,
+                ConfigField::MarsLogInterval,
+            ];
+        }
         match self.training_config.mode {
             TrainingMode::SingleAgent => {
                 let mut fields = vec![ConfigField::Sb3PolicyType, ConfigField::Sb3PolicyLayers];
@@ -4633,6 +5849,13 @@ impl App {
         let kind = match field {
             ConfigField::EnvPath => FileBrowserKind::ExistingFile {
                 extensions: Vec::new(),
+            },
+            ConfigField::MarsEnvPath => FileBrowserKind::ExistingFile {
+                extensions: Vec::new(),
+            },
+            ConfigField::MarsSavePath => FileBrowserKind::Directory {
+                allow_create: true,
+                require_checkpoints: false,
             },
             ConfigField::RllibConfigFile => FileBrowserKind::ExistingFile {
                 extensions: vec!["yaml".into(), "yml".into(), "json".into()],
@@ -4734,6 +5957,12 @@ impl App {
             FileBrowserTarget::Config(ConfigField::EnvPath) => self
                 .resolve_existing_path(&self.training_config.env_path)
                 .unwrap_or_else(|| project_root.clone()),
+            FileBrowserTarget::Config(ConfigField::MarsEnvPath) => self
+                .resolve_existing_path(&self.mars_config.env_path)
+                .unwrap_or_else(|| project_root.clone()),
+            FileBrowserTarget::Config(ConfigField::MarsSavePath) => self
+                .resolve_existing_path(&self.mars_config.save_path)
+                .unwrap_or_else(|| project_logs.clone()),
             FileBrowserTarget::Config(ConfigField::RllibConfigFile) => self
                 .resolve_existing_path(&self.training_config.rllib_config_file)
                 .unwrap_or_else(|| project_root.clone()),
@@ -4794,6 +6023,15 @@ impl App {
                 .active_project
                 .as_ref()
                 .map(|project| project.runs_dir())
+                .unwrap_or_else(|| project_root.clone()),
+            FileBrowserTarget::ChartExport => self
+                .chart_export_last_dir
+                .clone()
+                .or_else(|| {
+                    self.active_project
+                        .as_ref()
+                        .map(|project| project.root_path.clone())
+                })
                 .unwrap_or_else(|| project_root.clone()),
         }
     }
@@ -5038,32 +6276,27 @@ impl App {
     }
 
     fn confirm_new_file(&mut self) {
-        let name = self.file_browser_input.trim();
+        let mut name = self.file_browser_input.trim().to_string();
         if name.is_empty() {
             self.set_status("File name cannot be empty", StatusKind::Warning);
             return;
         }
-        let extension_check =
-            if let FileBrowserKind::OutputFile { extension } = &self.file_browser_kind {
-                if let Some(ext) = extension {
-                    if !name.ends_with(&format!(".{ext}")) {
-                        self.set_status(
-                            format!("File name must end with .{ext}"),
-                            StatusKind::Warning,
-                        );
-                        return;
-                    }
-                }
-                true
-            } else {
-                true
-            };
 
-        if !extension_check {
-            return;
+        if let FileBrowserKind::OutputFile { extension } = &self.file_browser_kind {
+            if let Some(ext) = extension {
+                let required = format!(".{}", ext.to_lowercase());
+                let name_lower = name.to_lowercase();
+                if !name_lower.ends_with(&required) {
+                    if let Some(dot) = name.rfind('.') {
+                        name.truncate(dot);
+                    }
+                    name.push('.');
+                    name.push_str(ext);
+                }
+            }
         }
 
-        let path = self.file_browser_path.join(name);
+        let path = self.file_browser_path.join(&name);
         if let Some(parent) = path.parent() {
             if let Err(error) = fs::create_dir_all(parent) {
                 self.set_status(
@@ -5135,7 +6368,12 @@ impl App {
             }
             Some(FileBrowserTarget::SavedRun) => {
                 self.cancel_file_browser();
-                if let Err(error) = self.load_run_overlay_from_path(path.clone()) {
+                let result = match self.run_load_mode {
+                    RunLoadMode::Overlay => self.load_run_overlay_from_path(path.clone()),
+                    RunLoadMode::ViewOnly => self.load_run_view_only_from_path(path.clone()),
+                };
+                self.run_load_mode = RunLoadMode::Overlay;
+                if let Err(error) = result {
                     self.set_status(format!("Failed to load run: {error}"), StatusKind::Error);
                 }
                 return;
@@ -5164,6 +6402,11 @@ impl App {
                 self.set_status("Export option updated", StatusKind::Success);
                 self.rebuild_export_fields();
             }
+            Some(FileBrowserTarget::ChartExport) => {
+                self.cancel_file_browser();
+                self.start_chart_export_options(path);
+                return;
+            }
             Some(FileBrowserTarget::SimulatorEnvPath) => {
                 let stored_value = self.stringify_for_storage(&path);
                 self.simulator_config.env_path = stored_value;
@@ -5188,6 +6431,12 @@ impl App {
         match field {
             ConfigField::EnvPath => {
                 self.training_config.env_path = value;
+            }
+            ConfigField::MarsEnvPath => {
+                self.mars_config.env_path = value;
+            }
+            ConfigField::MarsSavePath => {
+                self.mars_config.save_path = value;
             }
             ConfigField::RllibConfigFile => {
                 self.training_config.rllib_config_file = normalize_rllib_config_value(&value);
@@ -5466,6 +6715,56 @@ impl App {
         Ok(())
     }
 
+    pub fn validate_mars_config(&self) -> Result<()> {
+        if self.active_project.is_none() {
+            bail!("No project selected");
+        }
+        let cfg = &self.mars_config;
+        if cfg.env_path.trim().is_empty() {
+            bail!("Environment (Godot) path is required");
+        }
+        let project_root = &self.active_project.as_ref().unwrap().root_path;
+        let env_path = {
+            let raw = PathBuf::from(cfg.env_path.trim());
+            if raw.is_absolute() {
+                raw
+            } else {
+                project_root.join(raw)
+            }
+        };
+        if !env_path.exists() {
+            bail!("Environment path does not exist: {}", env_path.display());
+        }
+        if !env_path.is_file() {
+            bail!("Environment path must be a file: {}", env_path.display());
+        }
+        if cfg.method.trim().is_empty() {
+            bail!("MARS method is required");
+        }
+        if cfg.algorithm.trim().is_empty() {
+            bail!("Base algorithm is required");
+        }
+        if cfg.max_episodes == 0 {
+            bail!("Max episodes must be greater than 0");
+        }
+        if cfg.max_steps_per_episode == 0 {
+            bail!("Max steps per episode must be greater than 0");
+        }
+        if cfg.batch_size == 0 {
+            bail!("Batch size must be greater than 0");
+        }
+        if cfg.num_envs == 0 {
+            bail!("Number of envs must be at least 1");
+        }
+        if cfg.num_process == 0 {
+            bail!("Number of processes must be at least 1");
+        }
+        if cfg.log_interval == 0 {
+            bail!("Log interval must be at least 1");
+        }
+        Ok(())
+    }
+
     pub fn generate_rllib_config(&mut self) -> Result<()> {
         if let Some(project) = &self.active_project {
             let config_path = self.rllib_config_absolute_path(&project.root_path);
@@ -5695,6 +6994,24 @@ impl App {
         Ok(())
     }
 
+    fn load_run_view_only_from_path(&mut self, path: PathBuf) -> Result<()> {
+        let saved_run = runs::load_saved_run(&path)?;
+        self.saved_run_overlays.clear();
+        self.selected_overlay_index = None;
+        self.overlay_color_cursor = 0;
+        self.set_archived_run_view(saved_run, path.clone());
+        self.set_status(
+            format!(
+                "Viewing saved run only: {}",
+                path.file_name()
+                    .and_then(|p| p.to_str())
+                    .unwrap_or("run.json")
+            ),
+            StatusKind::Success,
+        );
+        Ok(())
+    }
+
     fn push_overlay_from_run(&mut self, saved_run: &SavedRun, path: PathBuf) -> Result<()> {
         if self
             .saved_run_overlays
@@ -5799,6 +7116,7 @@ impl App {
         self.overlay_color_cursor = 0;
         self.drop_archived_run_view();
         self.active_project = Some(project.clone());
+        self.training_log_session_written = false;
         let training_error = self.load_training_config_for_active_project();
         let export_error = self.load_export_state_for_active_project();
         self.refresh_projects(Some(project.logs_path.clone()))?;
@@ -5816,6 +7134,9 @@ impl App {
     }
 
     pub fn start_training(&mut self) -> Result<()> {
+        if self.is_experimental() {
+            return self.start_mars_training();
+        }
         if self.training_running {
             self.set_status(
                 "Training already running. Please wait for it to finish.",
@@ -5830,9 +7151,8 @@ impl App {
             return Ok(());
         }
 
-        let resuming_multi =
-            self.training_config.mode == TrainingMode::MultiAgent
-                && !self.training_config.rllib_resume_from.trim().is_empty();
+        let resuming_multi = self.training_config.mode == TrainingMode::MultiAgent
+            && !self.training_config.rllib_resume_from.trim().is_empty();
         let resume_baseline = if resuming_multi {
             let mut data = self.training_metrics_history().to_vec();
             if data.len() > TRAINING_METRIC_HISTORY_LIMIT {
@@ -5879,13 +7199,49 @@ impl App {
         self.training_cancel = Some(cancel_tx);
 
         let command = determine_python_command();
-        let project = self.active_project.as_ref().unwrap();
-        let cwd = project.root_path.clone();
+        let (project_root, project_logs, env_path_display) = {
+            let project = self.active_project.as_ref().unwrap();
+            let root = project.root_path.clone();
+            let logs = project.logs_path.clone();
+            let raw = PathBuf::from(self.training_config.env_path.trim());
+            let full = if raw.is_absolute() {
+                raw
+            } else {
+                root.join(raw)
+            };
+            (root, logs, self.project_relative_display(&full))
+        };
+        let cwd = project_root.clone();
+        let mode_name = match self.training_config.mode {
+            TrainingMode::SingleAgent => format!(
+                "SB3 ({})",
+                self.training_config.sb3_policy_type.as_str().to_uppercase()
+            ),
+            TrainingMode::MultiAgent => format!(
+                "RLlib ({})",
+                self.training_config
+                    .rllib_algorithm
+                    .trainer_name()
+                    .to_uppercase()
+            ),
+        };
+        self.append_run_header(format!(
+            "Run start ({mode_name}) at {} | experiment={} | env={}",
+            Local::now().format("%Y-%m-%d %H:%M:%S"),
+            self.training_config.experiment_name,
+            env_path_display
+        ));
+
+        let project = self
+            .active_project
+            .as_ref()
+            .cloned()
+            .expect("active project missing after validation");
 
         let (script_path, args) = match self.training_config.mode {
             TrainingMode::SingleAgent => {
                 let script = find_script(&cwd, "stable_baselines3_training_script.py")?;
-                let sb3_logs = project.logs_path.join("sb3");
+                let sb3_logs = project_logs.join("sb3");
                 fs::create_dir_all(&sb3_logs).wrap_err_with(|| {
                     format!("failed to create SB3 log directory {}", sb3_logs.display())
                 })?;
@@ -5949,7 +7305,7 @@ impl App {
                     if trimmed.is_empty() {
                         None
                     } else {
-                        Some(self.resolve_project_path(project, trimmed))
+                        Some(self.resolve_project_path(&project, trimmed))
                     }
                 } else {
                     None
@@ -5984,13 +7340,121 @@ impl App {
                         }
                     }
                     let display = self.project_relative_display(path);
-                    self.metrics_resume_label =
-                        Some(format!("Resume baseline from {}", display));
+                    self.metrics_resume_label = Some(format!("Resume baseline from {}", display));
                     args.push(format!("--resume={}", path.to_string_lossy()));
                 }
                 (script, args)
             }
         };
+
+        let display_cmd = format!(
+            "{} -u {} {}",
+            command,
+            script_path.display(),
+            args.join(" ")
+        );
+
+        if !self.training_output.is_empty() {
+            self.append_training_line(String::new());
+        }
+        self.append_training_line(format!("$ {}", display_cmd));
+
+        spawn_training_task(tx, command, script_path, args, cwd, cancel_rx);
+
+        Ok(())
+    }
+
+    fn append_run_header(&mut self, label: String) {
+        if !self.training_output.is_empty() {
+            self.append_training_line(String::new());
+        }
+        self.append_training_line(format!("===== {label} ====="));
+    }
+
+    fn start_mars_training(&mut self) -> Result<()> {
+        if self.training_running {
+            self.set_status(
+                "Training already running. Please wait for it to finish.",
+                StatusKind::Warning,
+            );
+            return Ok(());
+        }
+
+        if let Err(e) = self.validate_mars_config() {
+            self.set_status(format!("Validation failed: {}", e), StatusKind::Error);
+            return Ok(());
+        }
+
+        self.training_receiver = None;
+        self.training_cancel = None;
+        self.training_running = true;
+        self.metrics_timeline.clear();
+        self.metrics_resume_iteration = None;
+        self.metrics_resume_label = None;
+        self.training_metrics.clear();
+        self.current_run_start = Some(SystemTime::now());
+        self.metrics_history_index = 0;
+        self.metrics_chart_index = 0;
+        let now = Instant::now();
+        self.metric_timer_start = Some(now);
+        self.metric_last_sample_time = Some(now);
+        self.reset_training_output_scroll();
+        self.set_status("Starting MARS training...", StatusKind::Info);
+
+        let (tx, rx) = mpsc::channel();
+        self.training_receiver = Some(rx);
+        let (cancel_tx, cancel_rx) = mpsc::channel();
+        self.training_cancel = Some(cancel_tx);
+
+        let command = determine_python_command();
+        let (project_root, project_logs, env_path_display) = {
+            let project = self.active_project.as_ref().unwrap();
+            let root = project.root_path.clone();
+            let logs = project.logs_path.clone();
+            let raw = PathBuf::from(self.mars_config.env_path.trim());
+            let full = if raw.is_absolute() {
+                raw
+            } else {
+                root.join(raw)
+            };
+            (root, logs, self.project_relative_display(&full))
+        };
+        let cwd = project_root.clone();
+        let script_path = find_script(&cwd, "mars_training_script.py")?;
+        let mars_logs = project_logs.join("mars");
+        fs::create_dir_all(&mars_logs).wrap_err_with(|| {
+            format!(
+                "failed to create MARS log directory {}",
+                mars_logs.display()
+            )
+        })?;
+
+        let cfg = &self.mars_config;
+        let args = vec![
+            format!("--env_path={}", cfg.env_path),
+            format!("--env_name={}", cfg.env_name),
+            format!("--method={}", cfg.method),
+            format!("--algorithm={}", cfg.algorithm),
+            format!("--max_episodes={}", cfg.max_episodes),
+            format!("--max_steps_per_episode={}", cfg.max_steps_per_episode),
+            format!("--num_envs={}", cfg.num_envs),
+            format!("--num_process={}", cfg.num_process),
+            format!("--batch_size={}", cfg.batch_size),
+            format!("--learning_rate={}", cfg.learning_rate),
+            format!("--seed={}", cfg.seed),
+            format!("--save_id={}", cfg.save_id),
+            format!("--save_path={}", mars_logs.to_string_lossy()),
+            format!("--log_interval={}", cfg.log_interval),
+        ];
+
+        self.append_run_header(format!(
+            "Run start (MARS) at {} | method={} | algo={} | env_name={} | env={}",
+            Local::now().format("%Y-%m-%d %H:%M:%S"),
+            cfg.method,
+            cfg.algorithm,
+            cfg.env_name,
+            env_path_display
+        ));
 
         let display_cmd = format!(
             "{} -u {} {}",
@@ -6038,6 +7502,11 @@ impl App {
         self.training_receiver = Some(rx);
         let (cancel_tx, cancel_rx) = mpsc::channel();
         self.training_cancel = Some(cancel_tx);
+
+        self.append_run_header(format!(
+            "Run start (Demo) at {} | script=demo.py",
+            Local::now().format("%Y-%m-%d %H:%M:%S")
+        ));
 
         let command = determine_python_command();
         let cwd = std::env::current_dir().wrap_err("failed to determine current directory")?;
@@ -6391,27 +7860,33 @@ impl App {
         // Validate agent path
         if self.interface_config.agent_path.trim().is_empty() {
             self.set_status(
-                "Agent path is required. Use 'p' to select an agent.",
+                "Agent path is required. Use 'b' to select an agent.",
+                StatusKind::Warning,
+            );
+            return Ok(());
+        }
+
+        if matches!(
+            self.interface_config.model_format,
+            InterfaceModelFormat::Onnx
+        ) {
+            self.set_status(
+                "ONNX interface playback is not available yet. Switch to a raw checkpoint.",
                 StatusKind::Warning,
             );
             return Ok(());
         }
 
         let command = determine_python_command();
-        let script_path = find_script(&project_root, "interface.py")?;
+        let script_name = match self.interface_config.agent_type {
+            AgentType::StableBaselines3 => "interface_sb3_raw.py",
+            AgentType::Rllib => "interface_rllib_raw.py",
+        };
+        let script_path = find_script(&project_root, script_name)?;
 
-        let mut args = vec![
-            self.interface_config.agent_type.arg().to_string(),
-            self.interface_config.agent_path.clone(),
-        ];
+        let mut args = vec![self.interface_config.agent_path.clone()];
 
         args.push(format!("--mode={}", self.interface_config.mode.arg()));
-
-        if self.interface_config.show_window {
-            args.push("--show-window".to_string());
-        } else {
-            args.push("--headless".to_string());
-        }
 
         if self.interface_config.step_delay > 0.0 {
             args.push(format!(
@@ -6511,12 +7986,20 @@ impl App {
             return;
         }
 
-        let extensions = match self.interface_config.agent_type {
-            AgentType::StableBaselines3 => vec!["zip".into()],
-            AgentType::Rllib => Vec::new(), // Directories for RLlib
+        let extensions = match (
+            self.interface_config.agent_type,
+            self.interface_config.model_format,
+        ) {
+            (_, InterfaceModelFormat::Onnx) => vec!["onnx".into()],
+            (AgentType::StableBaselines3, InterfaceModelFormat::Raw) => vec!["zip".into()],
+            (AgentType::Rllib, InterfaceModelFormat::Raw) => Vec::new(), // Directories for RLlib
         };
 
-        let kind = if self.interface_config.agent_type == AgentType::Rllib {
+        let kind = if self.interface_config.agent_type == AgentType::Rllib
+            && matches!(
+                self.interface_config.model_format,
+                InterfaceModelFormat::Raw
+            ) {
             FileBrowserKind::Directory {
                 allow_create: false,
                 require_checkpoints: true,
@@ -6543,9 +8026,30 @@ impl App {
         );
     }
 
+    pub fn toggle_interface_model_format(&mut self) {
+        if self.interface_running {
+            self.set_status(
+                "Stop the interface before changing the model format.",
+                StatusKind::Warning,
+            );
+            return;
+        }
+        self.interface_config.model_format.toggle();
+        self.set_status(
+            format!(
+                "Model artifact: {}",
+                self.interface_config.model_format.label()
+            ),
+            StatusKind::Info,
+        );
+    }
+
     pub fn interface_use_export_agent_path(&mut self) {
-        match self.interface_config.agent_type {
-            AgentType::StableBaselines3 => {
+        match (
+            self.interface_config.agent_type,
+            self.interface_config.model_format,
+        ) {
+            (AgentType::StableBaselines3, InterfaceModelFormat::Raw) => {
                 let sb3_path = self.export_config.sb3_model_path.trim();
                 if sb3_path.is_empty() {
                     self.set_status(
@@ -6563,7 +8067,7 @@ impl App {
                     StatusKind::Success,
                 );
             }
-            AgentType::Rllib => {
+            (AgentType::Rllib, InterfaceModelFormat::Raw) => {
                 let checkpoint_path = self.export_config.rllib_checkpoint_path.trim();
                 if checkpoint_path.is_empty() {
                     self.set_status(
@@ -6578,6 +8082,33 @@ impl App {
                 self.interface_config.rllib_policy_id = self.export_config.rllib_policy_id.clone();
                 self.set_status(
                     "Interface checkpoint synced with Export config.",
+                    StatusKind::Success,
+                );
+            }
+            (AgentType::StableBaselines3, InterfaceModelFormat::Onnx) => {
+                let onnx_path = self.export_config.sb3_output_path.trim();
+                if onnx_path.is_empty() {
+                    self.set_status("ONNX path is empty in the Export tab.", StatusKind::Warning);
+                    return;
+                }
+                self.interface_config.agent_path = onnx_path.to_string();
+                self.set_status(
+                    "Interface ONNX path synced with Export config.",
+                    StatusKind::Success,
+                );
+            }
+            (AgentType::Rllib, InterfaceModelFormat::Onnx) => {
+                let onnx_dir = self.export_config.rllib_output_dir.trim();
+                if onnx_dir.is_empty() {
+                    self.set_status(
+                        "RLlib export output is empty in the Export tab.",
+                        StatusKind::Warning,
+                    );
+                    return;
+                }
+                self.interface_config.agent_path = onnx_dir.to_string();
+                self.set_status(
+                    "Interface ONNX path synced with Export config.",
                     StatusKind::Success,
                 );
             }
@@ -6597,23 +8128,6 @@ impl App {
             format!("Interface mode: {}", self.interface_config.mode.label()),
             StatusKind::Info,
         );
-    }
-
-    pub fn toggle_interface_window(&mut self) {
-        if self.interface_running {
-            self.set_status(
-                "Stop the interface before changing window settings.",
-                StatusKind::Warning,
-            );
-            return;
-        }
-        self.interface_config.show_window = !self.interface_config.show_window;
-        let state = if self.interface_config.show_window {
-            "visible"
-        } else {
-            "hidden"
-        };
-        self.set_status(format!("Godot window: {state}"), StatusKind::Info);
     }
 
     pub fn toggle_interface_auto_restart(&mut self) {
@@ -6736,6 +8250,7 @@ impl App {
     }
 
     pub fn start_run_overlay_browser(&mut self) -> Result<()> {
+        self.run_load_mode = RunLoadMode::Overlay;
         let project = match self.active_project.as_ref() {
             Some(project) => project,
             None => {
@@ -6759,6 +8274,37 @@ impl App {
             None,
         );
         self.set_status("Select a saved run to inspect or overlay", StatusKind::Info);
+        Ok(())
+    }
+
+    pub fn start_run_view_only_browser(&mut self) -> Result<()> {
+        self.run_load_mode = RunLoadMode::ViewOnly;
+        let project = match self.active_project.as_ref() {
+            Some(project) => project,
+            None => {
+                self.set_status("Select a project first", StatusKind::Warning);
+                return Ok(());
+            }
+        };
+
+        fs::create_dir_all(project.runs_dir()).wrap_err_with(|| {
+            format!(
+                "failed to prepare runs directory {}",
+                project.runs_dir().display()
+            )
+        })?;
+
+        self.start_file_browser(
+            FileBrowserTarget::SavedRun,
+            FileBrowserKind::ExistingFile {
+                extensions: vec!["json".into()],
+            },
+            None,
+        );
+        self.set_status(
+            "Select a saved run to view (overlays will be hidden)",
+            StatusKind::Info,
+        );
         Ok(())
     }
 
@@ -7088,7 +8634,8 @@ impl App {
         for entry in fs::read_dir(src)
             .wrap_err_with(|| format!("failed to read directory {}", src.display()))?
         {
-            let entry = entry.wrap_err_with(|| format!("failed to read entry in {}", src.display()))?;
+            let entry =
+                entry.wrap_err_with(|| format!("failed to read entry in {}", src.display()))?;
             let path = entry.path();
             let target = dst.join(entry.file_name());
             let file_type = entry
@@ -7459,12 +9006,50 @@ impl App {
     }
 
     fn append_training_line(&mut self, line: impl Into<String>) {
-        self.training_output.push(line.into());
+        let line = line.into();
+        self.write_training_log(&line);
+        self.training_output.push(line);
         if self.training_output.len() > TRAINING_BUFFER_LIMIT {
             let overflow = self.training_output.len() - TRAINING_BUFFER_LIMIT;
             self.training_output.drain(0..overflow);
         }
         self.clamp_training_output_scroll();
+    }
+
+    fn write_training_log(&mut self, line: &str) {
+        let Some(project) = &self.active_project else {
+            return;
+        };
+        let log_path = project
+            .root_path
+            .join(PROJECT_CONFIG_DIR)
+            .join("training_log.txt");
+
+        if let Some(parent) = log_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+
+        if !self.training_log_session_written {
+            let _ = self.append_training_log_line(
+                &log_path,
+                &format!(
+                    "===== Session start {} =====",
+                    self.session_start_time.format("%Y-%m-%d %H:%M:%S")
+                ),
+            );
+            self.training_log_session_written = true;
+        }
+
+        let _ = self.append_training_log_line(&log_path, line);
+    }
+
+    fn append_training_log_line(&self, path: &Path, line: &str) -> std::io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        writeln!(file, "{}", line)?;
+        Ok(())
     }
 
     fn clamp_training_output_scroll(&mut self) {
@@ -8203,11 +9788,22 @@ fn find_script(base_dir: &Path, script_name: &str) -> Result<PathBuf> {
 
     // Then check in the controller root (parent of projects dir)
     if let Some(parent) = base_dir.parent() {
+        let parent_script = parent.join(script_name);
+        if parent_script.exists() {
+            return Ok(parent_script);
+        }
         if let Some(grandparent) = parent.parent() {
             let root_script = grandparent.join(script_name);
             if root_script.exists() {
                 return Ok(root_script);
             }
+        }
+    }
+
+    if let Some(root) = CONTROLLER_ROOT {
+        let manifest_script = PathBuf::from(root).join(script_name);
+        if manifest_script.exists() {
+            return Ok(manifest_script);
         }
     }
 
@@ -8830,4 +10426,117 @@ fn write_rllib_config(path: &Path, config: &TrainingConfig) -> Result<()> {
         .wrap_err_with(|| format!("failed to write RLlib config to {}", path.display()))?;
 
     Ok(())
+}
+
+fn rgb_from_ratatui(color: Color) -> Option<RGBColor> {
+    match color {
+        Color::Reset => None,
+        Color::Black => Some(RGBColor(0, 0, 0)),
+        Color::Red => Some(RGBColor(255, 0, 0)),
+        Color::Green => Some(RGBColor(0, 200, 0)),
+        Color::Yellow => Some(RGBColor(255, 215, 0)),
+        Color::Blue => Some(RGBColor(0, 120, 255)),
+        Color::Magenta => Some(RGBColor(200, 0, 200)),
+        Color::Cyan => Some(RGBColor(0, 200, 200)),
+        Color::Gray => Some(RGBColor(128, 128, 128)),
+        Color::DarkGray => Some(RGBColor(64, 64, 64)),
+        Color::LightRed => Some(RGBColor(255, 128, 128)),
+        Color::LightGreen => Some(RGBColor(128, 255, 128)),
+        Color::LightYellow => Some(RGBColor(255, 255, 192)),
+        Color::LightBlue => Some(RGBColor(128, 160, 255)),
+        Color::LightMagenta => Some(RGBColor(255, 160, 255)),
+        Color::LightCyan => Some(RGBColor(160, 255, 255)),
+        Color::White => Some(RGBColor(240, 240, 240)),
+        Color::Rgb(r, g, b) => Some(RGBColor(r, g, b)),
+        Color::Indexed(value) => Some(RGBColor(value, value, value)),
+    }
+}
+
+fn export_palette_color(idx: usize) -> RGBColor {
+    const COLORS: [RGBColor; 8] = [
+        RGBColor(0, 196, 255),
+        RGBColor(255, 140, 105),
+        RGBColor(160, 200, 120),
+        RGBColor(255, 180, 50),
+        RGBColor(200, 160, 255),
+        RGBColor(120, 220, 200),
+        RGBColor(255, 110, 180),
+        RGBColor(200, 200, 200),
+    ];
+    COLORS[idx % COLORS.len()]
+}
+
+struct ChartExportPalette {
+    background: RGBColor,
+    grid: RGBColor,
+    caption: RGBColor,
+    axis_label: RGBColor,
+    label: RGBColor,
+    resume: RGBColor,
+    selection: RGBColor,
+    selection_line: RGBColor,
+    legend_bg: RGBColor,
+    legend_border: RGBColor,
+}
+
+fn export_colors(theme: ChartExportTheme) -> ChartExportPalette {
+    match theme {
+        ChartExportTheme::Dark => ChartExportPalette {
+            background: RGBColor(12, 16, 24),
+            grid: RGBColor(40, 48, 58),
+            caption: RGBColor(230, 230, 230),
+            axis_label: RGBColor(210, 210, 210),
+            label: RGBColor(190, 190, 190),
+            resume: RGBColor(200, 150, 80),
+            selection: RGBColor(255, 255, 255),
+            selection_line: RGBColor(120, 200, 255),
+            legend_bg: RGBColor(24, 24, 24),
+            legend_border: RGBColor(150, 150, 150),
+        },
+        ChartExportTheme::Light => ChartExportPalette {
+            background: RGBColor(245, 245, 245),
+            grid: RGBColor(210, 210, 210),
+            caption: RGBColor(40, 40, 40),
+            axis_label: RGBColor(50, 50, 50),
+            label: RGBColor(60, 60, 60),
+            resume: RGBColor(200, 120, 40),
+            selection: RGBColor(30, 30, 30),
+            selection_line: RGBColor(60, 120, 200),
+            legend_bg: RGBColor(255, 255, 255),
+            legend_border: RGBColor(120, 120, 120),
+        },
+    }
+}
+
+fn format_bool(value: bool) -> String {
+    if value {
+        "On".to_string()
+    } else {
+        "Off".to_string()
+    }
+}
+
+fn legend_position(pos: ChartLegendPosition) -> Option<SeriesLabelPosition> {
+    match pos {
+        ChartLegendPosition::Auto => Some(SeriesLabelPosition::UpperLeft),
+        ChartLegendPosition::UpperLeft => Some(SeriesLabelPosition::UpperLeft),
+        ChartLegendPosition::UpperRight => Some(SeriesLabelPosition::UpperRight),
+        ChartLegendPosition::LowerLeft => Some(SeriesLabelPosition::LowerLeft),
+        ChartLegendPosition::LowerRight => Some(SeriesLabelPosition::LowerRight),
+        ChartLegendPosition::None => None,
+    }
+}
+
+fn format_opt_f(value: Option<f64>) -> String {
+    value
+        .map(|v| format!("{v:.3}"))
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn format_delta(delta: f64) -> String {
+    if delta >= 0.0 {
+        format!("+{delta:.3}")
+    } else {
+        format!("{delta:.3}")
+    }
 }

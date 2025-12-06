@@ -41,6 +41,12 @@ from ray.rllib.algorithms.algorithm import Algorithm
 from ray.rllib.env.wrappers.pettingzoo_env import ParallelPettingZooEnv
 from custom_models import register_rllib_models
 
+class TensorWithCopy(torch.Tensor):
+    """A torch.Tensor subclass that overrides the copy method to avoid errors during ONNX export."""
+    
+    def copy(self, *args, **kwargs):
+        return self
+
 
 def non_negative_int(value: str) -> int:
     number = int(value)
@@ -52,35 +58,73 @@ def non_negative_int(value: str) -> int:
 class RLlibOnnxablePolicy(torch.nn.Module):
     """Wrapper to make RLlib policy exportable to ONNX with proper input/output structure."""
     
-    def __init__(self, model):
+    def __init__(self, model, state_count: int, prev_action_dim: int):
         super().__init__()
         self.model = model
+        self.state_count = state_count
+        self.prev_action_dim = prev_action_dim
         
-    def forward(self, obs, state_ins):
+    def forward(self, obs, seq_lens, state_ins):
         """
         Forward pass matching the expected ONNX signature.
         Args:
             obs: Observation tensor
-            state_ins: State input tensor (for recurrent policies, unused for feedforward)
+            seq_lens: Sequence length tensor (required for recurrent policies)
+            state_ins: Packed state input tensor (first dimension enumerates state tensors)
         Returns:
             output: Action logits or values
-            state_outs: State output tensor (passthrough for feedforward policies)
+            state_outs: Packed state output tensor
         """
+        obs = TensorWithCopy(obs)
+        seq_lens = seq_lens if seq_lens is not None else torch.tensor([obs.shape[0]], dtype=torch.int32)
+        state_tensor = TensorWithCopy(state_ins)
+
+        # Unpack stacked state tensor into a list for RLlib recurrent models
+        state_list = []
+        if state_tensor.dim() >= 1:
+            for i in range(state_tensor.size(0)):
+                tensor = state_tensor[i]
+                if tensor.dim() == 1:
+                    tensor = tensor.unsqueeze(0)
+                state_list.append(tensor)
+        prev_actions = None
+        pad_dim = int(getattr(self.model, "_prev_action_dim", 0)) if hasattr(self.model, "_prev_action_dim") else 0
+        if pad_dim <= 0:
+            pad_dim = self.prev_action_dim
+        if pad_dim <= 0:
+            pad_dim = 1  # minimal placeholder to satisfy models that expect prev_actions
+        prev_actions = torch.zeros((obs.shape[0], pad_dim), dtype=obs.dtype)
+
+        input_dict = {"obs": obs, "prev_actions": prev_actions}
         # Get the policy output
         try:
-            # Try with dict input (some RLlib models expect this)
-            output, _ = self.model({"obs": obs}, [], None)
-        except:
+            output, new_state = self.model(input_dict, state_list, seq_lens)
+        except Exception:
             try:
-                # Try with direct tensor input
-                output, _ = self.model(obs, [], None)
-            except:
-                # Fallback to simple forward
-                output = self.model(obs)
-        
-        # Return both output and state (state is just passed through for feedforward networks)
-        return output, state_ins
+                input_with_seq = dict(input_dict)
+                input_with_seq["seq_lens"] = seq_lens
+                output, new_state = self.model(input_with_seq, state_list, seq_lens)
+            except Exception:
+                # Fallback to simple forward with dict input
+                output, new_state = self.model(input_dict, state_list, seq_lens)
+                new_state = new_state if new_state is not None else state_list
+        if new_state is None:
+            new_state = state_list
+        if not isinstance(new_state, (list, tuple)):
+            new_state = [new_state]
 
+        # Stack state outputs back into a single tensor to make ONNX export stable
+        if len(new_state) == 0:
+            state_out_tensor = state_tensor
+        else:
+            padded = list(new_state)
+            if len(padded) < self.state_count:
+                padded.extend([state_tensor[0]] * (self.state_count - len(padded)))
+            elif len(padded) > self.state_count:
+                padded = padded[: self.state_count]
+            state_out_tensor = torch.stack([TensorWithCopy(s) for s in padded])
+        
+        return output, state_out_tensor
 
 def export_rllib_policy_to_onnx(
     policy,
@@ -111,11 +155,55 @@ def export_rllib_policy_to_onnx(
         # Fallback: try to infer from model
         dummy_obs = torch.randn(1, policy.model.obs_space.shape[0]).float()
     
-    # Create dummy state input (for compatibility with recurrent policies)
-    dummy_state = torch.zeros(1).float()
-    
-    # Wrap the model in our ONNX-compatible wrapper
-    onnxable_model = RLlibOnnxablePolicy(model)
+    # Build dummy state input using the policy's initial state if available
+    try:
+        init_state = policy.get_initial_state()
+    except Exception:
+        init_state = None
+
+    state_tensors = []
+    if init_state:
+        for s in init_state:
+            tensor_state = s if isinstance(s, torch.Tensor) else torch.tensor(s)
+            tensor_state = tensor_state.float()
+            if tensor_state.dim() == 1:
+                tensor_state = tensor_state.unsqueeze(0)
+            state_tensors.append(tensor_state)
+    if not state_tensors:
+        state_tensors = [torch.zeros(1).float()]
+    # Stack state tensors so the wrapper can unpack them
+    dummy_state = torch.stack(state_tensors)
+
+    # Sequence lengths tensor for recurrent models
+    dummy_seq_lens = torch.tensor([dummy_obs.shape[0]], dtype=torch.int32)
+
+    # Infer previous action dimension for recurrent models that use it
+    prev_action_dim = 0
+    try:
+        action_space = getattr(policy, "action_space", None)
+        if action_space is not None:
+            if hasattr(action_space, "flat_dim"):
+                prev_action_dim = int(action_space.flat_dim)
+            else:
+                try:
+                    from gymnasium.spaces.utils import flatten_space
+                    flat = flatten_space(action_space)
+                    if hasattr(flat, "shape") and flat.shape is not None and len(flat.shape) > 0:
+                        dim = 1
+                        for d in flat.shape:
+                            dim *= int(d)
+                        prev_action_dim = dim
+                except Exception:
+                    if hasattr(action_space, "shape") and action_space.shape is not None:
+                        dim = 1
+                        for d in action_space.shape:
+                            dim *= int(d)
+                        prev_action_dim = dim
+    except Exception:
+        prev_action_dim = 0
+
+    onnxable_model = RLlibOnnxablePolicy(model, state_count=len(state_tensors), prev_action_dim=prev_action_dim)
+    onnxable_model.cpu()
     onnxable_model.eval()
     
     print(f"  Exporting to ONNX with opset {opset_version}...")
@@ -125,20 +213,23 @@ def export_rllib_policy_to_onnx(
     with torch.no_grad():
         torch.onnx.export(
             onnxable_model,
-            args=(dummy_obs, dummy_state),
+            args=(dummy_obs, dummy_seq_lens, dummy_state),
             f=export_path,
             opset_version=opset_version,
-            input_names=["obs", "state_ins"],
+            input_names=["obs", "seq_lens", "state_ins"],
             output_names=["output", "state_outs"],
             dynamic_axes={
                 "obs": {0: "batch_size"},
-                "state_ins": {0: "batch_size"},
+                "seq_lens": {0: "batch_size"},
+                "state_ins": {0: "state_components"},
                 "output": {0: "batch_size"},
-                "state_outs": {0: "batch_size"},
+                "state_outs": {0: "state_components"},
             },
-            do_constant_folding=True,
+            do_constant_folding=False,
             export_params=True,
             dynamo=False,  # Use old exporter for better compatibility
+            optimize=False,
+            keep_initializers_as_inputs=True,
         )
     
     print(f"  Post-processing ONNX model...")
