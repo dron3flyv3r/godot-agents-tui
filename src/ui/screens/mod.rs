@@ -12,10 +12,12 @@ use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    config::RLLIB_ALGORITHM_LIST, AgentType, App, ChartExportOptionField, ConfigField,
-    FileBrowserEntry, FileBrowserKind, FileBrowserState, InputMode, InterfaceFocus, MetricSample,
-    MetricsFocus, SimulatorFocus, StatusKind, TabId,
+    config::RLLIB_ALGORITHM_LIST, AgentType, App, ChartExportOptionField, ChartLegendPosition,
+    ConfigField, FileBrowserEntry, FileBrowserKind, FileBrowserState, InputMode, InterfaceFocus,
+    MetricSample, MetricsFocus, MetricsSettingField, MetricsSettingsPanel, PoliciesSortMode,
+    SimulatorFocus, StatusKind, SummaryVerbosity, TabId,
 };
+use ratatui::widgets::LegendPosition;
 
 use super::utils::alphanumeric_sort_key;
 
@@ -361,7 +363,9 @@ fn render_home_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         | InputMode::ConfirmQuit
         | InputMode::AdvancedConfig
         | InputMode::ChartExportOptions
-        | InputMode::EditingChartExportOption => {
+        | InputMode::EditingChartExportOption
+        | InputMode::MetricsSettings
+        | InputMode::EditingMetricsSetting => {
             // These modes have their own full-screen renders
         }
     }
@@ -1688,6 +1692,7 @@ fn render_metrics_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let sample = app
         .selected_metric_sample()
         .or_else(|| app.latest_training_metric());
+    let summary_settings = app.metrics_summary_settings();
 
     if let Some(sample) = sample {
         let selection_index = app.metrics_history_selected_index();
@@ -1804,39 +1809,41 @@ fn render_metrics_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ]));
 
         // Throughput and time - smart wrap
-        if available_width >= 50 {
-            lines.push(Line::from(vec![
-                Span::styled("Throughput: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format_option_rate(sample.env_throughput(), " steps/s"),
-                    Style::default().fg(Color::Cyan),
-                ),
-                Span::raw("  "),
-                Span::styled("Time: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format_option_duration(sample.time_total_s()),
-                    Style::default().fg(Color::White),
-                ),
-            ]));
-        } else {
-            lines.push(Line::from(vec![
-                Span::styled("Throughput: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format_option_rate(sample.env_throughput(), " steps/s"),
-                    Style::default().fg(Color::Cyan),
-                ),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("Time: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format_option_duration(sample.time_total_s()),
-                    Style::default().fg(Color::White),
-                ),
-            ]));
+        if summary_settings.show_throughput_rows {
+            if available_width >= 50 {
+                lines.push(Line::from(vec![
+                    Span::styled("Throughput: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format_option_rate(sample.env_throughput(), " steps/s"),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::raw("  "),
+                    Span::styled("Time: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format_option_duration(sample.time_total_s()),
+                        Style::default().fg(Color::White),
+                    ),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled("Throughput: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format_option_rate(sample.env_throughput(), " steps/s"),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("Time: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format_option_duration(sample.time_total_s()),
+                        Style::default().fg(Color::White),
+                    ),
+                ]));
+            }
         }
 
         // Only show detailed steps if we have enough vertical space
-        if available_height >= 12 {
+        if summary_settings.verbosity == SummaryVerbosity::Detailed && available_height >= 12 {
             // Environment steps - split into two lines for clarity
             lines.push(Line::from(vec![Span::styled(
                 "Env steps: ",
@@ -1892,8 +1899,13 @@ fn render_metrics_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
 
         // Custom metrics if any - only if we have space
-        if available_height >= 10 && !sample.custom_metrics().is_empty() {
-            if let Some(custom_line) = summarize_custom_metrics(sample.custom_metrics(), 4) {
+        if available_height >= 10
+            && !sample.custom_metrics().is_empty()
+            && summary_settings.max_custom_metrics > 0
+        {
+            if let Some(custom_line) =
+                summarize_custom_metrics(sample.custom_metrics(), summary_settings.max_custom_metrics)
+            {
                 lines.push(custom_line);
             }
         }
@@ -1956,35 +1968,61 @@ fn render_metrics_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 fn render_metrics_history(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let history = app.training_metrics_history();
+    let settings = app.metrics_history_settings();
     let available_rows = area.height.saturating_sub(2) as usize;
     if available_rows == 0 {
         return;
     }
 
     let total = history.len();
-    let selected = app
+    let selected_offset_from_latest = app
         .metrics_history_selected_index()
         .min(total.saturating_sub(1));
+    let selected_display_index = if settings.sort_newest_first {
+        selected_offset_from_latest
+    } else {
+        total.saturating_sub(1).saturating_sub(selected_offset_from_latest)
+    };
+
     let max_start = total.saturating_sub(available_rows);
-    let start = selected.saturating_sub(available_rows / 2).min(max_start);
+    let start = selected_display_index
+        .saturating_sub(available_rows / 2)
+        .min(max_start);
     let end = (start + available_rows).min(total);
 
     let mut items = Vec::new();
     let max_width = area.width.saturating_sub(4) as usize;
-    for sample in history.iter().rev().skip(start).take(end - start) {
-        items.push(ListItem::new(metric_history_line(sample, max_width)));
+    let iter: Box<dyn Iterator<Item = &MetricSample>> = if settings.sort_newest_first {
+        Box::new(history.iter().rev().skip(start).take(end - start))
+    } else {
+        Box::new(history.iter().skip(start).take(end - start))
+    };
+    for sample in iter {
+        items.push(ListItem::new(metric_history_line(
+            sample,
+            max_width,
+            settings.show_timestamp,
+            settings.show_env_steps,
+            settings.show_wall_clock,
+        )));
     }
 
     let mut state = ListState::default();
-    state.select(Some(selected.saturating_sub(start)));
+    state.select(Some(selected_display_index.saturating_sub(start)));
 
     // Highlight border if this panel is focused
     let is_focused = app.metrics_focus() == MetricsFocus::History;
     let border_color = focused_border_color(app, is_focused);
     let mut title = if is_focused {
-        "History (newest first) [FOCUSED - Tab to switch]".to_string()
-    } else {
+        if settings.sort_newest_first {
+            "History (newest first) [FOCUSED - Tab to switch]".to_string()
+        } else {
+            "History (oldest first) [FOCUSED - Tab to switch]".to_string()
+        }
+    } else if settings.sort_newest_first {
         "History (newest first)".to_string()
+    } else {
+        "History (oldest first)".to_string()
     };
     if app.is_viewing_saved_run() {
         title.push_str(" • saved run");
@@ -2009,6 +2047,7 @@ fn render_metrics_history(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Highlight border if this panel is focused
     let is_focused = app.metrics_focus() == MetricsFocus::Chart;
+    let chart_settings = app.metrics_chart_settings();
     let border_color = focused_border_color(app, is_focused);
     let mut title = if is_focused {
         "Metric Chart [FOCUSED - Enter to view policies, x to export, Tab to switch]".to_string()
@@ -2016,9 +2055,12 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
         "Metric Chart [Enter to view policies]".to_string()
     };
     if let Some(label) = app.viewed_run_label() {
-        title.push_str(&format!(" • Saved run: {label}"));
+        if chart_settings.show_caption {
+            title.push_str(&format!(" • Saved run: {label}"));
+        }
     }
-    if let Some(iter) = app.resume_marker_iteration() {
+    if chart_settings.show_caption && chart_settings.show_resume {
+        if let Some(iter) = app.resume_marker_iteration() {
         let metric_opt = app.current_chart_metric();
         let pre = metric_opt
             .as_ref()
@@ -2031,6 +2073,7 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .map(|v| format!("{v:.3}"))
             .unwrap_or_else(|| "-".to_string());
         title.push_str(&format!(" • Resume @ {iter} (pre {pre} → live {post})"));
+        }
     }
 
     let block = Block::default()
@@ -2058,9 +2101,16 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
         _ => {}
     }
 
-    let max_points = (area.width as usize).saturating_mul(4);
-    let chart_data = app.chart_data(max_points);
-    let overlay_series = app.overlay_chart_series(&metric_option, max_points);
+    let max_points = chart_settings
+        .max_points
+        .unwrap_or_else(|| (area.width as usize).saturating_mul(4).max(1));
+    let chart_data = app.chart_data(max_points, chart_settings.smoothing);
+    let overlay_series = app.overlay_chart_series(
+        &metric_option,
+        max_points,
+        chart_settings.smoothing,
+        chart_settings.align_overlays_to_start,
+    );
 
     if chart_data.is_none() && overlay_series.is_empty() {
         let placeholder = Paragraph::new("No data for the selected metric yet.")
@@ -2076,8 +2126,6 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut y_max = f64::NEG_INFINITY;
     let mut x_min = f64::INFINITY;
     let mut x_max = f64::NEG_INFINITY;
-    let mut resume_line = Vec::new();
-    let mut resume_marker = Vec::new();
 
     let mut update_bounds = |points: &[(f64, f64)]| {
         for &(x, y) in points {
@@ -2090,15 +2138,64 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
     };
 
+    let primary_color = app.chart_primary_color();
+    let selection_color = app.chart_selection_color();
+    let resume_before_color = app.chart_resume_before_color();
+    let resume_after_color = app.chart_resume_after_color();
+    let resume_markers = if chart_settings.show_resume {
+        app.resume_markers_for_metric(&metric_option)
+    } else {
+        Vec::new()
+    };
+    let resume_split = resume_markers.last().map(|(x, _, _, _)| *x);
+
+    let mut owned_segments: Vec<(String, Vec<(f64, f64)>, Color)> = Vec::new();
     if let Some(chart_data) = &chart_data {
-        update_bounds(&chart_data.points);
+        if let Some(rx) = resume_split {
+            let (before, after): (Vec<_>, Vec<_>) = chart_data
+                .points
+                .iter()
+                .cloned()
+                .partition(|(x, _)| *x <= rx);
+            if !before.is_empty() {
+                owned_segments.push((
+                    format!("{} (pre)", chart_data.label),
+                    before,
+                    resume_before_color,
+                ));
+            }
+            if !after.is_empty() {
+                owned_segments.push((
+                    format!("{} (post)", chart_data.label),
+                    after,
+                    resume_after_color,
+                ));
+            }
+            if owned_segments.is_empty() {
+                owned_segments.push((
+                    chart_data.label.clone(),
+                    chart_data.points.clone(),
+                    primary_color,
+                ));
+            }
+        } else {
+            owned_segments.push((
+                chart_data.label.clone(),
+                chart_data.points.clone(),
+                primary_color,
+            ));
+        }
+    }
+
+    for (label, points, color) in &owned_segments {
+        update_bounds(points);
         datasets.push(
             Dataset::default()
-                .name(chart_data.label.clone())
+                .name(label.clone())
                 .marker(Marker::Braille)
                 .graph_type(GraphType::Line)
-                .style(Style::default().fg(Color::Cyan))
-                .data(&chart_data.points),
+                .style(Style::default().fg(*color))
+                .data(points),
         );
     }
 
@@ -2121,7 +2218,19 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let selected_y = app.selected_chart_value();
     let mut selection_line = Vec::new();
     let mut selection_marker = Vec::new();
-    let resume_x = app.resume_marker_iteration().map(|iter| iter as f64);
+
+    for (x, y, _, _) in &resume_markers {
+        if x.is_finite() {
+            x_min = x_min.min(*x);
+            x_max = x_max.max(*x);
+        }
+        if let Some(val) = y {
+            if val.is_finite() {
+                y_min = y_min.min(*val);
+                y_max = y_max.max(*val);
+            }
+        }
+    }
 
     if !y_min.is_finite() || !y_max.is_finite() {
         y_min = 0.0;
@@ -2136,36 +2245,18 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
         x_min = 0.0;
         x_max = 1.0;
     }
-    if let Some(x) = resume_x {
-        if x.is_finite() {
-            x_min = x_min.min(x);
-            x_max = x_max.max(x);
-        }
-    }
     if (x_max - x_min).abs() < 1e-3 {
         x_max = x_min + 1.0;
     }
 
-    if let Some(x) = selected_x {
-        if x.is_finite() && x >= x_min && x <= x_max {
-            selection_line.push((x, y_min));
-            selection_line.push((x, y_max));
-            if let Some(y) = selected_y {
-                if y.is_finite() {
-                    selection_marker.push((x, y));
-                }
-            }
-        }
-    }
-
-    if let Some(x) = resume_x {
-        if x.is_finite() && x >= x_min && x <= x_max {
-            resume_line.push((x, y_min));
-            resume_line.push((x, y_max));
-            if let Some(metric_option) = app.current_chart_metric() {
-                if let Some(y) = app.resume_marker_value(&metric_option) {
+    if chart_settings.show_selection {
+        if let Some(x) = selected_x {
+            if x.is_finite() && x >= x_min && x <= x_max {
+                selection_line.push((x, y_min));
+                selection_line.push((x, y_max));
+                if let Some(y) = selected_y {
                     if y.is_finite() {
-                        resume_marker.push((x, y));
+                        selection_marker.push((x, y));
                     }
                 }
             }
@@ -2178,7 +2269,7 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .name("Selected")
                 .marker(Marker::Braille)
                 .graph_type(GraphType::Line)
-                .style(Style::default().fg(Color::LightYellow))
+                .style(Style::default().fg(selection_color))
                 .data(&selection_line),
         );
     }
@@ -2189,28 +2280,46 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .name("Here")
                 .marker(Marker::Block)
                 .graph_type(GraphType::Scatter)
-                .style(Style::default().fg(Color::Yellow))
+                .style(Style::default().fg(selection_color))
                 .data(&selection_marker),
         );
     }
-    if !resume_line.is_empty() {
+    let mut resume_lines: Vec<(String, Vec<(f64, f64)>, Color)> = Vec::new();
+    let mut resume_point_sets: Vec<(String, Vec<(f64, f64)>, Color)> = Vec::new();
+    for (idx, (x, y, color, label)) in resume_markers.iter().enumerate() {
+        if !x.is_finite() || *x < x_min || *x > x_max {
+            continue;
+        }
+        let name = if label.is_empty() {
+            format!("Resume #{} @ {}", idx + 1, *x as u64)
+        } else {
+            format!("{} (iter {})", label, *x as u64)
+        };
+        resume_lines.push((name.clone(), vec![(*x, y_min), (*x, y_max)], *color));
+        if let Some(val) = y {
+            if val.is_finite() {
+                resume_point_sets.push((format!("{name} value"), vec![(*x, *val)], *color));
+            }
+        }
+    }
+    for (name, points, color) in &resume_lines {
         datasets.push(
             Dataset::default()
-                .name("Resume")
+                .name(name.clone())
                 .marker(Marker::Braille)
                 .graph_type(GraphType::Line)
-                .style(Style::default().fg(Color::LightMagenta))
-                .data(&resume_line),
+                .style(Style::default().fg(*color))
+                .data(points),
         );
     }
-    if !resume_marker.is_empty() {
+    for (name, points, color) in &resume_point_sets {
         datasets.push(
             Dataset::default()
-                .name("Resumed here")
+                .name(name.clone())
                 .marker(Marker::Block)
                 .graph_type(GraphType::Scatter)
-                .style(Style::default().fg(Color::Magenta))
-                .data(&resume_marker),
+                .style(Style::default().fg(*color))
+                .data(points),
         );
     }
 
@@ -2229,7 +2338,7 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let x_axis = Axis::default()
         .title(Span::styled(
-            "Iteration",
+            chart_settings.x_label.as_str(),
             Style::default().fg(Color::DarkGray),
         ))
         .labels(x_labels)
@@ -2237,16 +2346,35 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let y_axis = Axis::default()
         .title(Span::styled(
-            metric_option.label(),
+            if chart_settings.y_label.is_empty() || chart_settings.y_label == "Value" {
+                metric_option.label()
+            } else {
+                chart_settings.y_label.as_str()
+            },
             Style::default().fg(Color::DarkGray),
         ))
         .labels(y_labels)
         .bounds([y_min, y_max]);
 
-    let chart = Chart::new(datasets)
+    let mut chart = Chart::new(datasets)
         .block(block)
         .x_axis(x_axis)
         .y_axis(y_axis);
+
+    if chart_settings.show_legend {
+        let legend_pos = match chart_settings.legend_position {
+            ChartLegendPosition::Auto => LegendPosition::Top,
+            ChartLegendPosition::UpperLeft => LegendPosition::Top,
+            ChartLegendPosition::UpperRight => LegendPosition::Top,
+            ChartLegendPosition::LowerLeft => LegendPosition::Bottom,
+            ChartLegendPosition::LowerRight => LegendPosition::Bottom,
+            ChartLegendPosition::None => LegendPosition::Top,
+        };
+        chart = chart.legend_position(Some(legend_pos));
+    } else {
+        chart =
+            chart.hidden_legend_constraints((Constraint::Length(0), Constraint::Length(0)));
+    }
 
     frame.render_widget(chart, area);
 }
@@ -2258,7 +2386,17 @@ fn render_multi_series_chart(
     metric_option: &crate::app::ChartMetricOption,
     block: Block<'_>,
 ) {
-    let multi_data = app.chart_multi_series_data(metric_option);
+    let chart_settings = app.metrics_chart_settings();
+    let selection_color = app.chart_selection_color();
+    let resume_markers = if chart_settings.show_resume {
+        app.resume_markers_for_metric(metric_option)
+    } else {
+        Vec::new()
+    };
+    let max_points = chart_settings
+        .max_points
+        .unwrap_or_else(|| (area.width as usize).saturating_mul(4).max(1));
+    let multi_data = app.chart_multi_series_data(metric_option, max_points, chart_settings.smoothing);
 
     if multi_data.is_empty() {
         let placeholder = Paragraph::new("No data for overlay chart yet.")
@@ -2274,8 +2412,6 @@ fn render_multi_series_chart(
     let mut y_max = f64::NEG_INFINITY;
     let mut x_min = f64::INFINITY;
     let mut x_max = f64::NEG_INFINITY;
-    let resume_x = app.resume_marker_iteration().map(|iter| iter as f64);
-    let mut resume_line = Vec::new();
 
     for (_, points) in &multi_data {
         for &(x, y) in points {
@@ -2289,10 +2425,16 @@ fn render_multi_series_chart(
             }
         }
     }
-    if let Some(x) = resume_x {
+    for (x, y, _, _) in &resume_markers {
         if x.is_finite() {
-            x_min = x_min.min(x);
-            x_max = x_max.max(x);
+            x_min = x_min.min(*x);
+            x_max = x_max.max(*x);
+        }
+        if let Some(val) = y {
+            if val.is_finite() {
+                y_min = y_min.min(*val);
+                y_max = y_max.max(*val);
+            }
         }
     }
 
@@ -2314,28 +2456,12 @@ fn render_multi_series_chart(
         x_max = x_min + 1.0;
     }
 
-    // Define colors for different policies
-    let colors = [
-        Color::Cyan,
-        Color::Yellow,
-        Color::Magenta,
-        Color::Green,
-        Color::Red,
-        Color::Blue,
-        Color::LightCyan,
-        Color::LightYellow,
-        Color::LightMagenta,
-        Color::LightGreen,
-        Color::LightRed,
-        Color::LightBlue,
-    ];
-
     // Create datasets for each policy
     let mut datasets: Vec<Dataset> = multi_data
         .iter()
         .enumerate()
         .map(|(idx, (policy_id, points))| {
-            let color = colors[idx % colors.len()];
+            let color = app.policy_color(policy_id, idx);
             Dataset::default()
                 .name(policy_id.clone())
                 .marker(Marker::Braille)
@@ -2350,10 +2476,12 @@ fn render_multi_series_chart(
         .and_then(|sample| sample.training_iteration().map(|iter| iter as f64))
         .or_else(|| Some(app.metrics_history_selected_index() as f64));
     let mut selection_line = Vec::new();
-    if let Some(x) = selected_x {
-        if x.is_finite() && x >= x_min && x <= x_max {
-            selection_line.push((x, y_min));
-            selection_line.push((x, y_max));
+    if chart_settings.show_selection {
+        if let Some(x) = selected_x {
+            if x.is_finite() && x >= x_min && x <= x_max {
+                selection_line.push((x, y_min));
+                selection_line.push((x, y_max));
+            }
         }
     }
 
@@ -2363,24 +2491,46 @@ fn render_multi_series_chart(
                 .name("Selected")
                 .marker(Marker::Braille)
                 .graph_type(GraphType::Line)
-                .style(Style::default().fg(Color::LightYellow))
+                .style(Style::default().fg(selection_color))
                 .data(&selection_line),
         );
     }
-    if let Some(x) = resume_x {
-        if x.is_finite() && x >= x_min && x <= x_max {
-            resume_line.push((x, y_min));
-            resume_line.push((x, y_max));
+    let mut resume_lines: Vec<(String, Vec<(f64, f64)>, Color)> = Vec::new();
+    let mut resume_point_sets: Vec<(String, Vec<(f64, f64)>, Color)> = Vec::new();
+    for (idx, (x, y, color, label)) in resume_markers.iter().enumerate() {
+        if !x.is_finite() || *x < x_min || *x > x_max {
+            continue;
+        }
+        let name = if label.is_empty() {
+            format!("Resume #{} @ {}", idx + 1, *x as u64)
+        } else {
+            format!("{} (iter {})", label, *x as u64)
+        };
+        resume_lines.push((name.clone(), vec![(*x, y_min), (*x, y_max)], *color));
+        if let Some(val) = y {
+            if val.is_finite() {
+                resume_point_sets.push((format!("{name} value"), vec![(*x, *val)], *color));
+            }
         }
     }
-    if !resume_line.is_empty() {
+    for (name, points, color) in &resume_lines {
         datasets.push(
             Dataset::default()
-                .name("Resume")
+                .name(name.clone())
                 .marker(Marker::Braille)
                 .graph_type(GraphType::Line)
-                .style(Style::default().fg(Color::LightMagenta))
-                .data(&resume_line),
+                .style(Style::default().fg(*color))
+                .data(points),
+        );
+    }
+    for (name, points, color) in &resume_point_sets {
+        datasets.push(
+            Dataset::default()
+                .name(name.clone())
+                .marker(Marker::Block)
+                .graph_type(GraphType::Scatter)
+                .style(Style::default().fg(*color))
+                .data(points),
         );
     }
 
@@ -2399,7 +2549,7 @@ fn render_multi_series_chart(
 
     let x_axis = Axis::default()
         .title(Span::styled(
-            "Iteration",
+            chart_settings.x_label.as_str(),
             Style::default().fg(Color::DarkGray),
         ))
         .labels(x_labels)
@@ -2415,19 +2565,42 @@ fn render_multi_series_chart(
     };
 
     let y_axis = Axis::default()
-        .title(Span::styled(y_label, Style::default().fg(Color::DarkGray)))
+        .title(Span::styled(
+            if chart_settings.y_label.is_empty() || chart_settings.y_label == "Value" {
+                y_label
+            } else {
+                chart_settings.y_label.as_str()
+            },
+            Style::default().fg(Color::DarkGray),
+        ))
         .labels(y_labels)
         .bounds([y_min, y_max]);
 
-    let chart = Chart::new(datasets)
+    let mut chart = Chart::new(datasets)
         .block(block)
         .x_axis(x_axis)
         .y_axis(y_axis);
+
+    if chart_settings.show_legend {
+        let legend_pos = match chart_settings.legend_position {
+            ChartLegendPosition::Auto => LegendPosition::Top,
+            ChartLegendPosition::UpperLeft => LegendPosition::Top,
+            ChartLegendPosition::UpperRight => LegendPosition::Top,
+            ChartLegendPosition::LowerLeft => LegendPosition::Bottom,
+            ChartLegendPosition::LowerRight => LegendPosition::Bottom,
+            ChartLegendPosition::None => LegendPosition::Top,
+        };
+        chart = chart.legend_position(Some(legend_pos));
+    } else {
+        chart =
+            chart.hidden_legend_constraints((Constraint::Length(0), Constraint::Length(0)));
+    }
 
     frame.render_widget(chart, area);
 }
 
 fn render_metrics_chart_info(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let info_settings = app.metrics_info_settings();
     let metric = app.current_chart_metric();
     let metric_label = metric
         .as_ref()
@@ -2495,42 +2668,59 @@ fn render_metrics_chart_info(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ]));
     }
 
-    if available_width >= 90 {
-        lines.push(Line::from(vec![Span::styled(
-            "↑/↓: navigate history  •  PgUp/PgDn: jump 10  •  Home/End: edges  •  , / . : cycle metric",
-            Style::default().fg(Color::DarkGray),
-        )]));
-    } else if available_width >= 60 {
-        lines.push(Line::from(vec![Span::styled(
-            "↑/↓: history  •  PgUp/Dn: jump + move marker  •  Home/End: edges  •  ,/.: metric",
-            Style::default().fg(Color::DarkGray),
-        )]));
-    } else {
-        lines.push(Line::from(vec![Span::styled(
-            "↑/↓: history  •  PgUp/Dn: jump marker  •  ,/.: metric",
-            Style::default().fg(Color::DarkGray),
-        )]));
-    }
-
-    lines.push(Line::from(vec![Span::styled(
-        "r: use selected checkpoint to prefill resume + export paths",
-        Style::default().fg(Color::LightGreen),
-    )]));
-
-    if app.has_saved_run_overlays() {
-        if let Some(label) = app.selected_overlay_label() {
+    if info_settings.show_hints {
+        if available_width >= 90 {
             lines.push(Line::from(vec![Span::styled(
-                format!("Selected run: {label} — 'o' view / 'O' cycle"),
-                Style::default().fg(Color::LightCyan),
+                "↑/↓: navigate history  •  PgUp/PgDn: jump  •  Home/End: edges  •  , / . : cycle metric",
+                Style::default().fg(Color::DarkGray),
+            )]));
+        } else if available_width >= 60 {
+            lines.push(Line::from(vec![Span::styled(
+                "↑/↓: history  •  PgUp/Dn: jump marker  •  Home/End: edges  •  ,/.: metric",
+                Style::default().fg(Color::DarkGray),
+            )]));
+        } else {
+            lines.push(Line::from(vec![Span::styled(
+                "↑/↓: history  •  PgUp/Dn: jump marker  •  ,/.: metric",
+                Style::default().fg(Color::DarkGray),
             )]));
         }
-    }
 
-    if let Some(hint) = app.metrics_source_hint() {
         lines.push(Line::from(vec![Span::styled(
-            hint,
-            Style::default().fg(Color::LightMagenta),
+            "r: use selected checkpoint directory to prefill resume + export paths",
+            Style::default().fg(Color::LightGreen),
         )]));
+
+        if app.has_saved_run_overlays() {
+            if let Some(label) = app.selected_overlay_label() {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("Selected run: {label} — 'o' view / 'O' cycle"),
+                    Style::default().fg(Color::LightCyan),
+                )]));
+            }
+        }
+
+        if !app.discovered_runs().is_empty() {
+            let hint_label = app
+                .selected_discovered_label()
+                .unwrap_or_else(|| "latest detected".to_string());
+            lines.push(Line::from(vec![Span::styled(
+                format!("Detected RLlib runs: {hint_label} — 'f' pick/run menu, 'g' quick load latest, 'G' cycle+load"),
+                Style::default().fg(Color::LightYellow),
+            )]));
+        } else {
+            lines.push(Line::from(vec![Span::styled(
+                "Press 'f' to scan logs/rllib, pick a run, or choose a file manually",
+                Style::default().fg(Color::DarkGray),
+            )]));
+        }
+
+        if let Some(hint) = app.metrics_source_hint() {
+            lines.push(Line::from(vec![Span::styled(
+                hint,
+                Style::default().fg(Color::LightMagenta),
+            )]));
+        }
     }
 
     let is_focused = app.metrics_focus() == MetricsFocus::Chart;
@@ -2560,8 +2750,16 @@ fn render_metrics_chart_info(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .borders(Borders::ALL)
         .title("Marker Stats")
         .border_style(Style::default().fg(border_color));
-    frame.render_widget(
+    let stats_content = if info_settings.show_marker_stats {
         Paragraph::new(marker_stats_lines(app))
+    } else {
+        Paragraph::new(Line::from(Span::styled(
+            "Marker stats hidden (toggle in settings)",
+            Style::default().fg(Color::DarkGray),
+        )))
+    };
+    frame.render_widget(
+        stats_content
             .block(stats_block)
             .alignment(Alignment::Left)
             .wrap(Wrap { trim: true }),
@@ -2687,6 +2885,7 @@ fn render_metrics_policies(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
+    let settings = app.metrics_policies_settings();
     let highlighted_policy = app
         .current_chart_metric()
         .and_then(|metric| metric.policy_id().map(|p| p.to_string()));
@@ -2694,12 +2893,21 @@ fn render_metrics_policies(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let available_width = area.width.saturating_sub(4) as usize; // Account for borders
     let available_height = area.height.saturating_sub(2) as usize; // Account for borders
 
-    // Collect and sort policies using smart alphanumeric sorting
+    // Collect and sort policies using configured mode
     let mut policies: Vec<_> = sample.policies().iter().collect();
-    policies.sort_by(|a, b| {
-        let key_a = alphanumeric_sort_key(a.0);
-        let key_b = alphanumeric_sort_key(b.0);
-        key_a.cmp(&key_b)
+    policies.sort_by(|a, b| match settings.sort {
+        PoliciesSortMode::Alphanumeric => {
+            let key_a = alphanumeric_sort_key(a.0);
+            let key_b = alphanumeric_sort_key(b.0);
+            key_a.cmp(&key_b)
+        }
+        PoliciesSortMode::RewardDescending => {
+            let a_reward = a.1.reward_mean().unwrap_or(f64::MIN);
+            let b_reward = b.1.reward_mean().unwrap_or(f64::MIN);
+            b_reward
+                .partial_cmp(&a_reward)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }
     });
 
     let mut items = Vec::new();
@@ -2784,24 +2992,27 @@ fn render_metrics_policies(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ]));
         }
 
-        if let Some(comp) = comparison.as_ref() {
-            if let Some(line) = render_compact_policy_delta("Δ Reward μ: ", comp.reward_mean) {
-                lines.push(line);
-            }
-            if let Some(line) = render_compact_policy_delta("Δ Ep len: ", comp.episode_len_mean) {
-                lines.push(line);
+        if settings.show_overlay_deltas {
+            if let Some(comp) = comparison.as_ref() {
+                if let Some(line) = render_compact_policy_delta("Δ Reward μ: ", comp.reward_mean) {
+                    lines.push(line);
+                }
+                if let Some(line) = render_compact_policy_delta("Δ Ep len: ", comp.episode_len_mean) {
+                    lines.push(line);
+                }
             }
         }
 
         // Learner stats - show key metrics, wrap intelligently
-        // Limit stats shown based on available height
-        let max_learner_stats = if available_height < 8 {
+        // Limit stats shown based on available height and setting
+        let auto_limit = if available_height < 8 {
             2 // Very limited space, show only 2 stats per policy
         } else if available_height < 12 {
             3 // Limited space, show 3 stats per policy
         } else {
             5 // Normal space, show up to 5 stats per policy
         };
+        let max_learner_stats = auto_limit.min(settings.max_learner_stats);
 
         if !metrics.learner_stats().is_empty() {
             // Show most important learner stats on separate lines for readability
@@ -2919,12 +3130,22 @@ fn render_metrics_policies_expanded(frame: &mut Frame<'_>, area: Rect, app: &App
         return;
     }
 
-    // Collect and sort policies using smart alphanumeric sorting
+    let settings = app.metrics_policies_settings();
+    // Collect and sort policies using configured mode
     let mut policies: Vec<_> = sample.policies().iter().collect();
-    policies.sort_by(|a, b| {
-        let key_a = alphanumeric_sort_key(a.0);
-        let key_b = alphanumeric_sort_key(b.0);
-        key_a.cmp(&key_b)
+    policies.sort_by(|a, b| match settings.sort {
+        PoliciesSortMode::Alphanumeric => {
+            let key_a = alphanumeric_sort_key(a.0);
+            let key_b = alphanumeric_sort_key(b.0);
+            key_a.cmp(&key_b)
+        }
+        PoliciesSortMode::RewardDescending => {
+            let a_reward = a.1.reward_mean().unwrap_or(f64::MIN);
+            let b_reward = b.1.reward_mean().unwrap_or(f64::MIN);
+            b_reward
+                .partial_cmp(&a_reward)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }
     });
 
     let num_policies = policies.len();
@@ -2991,6 +3212,7 @@ fn render_single_policy_detailed(
     is_first: bool,
     app: &App,
 ) {
+    let settings = app.metrics_policies_settings();
     let mut lines = Vec::new();
 
     // Policy name as header
@@ -3058,7 +3280,7 @@ fn render_single_policy_detailed(
     lines.push(Line::from(""));
 
     // Learner stats
-    if !metrics.learner_stats().is_empty() {
+    if !metrics.learner_stats().is_empty() && settings.max_learner_stats > 0 {
         lines.push(Line::from(vec![Span::styled(
             "Learner Stats:",
             Style::default()
@@ -3066,7 +3288,10 @@ fn render_single_policy_detailed(
                 .add_modifier(Modifier::BOLD),
         )]));
 
-        for (key, value) in metrics.learner_stats() {
+        for (idx, (key, value)) in metrics.learner_stats().iter().enumerate() {
+            if idx >= settings.max_learner_stats {
+                break;
+            }
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(format!("{}: ", key), Style::default().fg(Color::DarkGray)),
@@ -3077,7 +3302,7 @@ fn render_single_policy_detailed(
     }
 
     // Custom metrics
-    if !metrics.custom_metrics().is_empty() {
+    if settings.show_custom_metrics && !metrics.custom_metrics().is_empty() {
         lines.push(Line::from(vec![Span::styled(
             "Custom Metrics:",
             Style::default()
@@ -3094,7 +3319,8 @@ fn render_single_policy_detailed(
         }
     }
 
-    if let Some(comp) = app.policy_comparison(policy_id) {
+    if settings.show_overlay_deltas {
+        if let Some(comp) = app.policy_comparison(policy_id) {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![Span::styled(
             format!("Comparison vs {}", comp.baseline_label),
@@ -3117,6 +3343,7 @@ fn render_single_policy_detailed(
         if let Some(line) = render_expanded_policy_delta_u64("Completed", comp.completed_episodes) {
             lines.push(line);
         }
+    }
     }
 
     // Apply vertical scroll with bounds checking
@@ -3144,24 +3371,38 @@ fn render_single_policy_detailed(
     frame.render_widget(paragraph, area);
 }
 
-fn metric_history_line(sample: &MetricSample, max_width: usize) -> Line<'static> {
-    let timestamp = sample.timestamp().unwrap_or("—").to_string();
-    let timestamp = timestamp
-        .split("T")
-        .nth(1)
-        .unwrap_or("—")
-        .split("Z")
-        .nth(0)
-        .unwrap_or("—");
-    let timestamp = timestamp.split(":").take(3).collect::<Vec<_>>().join(":");
-    let timestamp = timestamp.split(".").nth(0).unwrap_or("—");
+fn metric_history_line(
+    sample: &MetricSample,
+    max_width: usize,
+    show_timestamp: bool,
+    show_env_steps: bool,
+    wall_clock: bool,
+) -> Line<'static> {
+    let timestamp = if !show_timestamp {
+        String::new()
+    } else if wall_clock {
+        sample.timestamp().unwrap_or("—").to_string()
+    } else {
+        let ts = sample.timestamp().unwrap_or("—").to_string();
+        let ts = ts
+            .split('T')
+            .nth(1)
+            .unwrap_or("—")
+            .split('Z')
+            .nth(0)
+            .unwrap_or("—");
+        let ts = ts.split(':').take(3).collect::<Vec<_>>().join(":");
+        ts.split('.').nth(0).unwrap_or("—").to_string()
+    };
 
     let mut segments: Vec<(String, Style)> = Vec::new();
-    segments.push((
-        format!("{timestamp} "),
-        Style::default().fg(Color::DarkGray),
-    ));
-    segments.push(("  ".to_string(), Style::default()));
+    if show_timestamp {
+        segments.push((
+            format!("{timestamp} "),
+            Style::default().fg(Color::DarkGray),
+        ));
+        segments.push(("  ".to_string(), Style::default()));
+    }
     segments.push((
         format!("iter {}", format_option_u64(sample.training_iteration())),
         Style::default().fg(Color::Cyan),
@@ -3182,11 +3423,13 @@ fn metric_history_line(sample: &MetricSample, max_width: usize) -> Line<'static>
         Style::default().fg(Color::LightBlue),
     ));
     segments.push(("  ".to_string(), Style::default()));
-    if let Some(env_steps) = sample.env_steps_this_iter() {
-        segments.push((
-            format!("env {}", env_steps),
-            Style::default().fg(Color::LightYellow),
-        ));
+    if show_env_steps {
+        if let Some(env_steps) = sample.env_steps_this_iter() {
+            segments.push((
+                format!("env {}", env_steps),
+                Style::default().fg(Color::LightYellow),
+            ));
+        }
     }
 
     let spans = truncate_segments(segments, max_width);
@@ -3226,6 +3469,47 @@ fn truncate_segments(segments: Vec<(String, Style)>, max_width: usize) -> Vec<Sp
         }
     }
     collected
+}
+
+fn metrics_setting_label(field: MetricsSettingField) -> &'static str {
+    match field {
+        MetricsSettingField::ChartShowLegend => "Show legend",
+        MetricsSettingField::ChartLegendPosition => "Legend position",
+        MetricsSettingField::ChartShowResumeMarker => "Resume marker",
+        MetricsSettingField::ChartShowSelectionMarker => "Selection marker",
+        MetricsSettingField::ChartShowCaption => "Caption/title",
+        MetricsSettingField::ChartXAxisLabel => "X axis title",
+        MetricsSettingField::ChartYAxisLabel => "Y axis title",
+        MetricsSettingField::ChartAlignOverlaysToStart => "Align overlays to start",
+        MetricsSettingField::ChartMaxPoints => "Max points (Auto)",
+        MetricsSettingField::ChartSmoothing => "Smoothing",
+        MetricsSettingField::ChartPrimaryColor => "Series color",
+        MetricsSettingField::ChartSelectionColor => "Selection color",
+        MetricsSettingField::ChartResumeBeforeColor => "Resume (before) color",
+        MetricsSettingField::ChartResumeAfterColor => "Resume (after) color",
+        MetricsSettingField::ChartResumeMarkerColor => "Resume marker color",
+        MetricsSettingField::ChartPaletteName => "Palette",
+        MetricsSettingField::HistorySortNewestFirst => "Newest first",
+        MetricsSettingField::HistoryAutoFollow => "Auto-follow latest",
+        MetricsSettingField::HistoryPageStep => "Page step",
+        MetricsSettingField::HistoryShowTimestamp => "Show timestamp",
+        MetricsSettingField::HistoryShowEnvSteps => "Show env steps",
+        MetricsSettingField::HistoryShowWallClock => "Wall-clock time",
+        MetricsSettingField::SummaryVerbosity => "Verbosity",
+        MetricsSettingField::SummaryMaxCustom => "Max custom metrics",
+        MetricsSettingField::SummaryShowOverlayDeltas => "Overlay deltas",
+        MetricsSettingField::SummaryShowThroughput => "Throughput/time rows",
+        MetricsSettingField::PoliciesDefaultView => "Default view",
+        MetricsSettingField::PoliciesSort => "Sort policies by",
+        MetricsSettingField::PoliciesMaxLearnerStats => "Max learner stats",
+        MetricsSettingField::PoliciesShowCustomMetrics => "Show custom metrics",
+        MetricsSettingField::PoliciesShowOverlayDeltas => "Overlay deltas",
+        MetricsSettingField::PoliciesStartExpanded => "Start expanded",
+        MetricsSettingField::PoliciesColorMode => "Policy color mode",
+        MetricsSettingField::PoliciesColorOverride => "Policy color override",
+        MetricsSettingField::InfoShowHints => "Show hints",
+        MetricsSettingField::InfoShowMarkerStats => "Show marker stats",
+    }
 }
 
 fn format_option_u64(value: Option<u64>) -> String {
@@ -3935,11 +4219,12 @@ fn metrics_help_lines(app: &App) -> Vec<String> {
         "x (chart focus)  Export chart as PNG (adjust options after choosing path)".to_string(),
         "l                Load a saved run as the primary view (no overlays)".to_string(),
         "c                Load a saved run overlay from disk".to_string(),
+        "f / g / G        Refresh detected RLlib runs • load latest detected • cycle+load".to_string(),
         "C                Clear all overlays".to_string(),
         "o                Toggle viewing the selected saved run".to_string(),
         "O                Cycle through loaded runs".to_string(),
         "v                Return to live metrics when viewing a run".to_string(),
-        "r                Apply the selected checkpoint to the training config".to_string(),
+        "r                Apply the selected checkpoint directory to the training config".to_string(),
     ];
     if app.has_saved_run_overlays() {
         if let Some(label) = app.selected_overlay_label() {
@@ -4331,6 +4616,7 @@ pub fn render_chart_export_options(frame: &mut Frame<'_>, app: &App) {
                 ChartExportOptionField::ShowGrid => "Grid",
                 ChartExportOptionField::XAxisTitle => "X axis title",
                 ChartExportOptionField::YAxisTitle => "Y axis title",
+                ChartExportOptionField::Smoothing => "Smoothing",
             };
             let value = app
                 .chart_export_option_value(*field)
@@ -4400,6 +4686,132 @@ pub fn render_chart_export_options(frame: &mut Frame<'_>, app: &App) {
         Paragraph::new(instructions)
             .block(footer_block)
             .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true }),
+        layout[2],
+    );
+}
+
+pub fn render_metrics_settings(frame: &mut Frame<'_>, app: &App) {
+    let area = frame.area();
+    let vertical_margin = area.height / 6;
+    let horizontal_margin = area.width / 6;
+    let overlay_area = Rect {
+        x: horizontal_margin,
+        y: vertical_margin,
+        width: area.width.saturating_sub(horizontal_margin * 2),
+        height: area.height.saturating_sub(vertical_margin * 2),
+    };
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(5),
+            Constraint::Length(3),
+        ])
+        .split(overlay_area);
+
+    let panel_label = match app.metrics_settings_panel() {
+        MetricsSettingsPanel::Chart => "Chart Settings",
+        MetricsSettingsPanel::History => "History Settings",
+        MetricsSettingsPanel::Summary => "Summary Settings",
+        MetricsSettingsPanel::Policies => "Policies Settings",
+        MetricsSettingsPanel::Info => "Info Panel Settings",
+    };
+
+    let header_block = Block::default()
+        .borders(Borders::ALL)
+        .title(panel_label)
+        .title_alignment(Alignment::Center)
+        .border_style(Style::default().fg(Color::Cyan));
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "Adjust metrics panel behavior (live only)",
+            Style::default().fg(Color::DarkGray),
+        )))
+        .block(header_block)
+        .alignment(Alignment::Center),
+        layout[0],
+    );
+
+    let fields = app.metrics_settings_fields();
+    let items: Vec<ListItem> = fields
+        .iter()
+        .map(|field| {
+            let label = metrics_setting_label(*field);
+            let value = app.metrics_setting_value(*field);
+            let spans = vec![
+                Span::styled(
+                    format!("{label}: "),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(value, Style::default().fg(Color::Yellow)),
+            ];
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    let selected = app
+        .metrics_settings_selection()
+        .min(fields.len().saturating_sub(1));
+    state.select(Some(selected));
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title("Options")
+            .title_alignment(Alignment::Center),
+    )
+    .highlight_style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )
+    .highlight_symbol("› ");
+
+    frame.render_stateful_widget(list, layout[1], &mut state);
+
+    let editing = matches!(app.input_mode(), InputMode::EditingMetricsSetting);
+    let footer_text = if editing {
+        format!(
+            "Editing: {} — type, Enter to save, Esc to cancel",
+            app.active_metrics_setting_field()
+                .map(metrics_setting_label)
+                .unwrap_or("value")
+        )
+    } else {
+        "↑/↓ select • Enter/Space toggle/edit • s or Esc to close".to_string()
+    };
+
+    let footer_spans = if editing {
+        vec![
+            Span::styled(footer_text, Style::default().fg(Color::LightCyan)),
+            Span::raw("  "),
+            Span::styled(
+                format!("Input: {}", app.metrics_settings_edit_buffer()),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]
+    } else {
+        vec![Span::styled(
+            footer_text,
+            Style::default().fg(Color::LightCyan),
+        )]
+    };
+
+    frame.render_widget(
+        Paragraph::new(Line::from(footer_spans))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Controls")
+                    .border_style(Style::default().fg(Color::Cyan)),
+            )
+            .alignment(Alignment::Left)
             .wrap(Wrap { trim: true }),
         layout[2],
     );
@@ -4616,7 +5028,7 @@ pub fn render_choice_menu(frame: &mut Frame<'_>, app: &App) {
     let Some(menu) = app.choice_menu() else {
         return;
     };
-    let field_label = menu.field.label();
+    let field_label = menu.label;
 
     let area = frame.area();
     let vertical_margin = area.height / 8;

@@ -50,6 +50,8 @@ fn handle_key_event(app: &mut App, key: KeyCode) -> Result<()> {
         InputMode::EditingExport => handle_export_edit_input(app, key)?,
         InputMode::ChartExportOptions => handle_chart_export_options_input(app, key)?,
         InputMode::EditingChartExportOption => handle_chart_export_option_edit_input(app, key)?,
+        InputMode::MetricsSettings => handle_metrics_settings_input(app, key)?,
+        InputMode::EditingMetricsSetting => handle_metrics_setting_edit_input(app, key)?,
         InputMode::Normal => handle_normal_mode_key(app, key)?,
     }
     Ok(())
@@ -225,7 +227,7 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
                     app.metrics_toggle_policies_expanded();
                 }
             }
-            KeyCode::Left => {
+            KeyCode::Right => {
                 // If chart is focused, move marker to newer sample; otherwise scroll expanded policies
                 if app.metrics_focus() == app::MetricsFocus::Chart {
                     app.metrics_history_move_newer();
@@ -233,7 +235,7 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
                     app.metrics_scroll_policies_left();
                 }
             }
-            KeyCode::Right => {
+            KeyCode::Left => {
                 // If chart is focused, move marker to older sample; otherwise scroll expanded policies
                 if app.metrics_focus() == app::MetricsFocus::Chart {
                     app.metrics_history_move_older();
@@ -261,18 +263,18 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
             }
             KeyCode::PageUp => {
                 if app.metrics_focus() == app::MetricsFocus::History {
-                    app.metrics_history_page_newer(10);
+                    app.metrics_history_page_newer(app.metrics_history_page_step());
                 } else if app.metrics_focus() == app::MetricsFocus::Chart {
-                    app.metrics_history_page_newer(10);
+                    app.metrics_history_page_newer(app.metrics_history_page_step());
                 } else {
                     app.metrics_scroll_up(5);
                 }
             }
             KeyCode::PageDown => {
                 if app.metrics_focus() == app::MetricsFocus::History {
-                    app.metrics_history_page_older(10);
+                    app.metrics_history_page_older(app.metrics_history_page_step());
                 } else if app.metrics_focus() == app::MetricsFocus::Chart {
-                    app.metrics_history_page_older(10);
+                    app.metrics_history_page_older(app.metrics_history_page_step());
                 } else {
                     app.metrics_scroll_down(5);
                 }
@@ -284,6 +286,9 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
             }
             KeyCode::Char('.') | KeyCode::Char('>') => {
                 app.cycle_chart_metric_next();
+            }
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                app.open_metrics_settings();
             }
             KeyCode::Char('x') | KeyCode::Char('X') => {
                 app.start_chart_export();
@@ -490,6 +495,35 @@ fn handle_chart_export_option_edit_input(app: &mut App, key: KeyCode) -> Result<
         KeyCode::Esc => app.cancel_chart_export_edit(),
         KeyCode::Backspace => app.pop_chart_export_char(),
         KeyCode::Char(ch) => app.push_chart_export_char(ch),
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_metrics_settings_input(app: &mut App, key: KeyCode) -> Result<()> {
+    match key {
+        KeyCode::Esc => app.close_metrics_settings(),
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
+            app.select_previous_metrics_setting();
+        }
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+            app.select_next_metrics_setting();
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            app.toggle_metrics_setting();
+        }
+        KeyCode::Char('s') | KeyCode::Char('S') => app.close_metrics_settings(),
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_metrics_setting_edit_input(app: &mut App, key: KeyCode) -> Result<()> {
+    match key {
+        KeyCode::Enter => app.confirm_metrics_setting_edit(),
+        KeyCode::Esc => app.cancel_metrics_setting_edit(),
+        KeyCode::Backspace => app.pop_metrics_setting_char(),
+        KeyCode::Char(ch) => app.push_metrics_setting_char(ch),
         _ => {}
     }
     Ok(())

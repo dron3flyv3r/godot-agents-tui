@@ -2,16 +2,17 @@
 # needs rllib_config.yaml in the same folder or --config_file argument specified to work.
 
 import argparse
-import glob
+import hashlib
 import logging
 import os
 import pathlib
 import signal
-import shutil
 import sys
+import time
+import uuid
 from datetime import datetime, timezone
 from numbers import Number
-from typing import Any, Optional
+from typing import Any, Optional, Type
 
 import json
 import numpy as np
@@ -22,8 +23,7 @@ import yaml
 from godot_rl.core.godot_env import GodotEnv
 from godot_rl.wrappers.petting_zoo_wrapper import GDRLPettingZooEnv
 from godot_rl.wrappers.ray_wrapper import RayVectorGodotEnv
-from ray import train, tune
-from ray.air.config import RunConfig
+from ray import tune
 from ray.rllib.algorithms.algorithm import Algorithm
 from ray.rllib.env.wrappers.pettingzoo_env import ParallelPettingZooEnv
 from ray.rllib.policy.policy import PolicySpec
@@ -31,6 +31,9 @@ from ray.rllib.utils.replay_buffers.episode_replay_buffer import EpisodeReplayBu
 from ray.rllib.utils.replay_buffers.multi_agent_prioritized_replay_buffer import (
     MultiAgentPrioritizedReplayBuffer,
 )
+from ray.tune import Checkpoint
+from ray.tune.logger import UnifiedLogger
+from ray.tune.registry import get_trainable_cls
 from custom_models import register_rllib_models
 
 METRIC_PREFIX = "@METRIC "
@@ -137,6 +140,27 @@ def _resolve_env_path(raw_path: Optional[str]) -> Optional[str]:
             return candidate
 
     raise FileNotFoundError(f"env_path '{raw_path}' not found. Tried: {candidates}")
+
+def _config_sha1(config: dict[str, Any]) -> str:
+    """Return a short, deterministic hash for the config for manifest/debugging."""
+    try:
+        blob = json.dumps(config, sort_keys=True, default=str).encode("utf-8")
+    except Exception:
+        blob = repr(config).encode("utf-8")
+    return hashlib.sha1(blob).hexdigest()
+
+
+def _checkpoint_number_from_path(path: Optional[str]) -> Optional[int]:
+    """Extract checkpoint index from a path like .../checkpoint_000123."""
+    if not path:
+        return None
+    try:
+        stem = pathlib.Path(path).name
+        if stem.startswith("checkpoint_"):
+            return int(stem.split("_")[-1])
+    except Exception:
+        return None
+    return None
 
 
 class NumpyObsGDRLPettingZooEnv(GDRLPettingZooEnv):
@@ -574,8 +598,8 @@ class ControllerMetricsCallback(tune.Callback):
                 return numeric
             return str(obj)
         
-        with open("/home/kasper/GameProjects/agents/debug_result.json", "w") as f:
-            json.dump(_sanitize(payload), f, indent=2)
+        # with open("/home/kasper/GameProjects/agents/debug_result.json", "w") as f:
+        #     json.dump(_sanitize(payload), f, indent=2)
 
         print(f"{METRIC_PREFIX}{json.dumps(_sanitize(payload))}", flush=True)
 
@@ -637,32 +661,7 @@ if __name__ == "__main__":
             "Both --resume and --restore provided; preferring --resume directory.",
             flush=True,
         )
-    if resume_target:
-        resume_dir = os.path.abspath(resume_target)
-        tuner_state = os.path.join(resume_dir, "tuner.pkl")
-        legacy_tune_state = os.path.join(resume_dir, "tune.pkl")
-
-        if not os.path.isfile(tuner_state):
-            if os.path.isfile(legacy_tune_state):
-                try:
-                    shutil.copy2(legacy_tune_state, tuner_state)
-                    print(
-                        f"Detected legacy tune.pkl; copied to tuner.pkl for Ray restore: {tuner_state}",
-                        flush=True,
-                    )
-                except Exception as exc:  # pragma: no cover - filesystem specific
-                    print(
-                        f"Warning: found tune.pkl but failed to copy to tuner.pkl ({exc}); restore may fail.",
-                        flush=True,
-                    )
-            else:
-                parser.error(
-                    f"Resume directory must contain tuner.pkl (Ray AIR) or tune.pkl (legacy). "
-                    f"Checked: {tuner_state}"
-                )
-        args.restore = resume_dir
-    else:
-        args.restore = None
+    args.restore = os.path.abspath(resume_target) if resume_target else None
 
     signal.signal(signal.SIGINT, _handle_interrupt_signal)
     signal.signal(signal.SIGTERM, _handle_interrupt_signal)
@@ -917,114 +916,283 @@ if __name__ == "__main__":
     else:
         exp["config"]["num_envs_per_env_runner"] = num_envs
 
-    tuner = None
-    run_callbacks = []
+    run_callbacks: list[tune.Callback] = []
     if METRIC_SOURCE:
         run_callbacks.append(ControllerMetricsCallback(METRIC_SOURCE))
 
-    if not args.restore:
-        run_config_kwargs = dict(
-            storage_path=os.path.abspath(args.experiment_dir),
-            stop=exp["stop"],
-            checkpoint_config=train.CheckpointConfig(
-                checkpoint_frequency=exp["checkpoint_frequency"]
-            ),
-        )
-        if run_callbacks:
-            run_config_kwargs["callbacks"] = run_callbacks
-        Algorithm.from_checkpoint
-        tuner = tune.Tuner(
-            trainable=exp["algorithm"],
-            param_space=exp["config"],
-            run_config=RunConfig(**run_config_kwargs), # type: ignore
-        )
-    else:
-        tuner = tune.Tuner.restore(
-            trainable=exp["algorithm"],
-            path=args.restore,
-            resume_unfinished=True,
-        )
-        if run_callbacks:
-            if tuner._local_tuner is None:
-                raise RuntimeError("Unable to access local tuner for attaching callbacks.")
-            try:  # pragma: no cover - relies on Ray internals
-                tuner._local_tuner._run_config.callbacks = run_callbacks
-            except AttributeError:  # pragma: no cover
-                try:
-                    tuner.get_internal_tuner()._run_config.callbacks = run_callbacks
-                except Exception:
-                    print("Warning: unable to attach controller metrics callback after restore.")
+    checkpoint_frequency = int(exp.get("checkpoint_frequency") or 0)
+    stop_config = exp.get("stop") or {}
+    algorithm_name = str(exp.get("algorithm") or "UNKNOWN")
 
-    result = None
-    checkpoint = None
-    latest_checkpoint_path: Optional[pathlib.Path] = None
-    export_after_training = False
+    resume_checkpoint = args.restore
 
-    try:
-        try:
-            result = tuner.fit()
-            checkpoint = result.get_best_result().checkpoint
-        except KeyboardInterrupt:
-            export_after_training = False
-            print(
-                "\n\nTraining interrupted by user. Searching for the latest checkpoint..."
+    def _locate_checkpoint_from_tune_dir(path: pathlib.Path) -> Optional[str]:
+        marker = path / "tuner.pkl"
+        legacy = path / "tune.pkl"
+        if marker.is_file() or legacy.is_file():
+            checkpoint_dirs = list(path.rglob("checkpoint_*"))
+            checkpoint_dirs = [p for p in checkpoint_dirs if p.is_dir()]
+            if checkpoint_dirs:
+                checkpoint_dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                latest = checkpoint_dirs[0]
+                print(
+                    f"Detected Ray Tune run directory; resuming from latest checkpoint: {latest}"
+                )
+                return str(latest)
+            print("Tune run directory found but no checkpoints were located.")
+        return None
+
+    if resume_checkpoint:
+        resume_path = pathlib.Path(resume_checkpoint)
+        if not resume_path.exists():
+            parser.error(f"Resume checkpoint not found: {resume_path}")
+        if resume_path.is_dir() and not (resume_path / "algorithm_state.pkl").is_file():
+            found = _locate_checkpoint_from_tune_dir(resume_path)
+            if found:
+                resume_checkpoint = found
+                resume_path = pathlib.Path(resume_checkpoint)
+        algo_state = resume_path / "algorithm_state.pkl"
+        rllib_meta = resume_path / "rllib_checkpoint.json"
+        if not resume_path.is_dir():
+            parser.error(f"Resume path must be a checkpoint directory: {resume_path}")
+        if not algo_state.is_file() and not rllib_meta.is_file():
+            parser.error(
+                f"Resume checkpoint missing algorithm_state.pkl (or rllib_checkpoint.json): {resume_path}"
             )
+
+    resume_env_path = None
+    if resume_checkpoint:
+        manifest_path = pathlib.Path(resume_checkpoint).parent / "run_manifest.json"
+        if manifest_path.is_file():
             try:
-                experiment_path = os.path.abspath(args.experiment_dir)
-                trial_dirs = glob.glob(os.path.join(experiment_path, "*/"))
-                if trial_dirs:
-                    trial_dirs.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-                    latest_trial = pathlib.Path(trial_dirs[0])
-                    checkpoint_dirs = glob.glob(
-                        str(latest_trial / "checkpoint_*")
-                    )
-                    if checkpoint_dirs:
-                        checkpoint_dirs.sort(
-                            key=lambda x: os.path.getmtime(x), reverse=True
-                        )
-                        latest_checkpoint_path = pathlib.Path(checkpoint_dirs[0])
-                        print(f"Latest checkpoint located at: {latest_checkpoint_path}")
-                    else:
-                        print("No checkpoints found in the most recent trial directory.")
-                else:
-                    print(
-                        "No trial directories found. Check that checkpoints were being saved."
-                    )
+                with open(manifest_path, "r") as f:
+                    resume_env_path = (json.load(f) or {}).get("env_path")
+            except Exception:
+                resume_env_path = None
+
+    env_cfg = exp["config"].get("env_config") or {}
+    env_path = env_cfg.get("env_path")
+    if resume_env_path and env_path and env_path != resume_env_path:
+        print(
+            f"Warning: env_path changed from resume manifest ({resume_env_path}) to {env_path}. Continuing.",
+            flush=True,
+        )
+
+    env_label = pathlib.Path(env_path or "env").stem or "env"
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    token = uuid.uuid4().hex[:5]
+    experiment_id = f"{algorithm_name}_{timestamp}"
+    trial_id = f"{token}_manual"
+    trial_dir_name = f"{algorithm_name}_{env_label}_{token}_{timestamp}"
+    run_dir = pathlib.Path(args.experiment_dir).expanduser().resolve() / experiment_id
+    trial_dir = run_dir / trial_dir_name
+    trial_dir.mkdir(parents=True, exist_ok=True)
+    experiment_tag = trial_dir_name
+    start_checkpoint_index = (_checkpoint_number_from_path(resume_checkpoint) or -1) + 1
+
+    class _ManualTrial:
+        """Lightweight trial-like object for Tune-style callbacks."""
+
+        def __init__(self, trial_id: str, tag: str, local_path: str, config: dict[str, Any]):
+            self.trial_id = trial_id
+            self.experiment_tag = tag
+            self.local_path = local_path
+            self.logdir = local_path
+            self.config = config
+
+        def __str__(self) -> str:
+            return self.experiment_tag
+
+    trial = _ManualTrial(trial_id, experiment_tag, str(trial_dir), exp["config"])
+    trials = [trial]
+
+    algo_cls: Type[Algorithm] = get_trainable_cls(algorithm_name)
+
+    def logger_creator(config):
+        logdir = str(trial_dir)
+        os.makedirs(logdir, exist_ok=True)
+        return UnifiedLogger(config, logdir, loggers=None)
+
+    manifest = {
+        "algorithm": algorithm_name,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "experiment_id": experiment_id,
+        "experiment_tag": experiment_tag,
+        "trial_id": trial_id,
+        "trial_dir": str(trial_dir),
+        "env_path": env_path,
+        "checkpoint_frequency": checkpoint_frequency,
+        "stop": stop_config,
+        "resume_from": resume_checkpoint,
+        "config_sha1": _config_sha1(exp["config"]),
+        "checkpoint_index_offset": start_checkpoint_index,
+    }
+    try:
+        with open(trial_dir / "run_manifest.json", "w") as f:
+            json.dump(manifest, f, indent=2)
+    except Exception as exc:
+        print(f"Warning: failed to write run_manifest.json: {exc}")
+
+    algo = None
+    latest_checkpoint_path: Optional[pathlib.Path] = None
+    next_checkpoint_index = start_checkpoint_index
+
+    def _save_checkpoint(algo_obj: Algorithm, index: int) -> pathlib.Path:
+        path = trial_dir / f"checkpoint_{index:06d}"
+        path.mkdir(parents=True, exist_ok=True)
+        algo_obj.save_checkpoint(str(path))
+        return path
+
+    def _should_stop(stop_cfg: dict[str, Any], result: dict[str, Any], start_time: float) -> bool:
+        for key, target in stop_cfg.items():
+            if target is None:
+                continue
+            current = None
+            if key == "time_total_s":
+                current = result.get("time_total_s")
+                if current is None:
+                    current = time.perf_counter() - start_time
+            else:
+                current = result.get(key)
+            try:
+                if current is not None and float(current) >= float(target):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    start_perf = time.perf_counter()
+
+    def _callback_setup():
+        for cb in run_callbacks:
+            try:
+                cb.setup(stop=stop_config, num_samples=1, total_num_samples=1) # type: ignore
             except Exception as exc:
-                print(f"Could not resolve latest checkpoint after interruption: {exc}")
+                logging.warning(f"Callback setup failed: {exc}")
+
+    def _callback_on_trial_start(iteration: int):
+        for cb in run_callbacks:
+            try:
+                cb.on_trial_start(iteration=iteration, trials=trials, trial=trial) # type: ignore
+            except Exception as exc:
+                logging.warning(f"Callback on_trial_start failed: {exc}")
+
+    def _callback_on_trial_restore(iteration: int):
+        for cb in run_callbacks:
+            try:
+                cb.on_trial_restore(iteration=iteration, trials=trials, trial=trial) # type: ignore
+            except Exception as exc:
+                logging.warning(f"Callback on_trial_restore failed: {exc}")
+
+    def _callback_on_step_begin(iteration: int):
+        for cb in run_callbacks:
+            try:
+                cb.on_step_begin(iteration=iteration, trials=trials) # type: ignore
+            except Exception as exc:
+                logging.warning(f"Callback on_step_begin failed: {exc}")
+
+    def _callback_on_step_end(iteration: int):
+        for cb in run_callbacks:
+            try:
+                cb.on_step_end(iteration=iteration, trials=trials) # type: ignore
+            except Exception as exc:
+                logging.warning(f"Callback on_step_end failed: {exc}")
+
+    def _callback_on_trial_result(iteration: int, result: dict[str, Any]):
+        for cb in run_callbacks:
+            try:
+                cb.on_trial_result(iteration=iteration, trials=trials, trial=trial, result=result) # type: ignore
+            except Exception as exc:
+                logging.warning(f"Callback on_trial_result failed: {exc}")
+
+    def _callback_on_checkpoint(iteration: int, checkpoint_path: pathlib.Path):
+        if not run_callbacks:
+            return
+        checkpoint_obj = Checkpoint.from_directory(str(checkpoint_path))
+        for cb in run_callbacks:
+            try:
+                cb.on_checkpoint(
+                    iteration=iteration, trials=trials, trial=trial, checkpoint=checkpoint_obj # type: ignore
+                )
+                cb.on_trial_save(iteration=iteration, trials=trials, trial=trial) # type: ignore
+            except Exception as exc:
+                logging.warning(f"Callback on_checkpoint/on_trial_save failed: {exc}")
+
+    def _callback_on_trial_complete(iteration: int):
+        for cb in run_callbacks:
+            try:
+                cb.on_trial_complete(iteration=iteration, trials=trials, trial=trial) # type: ignore
+            except Exception as exc:
+                logging.warning(f"Callback on_trial_complete failed: {exc}")
+        for cb in run_callbacks:
+            try:
+                cb.on_experiment_end(trials=trials) # type: ignore
+            except Exception as exc:
+                logging.warning(f"Callback on_experiment_end failed: {exc}")
+
+    _callback_setup()
+    try:
+        algo = algo_cls(config=exp["config"], logger_creator=logger_creator) # type: ignore
+        if resume_checkpoint:
+            print(f"Restoring from checkpoint: {resume_checkpoint}", flush=True)
+            algo.restore(resume_checkpoint)
+            _callback_on_trial_restore(iteration=0)
+
+        _callback_on_trial_start(iteration=0)
+
+        loop_iter = 0
+        while True:
+            _callback_on_step_begin(iteration=loop_iter)
+            iter_start = time.perf_counter()
+            result = algo.train()
+            now = time.perf_counter()
+            result.setdefault("date", datetime.now(timezone.utc).isoformat())
+            result.setdefault("time_total_s", now - start_perf)
+            result.setdefault("time_this_iter_s", now - iter_start)
+            result["experiment_id"] = experiment_id
+            result["experiment_tag"] = experiment_tag
+            result["trial_id"] = trial_id
+
+            _callback_on_trial_result(iteration=loop_iter, result=result)
+
+            training_iteration = int(result.get("training_iteration") or 0)
+            if checkpoint_frequency > 0 and training_iteration > 0:
+                if training_iteration % checkpoint_frequency == 0:
+                    latest_checkpoint_path = _save_checkpoint(algo, next_checkpoint_index)
+                    next_checkpoint_index += 1
+                    print(f"Saved checkpoint: {latest_checkpoint_path}", flush=True)
+                    _callback_on_checkpoint(iteration=loop_iter, checkpoint_path=latest_checkpoint_path)
+
+            if _should_stop(stop_config, result, start_perf):
+                print("Stopping criteria reached. Ending training.", flush=True)
+                _callback_on_step_end(iteration=loop_iter)
+                break
+
+            _callback_on_step_end(iteration=loop_iter)
+            loop_iter += 1
+
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user. Attempting to save a checkpoint...", flush=True)
+        if algo:
+            try:
+                latest_checkpoint_path = _save_checkpoint(algo, next_checkpoint_index)
+                print(f"Checkpoint saved after interrupt: {latest_checkpoint_path}", flush=True)
+            except Exception as exc:
+                print(f"Could not save checkpoint after interrupt: {exc}", flush=True)
+            if latest_checkpoint_path:
+                _callback_on_checkpoint(iteration=0, checkpoint_path=latest_checkpoint_path)
     finally:
+        _callback_on_trial_complete(iteration=loop_iter if 'loop_iter' in locals() else 0) # type: ignore
+        if algo:
+            try:
+                algo.stop()
+            except Exception:
+                pass
         ray.shutdown()
 
     if latest_checkpoint_path:
         print(
             "Resume training by selecting this checkpoint path in the controller or by"
-            f" passing --restore {latest_checkpoint_path}"
+            f" passing --resume {latest_checkpoint_path}",
+            flush=True,
         )
-
-    if not export_after_training:
-        print("Skip ONNX export")
-    else:
-        if checkpoint is None and result is not None:
-            try:
-                checkpoint = result.get_best_result().checkpoint
-            except Exception:
-                checkpoint = None
-
-        if checkpoint and result:
-            result_path = result.get_best_result().path
-            ppo = Algorithm.from_checkpoint(checkpoint)
-            if is_multiagent and policy_names:
-                for policy_name in set(policy_names):
-                    ppo.get_policy(policy_name).export_model(
-                        f"{result_path}/onnx_export/{policy_name}_onnx", onnx=11
-                    )
-                    print(
-                        f"Saving onnx policy to {pathlib.Path(f'{result_path}/onnx_export/{policy_name}_onnx').resolve()}"
-                    )
-            else:
-                ppo.get_policy().export_model(
-                    f"{result_path}/onnx_export/single_agent_policy_onnx", onnx=11
-                )
-                print(
-                    f"Saving onnx policy to {pathlib.Path(f'{result_path}/onnx_export/single_agent_policy_onnx').resolve()}"
-                )

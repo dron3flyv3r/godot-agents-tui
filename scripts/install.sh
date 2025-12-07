@@ -15,14 +15,14 @@ if [[ -n "${VENV_PYTHON}" ]]; then
     BUILD_ENV+=("CONTROLLER_PYTHON_BIN=${VENV_PYTHON}")
 fi
 
+INSTALL_DIR="${INSTALL_DIR:-${HOME}/.local/bin}"
+
 echo "Building controller-mk2 in release mode..."
 if [[ ${#BUILD_ENV[@]} -gt 0 ]]; then
     env "${BUILD_ENV[@]}" cargo build --release
 else
     cargo build --release
 fi
-
-INSTALL_DIR="${HOME}/.local/bin"
 mkdir -p "${INSTALL_DIR}"
 
 BIN_SOURCE="${REPO_ROOT}/target/release/controller-mk2"

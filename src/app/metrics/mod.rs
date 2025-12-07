@@ -76,7 +76,12 @@ pub struct MetricSample {
 impl MetricSample {
     pub(crate) fn from_value(value: &Value, checkpoint_frequency: u64) -> Option<Self> {
         let kind = value.get("kind").and_then(Value::as_str);
-        if kind != Some("iteration") {
+        if let Some(kind_str) = kind {
+            if kind_str != "iteration" {
+                return None;
+            }
+        } else if value.get("training_iteration").and_then(value_as_u64).is_none() {
+            // Accept lines without "kind" as long as they include iteration info.
             return None;
         }
 

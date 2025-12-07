@@ -32,6 +32,7 @@ use crate::domain::projects::PROJECT_CONFIG_DIR;
 use crate::domain::{ProjectInfo, ProjectManager};
 use ratatui::style::Color;
 use serde_json::{self, Value};
+use serde::{Deserialize, Serialize};
 
 const TRAINING_BUFFER_LIMIT: usize = 512;
 const EXPORT_BUFFER_LIMIT: usize = 512;
@@ -51,6 +52,7 @@ const EMBEDDED_SCRIPT_ROOT: Option<&str> = option_env!("CONTROLLER_SCRIPTS_ROOT"
 const CONTROLLER_ROOT: Option<&str> = option_env!("CARGO_MANIFEST_DIR");
 const PROJECT_LOCATION_MAX_LEN: usize = 4096;
 const MAX_RUN_OVERLAYS: usize = 4;
+const METRICS_SETTINGS_FILENAME: &str = "metrics_settings.json";
 const OVERLAY_COLORS: [Color; 6] = [
     Color::LightMagenta,
     Color::LightGreen,
@@ -58,6 +60,47 @@ const OVERLAY_COLORS: [Color; 6] = [
     Color::LightBlue,
     Color::LightRed,
     Color::White,
+];
+const DEFAULT_COLOR_PALETTE: [(&str, Color); 12] = [
+    ("Cyan", Color::Cyan),
+    ("Yellow", Color::Yellow),
+    ("Magenta", Color::Magenta),
+    ("Green", Color::Green),
+    ("Red", Color::Red),
+    ("Blue", Color::Blue),
+    ("LightCyan", Color::LightCyan),
+    ("LightYellow", Color::LightYellow),
+    ("LightMagenta", Color::LightMagenta),
+    ("LightGreen", Color::LightGreen),
+    ("LightRed", Color::LightRed),
+    ("LightBlue", Color::LightBlue),
+];
+const COLOR_PALETTES: &[(&str, &[&str])] = &[
+    (
+        "Vibrant",
+        &[
+            "Cyan",
+            "Yellow",
+            "Magenta",
+            "Green",
+            "Red",
+            "Blue",
+            "LightCyan",
+            "LightYellow",
+            "LightMagenta",
+            "LightGreen",
+            "LightRed",
+            "LightBlue",
+        ],
+    ),
+    (
+        "Cool",
+        &["Blue", "Cyan", "LightBlue", "LightCyan", "Magenta", "LightMagenta"],
+    ),
+    (
+        "Warm",
+        &["Red", "LightRed", "Yellow", "LightYellow", "Magenta", "LightMagenta"],
+    ),
 ];
 
 const RLLIB_STOP_MODE_CHOICES: [(&str, &str, &str); 2] = [
@@ -164,6 +207,21 @@ struct RunOverlay {
     run: SavedRun,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct DiscoveredRun {
+    path: PathBuf,
+    label: String,
+    created_ts: u64,
+    latest_checkpoint: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumePoint {
+    pub iteration: u64,
+    pub label: String,
+    pub color: String,
+}
+
 impl RunOverlay {
     fn metrics(&self) -> &[MetricSample] {
         &self.run.metrics
@@ -248,8 +306,16 @@ impl ConfigChoice {
 }
 
 #[derive(Debug, Clone)]
+enum ChoiceMenuTarget {
+    Config(ConfigField),
+    Metrics(MetricsSettingField),
+    DiscoveredRun,
+}
+
+#[derive(Debug, Clone)]
 struct ChoiceMenuState {
-    field: ConfigField,
+    target: ChoiceMenuTarget,
+    label: String,
     options: Vec<ConfigChoice>,
     selected: usize,
 }
@@ -262,7 +328,7 @@ impl ChoiceMenuState {
 
 #[derive(Debug, Clone, Copy)]
 pub struct ChoiceMenuView<'a> {
-    pub field: ConfigField,
+    pub label: &'a str,
     pub options: &'a [ConfigChoice],
     pub selected: usize,
 }
@@ -273,6 +339,58 @@ pub struct ChartOverlaySeries {
     pub points: Vec<(f64, f64)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChartSmoothingKind {
+    None,
+    Ema20,
+    Ema40,
+    Ema60,
+    Mean5,
+    Mean10,
+    Mean20,
+    Median5,
+    Median9,
+}
+
+impl ChartSmoothingKind {
+    fn label(self) -> &'static str {
+        match self {
+            ChartSmoothingKind::None => "Off",
+            ChartSmoothingKind::Ema20 => "EMA (α=0.20)",
+            ChartSmoothingKind::Ema40 => "EMA (α=0.40)",
+            ChartSmoothingKind::Ema60 => "EMA (α=0.60)",
+            ChartSmoothingKind::Mean5 => "Mean (5)",
+            ChartSmoothingKind::Mean10 => "Mean (10)",
+            ChartSmoothingKind::Mean20 => "Mean (20)",
+            ChartSmoothingKind::Median5 => "Median (5)",
+            ChartSmoothingKind::Median9 => "Median (9)",
+        }
+    }
+
+    fn cycle(self, direction: i32) -> Self {
+        let variants = [
+            ChartSmoothingKind::None,
+            ChartSmoothingKind::Ema20,
+            ChartSmoothingKind::Ema40,
+            ChartSmoothingKind::Ema60,
+            ChartSmoothingKind::Mean5,
+            ChartSmoothingKind::Mean10,
+            ChartSmoothingKind::Mean20,
+            ChartSmoothingKind::Median5,
+            ChartSmoothingKind::Median9,
+        ];
+        let len = variants.len() as i32;
+        let current = variants.iter().position(|k| k == &self).unwrap_or(0) as i32;
+        let mut next = current + direction;
+        if next < 0 {
+            next = len - 1;
+        } else if next >= len {
+            next = 0;
+        }
+        variants[next as usize]
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ExportSeries {
     label: String,
@@ -280,7 +398,7 @@ struct ExportSeries {
     points: Vec<(f64, f64)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChartExportStyle {
     theme: ChartExportTheme,
     show_legend: bool,
@@ -292,6 +410,7 @@ pub struct ChartExportStyle {
     show_grid: bool,
     x_label: String,
     y_label: String,
+    smoothing: ChartSmoothingKind,
 }
 
 impl Default for ChartExportStyle {
@@ -307,17 +426,97 @@ impl Default for ChartExportStyle {
             show_grid: true,
             x_label: String::from("Training iteration"),
             y_label: String::from("Value"),
+            smoothing: ChartSmoothingKind::None,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+fn apply_chart_smoothing(points: &[(f64, f64)], smoothing: ChartSmoothingKind) -> Vec<(f64, f64)> {
+    match smoothing {
+        ChartSmoothingKind::None => points.to_vec(),
+        ChartSmoothingKind::Ema20 => smooth_ema(points, 0.20),
+        ChartSmoothingKind::Ema40 => smooth_ema(points, 0.40),
+        ChartSmoothingKind::Ema60 => smooth_ema(points, 0.60),
+        ChartSmoothingKind::Mean5 => smooth_mean(points, 5),
+        ChartSmoothingKind::Mean10 => smooth_mean(points, 10),
+        ChartSmoothingKind::Mean20 => smooth_mean(points, 20),
+        ChartSmoothingKind::Median5 => smooth_median(points, 5),
+        ChartSmoothingKind::Median9 => smooth_median(points, 9),
+    }
+}
+
+fn smooth_ema(points: &[(f64, f64)], alpha: f64) -> Vec<(f64, f64)> {
+    let mut smoothed = Vec::with_capacity(points.len());
+    let mut last = None;
+    for &(x, y) in points {
+        let value = if let Some(prev) = last {
+            alpha * y + (1.0 - alpha) * prev
+        } else {
+            y
+        };
+        last = Some(value);
+        smoothed.push((x, value));
+    }
+    smoothed
+}
+
+fn smooth_mean(points: &[(f64, f64)], window: usize) -> Vec<(f64, f64)> {
+    if window == 0 {
+        return points.to_vec();
+    }
+    let mut buffer: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(window);
+    let mut smoothed = Vec::with_capacity(points.len());
+    let mut sum = 0.0;
+    for &(x, y) in points {
+        buffer.push_back(y);
+        sum += y;
+        if buffer.len() > window {
+            if let Some(front) = buffer.pop_front() {
+                sum -= front;
+            }
+        }
+        let denom = buffer.len() as f64;
+        let mean = if denom > 0.0 { sum / denom } else { y };
+        smoothed.push((x, mean));
+    }
+    smoothed
+}
+
+fn smooth_median(points: &[(f64, f64)], window: usize) -> Vec<(f64, f64)> {
+    if window == 0 {
+        return points.to_vec();
+    }
+    let mut buffer: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(window);
+    let mut smoothed = Vec::with_capacity(points.len());
+    for &(x, y) in points {
+        buffer.push_back(y);
+        if buffer.len() > window {
+            buffer.pop_front();
+        }
+        let mut values: Vec<f64> = buffer.iter().copied().collect();
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = if values.is_empty() {
+            y
+        } else {
+            let mid = values.len() / 2;
+            if values.len() % 2 == 0 {
+                (values[mid - 1] + values[mid]) / 2.0
+            } else {
+                values[mid]
+            }
+        };
+        smoothed.push((x, median));
+    }
+    smoothed
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChartExportTheme {
     Dark,
     Light,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum ChartExportOptionField {
     FileName,
     Theme,
@@ -330,16 +529,17 @@ pub enum ChartExportOptionField {
     ShowGrid,
     XAxisTitle,
     YAxisTitle,
+    Smoothing,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChartExportOptions {
     pub path: PathBuf,
     pub file_name: String,
     pub style: ChartExportStyle,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChartLegendPosition {
     Auto,
     UpperLeft,
@@ -347,6 +547,294 @@ pub enum ChartLegendPosition {
     LowerLeft,
     LowerRight,
     None,
+}
+
+const METRIC_CHART_SETTING_FIELDS: [MetricsSettingField; 16] = [
+    MetricsSettingField::ChartShowLegend,
+    MetricsSettingField::ChartLegendPosition,
+    MetricsSettingField::ChartShowResumeMarker,
+    MetricsSettingField::ChartShowSelectionMarker,
+    MetricsSettingField::ChartShowCaption,
+    MetricsSettingField::ChartXAxisLabel,
+    MetricsSettingField::ChartYAxisLabel,
+    MetricsSettingField::ChartAlignOverlaysToStart,
+    MetricsSettingField::ChartMaxPoints,
+    MetricsSettingField::ChartSmoothing,
+    MetricsSettingField::ChartPrimaryColor,
+    MetricsSettingField::ChartSelectionColor,
+    MetricsSettingField::ChartResumeBeforeColor,
+    MetricsSettingField::ChartResumeAfterColor,
+    MetricsSettingField::ChartResumeMarkerColor,
+    MetricsSettingField::ChartPaletteName,
+];
+
+const METRIC_HISTORY_SETTING_FIELDS: [MetricsSettingField; 6] = [
+    MetricsSettingField::HistorySortNewestFirst,
+    MetricsSettingField::HistoryAutoFollow,
+    MetricsSettingField::HistoryPageStep,
+    MetricsSettingField::HistoryShowTimestamp,
+    MetricsSettingField::HistoryShowEnvSteps,
+    MetricsSettingField::HistoryShowWallClock,
+];
+
+const METRIC_SUMMARY_SETTING_FIELDS: [MetricsSettingField; 4] = [
+    MetricsSettingField::SummaryVerbosity,
+    MetricsSettingField::SummaryMaxCustom,
+    MetricsSettingField::SummaryShowOverlayDeltas,
+    MetricsSettingField::SummaryShowThroughput,
+];
+
+const METRIC_POLICIES_SETTING_FIELDS: [MetricsSettingField; 8] = [
+    MetricsSettingField::PoliciesDefaultView,
+    MetricsSettingField::PoliciesSort,
+    MetricsSettingField::PoliciesMaxLearnerStats,
+    MetricsSettingField::PoliciesShowCustomMetrics,
+    MetricsSettingField::PoliciesShowOverlayDeltas,
+    MetricsSettingField::PoliciesStartExpanded,
+    MetricsSettingField::PoliciesColorMode,
+    MetricsSettingField::PoliciesColorOverride,
+];
+
+const METRIC_INFO_SETTING_FIELDS: [MetricsSettingField; 2] = [
+    MetricsSettingField::InfoShowHints,
+    MetricsSettingField::InfoShowMarkerStats,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MetricsSettingsPanel {
+    Chart,
+    History,
+    Summary,
+    Policies,
+    Info,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MetricsSettingField {
+    ChartShowLegend,
+    ChartLegendPosition,
+    ChartShowResumeMarker,
+    ChartShowSelectionMarker,
+    ChartShowCaption,
+    ChartXAxisLabel,
+    ChartYAxisLabel,
+    ChartAlignOverlaysToStart,
+    ChartMaxPoints,
+    ChartSmoothing,
+    ChartPrimaryColor,
+    ChartSelectionColor,
+    ChartResumeBeforeColor,
+    ChartResumeAfterColor,
+    ChartResumeMarkerColor,
+    ChartPaletteName,
+    HistorySortNewestFirst,
+    HistoryAutoFollow,
+    HistoryPageStep,
+    HistoryShowTimestamp,
+    HistoryShowEnvSteps,
+    HistoryShowWallClock,
+    SummaryVerbosity,
+    SummaryMaxCustom,
+    SummaryShowOverlayDeltas,
+    SummaryShowThroughput,
+    PoliciesDefaultView,
+    PoliciesSort,
+    PoliciesMaxLearnerStats,
+    PoliciesShowCustomMetrics,
+    PoliciesShowOverlayDeltas,
+    PoliciesStartExpanded,
+    PoliciesColorMode,
+    PoliciesColorOverride,
+    InfoShowHints,
+    InfoShowMarkerStats,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SummaryVerbosity {
+    Compact,
+    Detailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PoliciesViewMode {
+    List,
+    Expanded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PoliciesSortMode {
+    Alphanumeric,
+    RewardDescending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PolicyColorMode {
+    Auto,
+    Manual,
+    Mixed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsChartSettings {
+    pub show_legend: bool,
+    pub legend_position: ChartLegendPosition,
+    pub show_resume: bool,
+    pub show_selection: bool,
+    pub show_caption: bool,
+    pub x_label: String,
+    pub y_label: String,
+    pub align_overlays_to_start: bool,
+    pub max_points: Option<usize>,
+    pub smoothing: ChartSmoothingKind,
+}
+
+impl Default for MetricsChartSettings {
+    fn default() -> Self {
+        Self {
+            show_legend: true,
+            legend_position: ChartLegendPosition::Auto,
+            show_resume: true,
+            show_selection: true,
+            show_caption: true,
+            x_label: "Training iteration".to_string(),
+            y_label: String::new(),
+            align_overlays_to_start: false,
+            max_points: None,
+            smoothing: ChartSmoothingKind::None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsHistorySettings {
+    pub sort_newest_first: bool,
+    pub auto_follow_latest: bool,
+    pub page_step: usize,
+    pub show_timestamp: bool,
+    pub show_env_steps: bool,
+    pub show_wall_clock: bool,
+}
+
+impl Default for MetricsHistorySettings {
+    fn default() -> Self {
+        Self {
+            sort_newest_first: true,
+            auto_follow_latest: true,
+            page_step: 10,
+            show_timestamp: true,
+            show_env_steps: true,
+            show_wall_clock: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsSummarySettings {
+    pub verbosity: SummaryVerbosity,
+    pub max_custom_metrics: usize,
+    pub show_overlay_deltas: bool,
+    pub show_throughput_rows: bool,
+}
+
+impl Default for MetricsSummarySettings {
+    fn default() -> Self {
+        Self {
+            verbosity: SummaryVerbosity::Detailed,
+            max_custom_metrics: 4,
+            show_overlay_deltas: true,
+            show_throughput_rows: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsPoliciesSettings {
+    pub default_view: PoliciesViewMode,
+    pub sort: PoliciesSortMode,
+    pub max_learner_stats: usize,
+    pub show_custom_metrics: bool,
+    pub show_overlay_deltas: bool,
+    pub start_expanded: bool,
+}
+
+impl Default for MetricsPoliciesSettings {
+    fn default() -> Self {
+        Self {
+            default_view: PoliciesViewMode::List,
+            sort: PoliciesSortMode::Alphanumeric,
+            max_learner_stats: 5,
+            show_custom_metrics: true,
+            show_overlay_deltas: true,
+            start_expanded: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsInfoSettings {
+    pub show_hints: bool,
+    pub show_marker_stats: bool,
+}
+
+impl Default for MetricsInfoSettings {
+    fn default() -> Self {
+        Self {
+            show_hints: true,
+            show_marker_stats: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedMetricsSettings {
+    chart: MetricsChartSettings,
+    history: MetricsHistorySettings,
+    summary: MetricsSummarySettings,
+    policies: MetricsPoliciesSettings,
+    info: MetricsInfoSettings,
+    colors: MetricsColorSettings,
+    resume_points: Vec<ResumePoint>,
+}
+
+impl Default for PersistedMetricsSettings {
+    fn default() -> Self {
+        Self {
+            chart: MetricsChartSettings::default(),
+            history: MetricsHistorySettings::default(),
+            summary: MetricsSummarySettings::default(),
+            policies: MetricsPoliciesSettings::default(),
+            info: MetricsInfoSettings::default(),
+            colors: MetricsColorSettings::default(),
+            resume_points: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsColorSettings {
+    pub primary_color: String,
+    pub selection_color: String,
+    pub resume_before_color: String,
+    pub resume_after_color: String,
+    pub resume_marker_color: String,
+    pub palette_name: String,
+    pub policy_color_mode: PolicyColorMode,
+    pub policy_color_overrides: HashMap<String, String>,
+}
+
+impl Default for MetricsColorSettings {
+    fn default() -> Self {
+        Self {
+            primary_color: "Cyan".to_string(),
+            selection_color: "LightYellow".to_string(),
+            resume_before_color: "LightMagenta".to_string(),
+            resume_after_color: "LightBlue".to_string(),
+            resume_marker_color: "Magenta".to_string(),
+            palette_name: "Vibrant".to_string(),
+            policy_color_mode: PolicyColorMode::Auto,
+            policy_color_overrides: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -363,6 +851,8 @@ pub enum InputMode {
     EditingExport,
     ChartExportOptions,
     EditingChartExportOption,
+    MetricsSettings,
+    EditingMetricsSetting,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -835,6 +1325,8 @@ pub struct App {
     metrics_resume_label: Option<String>,
     saved_run_overlays: Vec<RunOverlay>,
     selected_overlay_index: Option<usize>,
+    discovered_runs: Vec<DiscoveredRun>,
+    selected_discovered_index: Option<usize>,
     archived_run_view: Option<ArchivedRunView>,
     overlay_color_cursor: usize,
     current_run_start: Option<SystemTime>,
@@ -846,6 +1338,17 @@ pub struct App {
     metrics_policies_scroll: usize,
     metrics_policies_expanded: bool,
     metrics_policies_horizontal_scroll: usize,
+    metrics_chart_settings: MetricsChartSettings,
+    metrics_history_settings: MetricsHistorySettings,
+    metrics_summary_settings: MetricsSummarySettings,
+    metrics_policies_settings: MetricsPoliciesSettings,
+    metrics_info_settings: MetricsInfoSettings,
+    metrics_color_settings: MetricsColorSettings,
+    metrics_resume_points: Vec<ResumePoint>,
+    metrics_settings_panel: MetricsSettingsPanel,
+    metrics_settings_selection: usize,
+    metrics_settings_edit_buffer: String,
+    active_metrics_setting_field: Option<MetricsSettingField>,
     metric_timer_start: Option<Instant>,
     metric_last_sample_time: Option<Instant>,
 
@@ -996,6 +1499,8 @@ impl App {
             metrics_resume_label: None,
             saved_run_overlays: Vec::new(),
             selected_overlay_index: None,
+            discovered_runs: Vec::new(),
+            selected_discovered_index: None,
             archived_run_view: None,
             overlay_color_cursor: 0,
             current_run_start: None,
@@ -1007,6 +1512,17 @@ impl App {
             metrics_policies_scroll: 0,
             metrics_policies_expanded: false,
             metrics_policies_horizontal_scroll: 0,
+            metrics_chart_settings: MetricsChartSettings::default(),
+            metrics_history_settings: MetricsHistorySettings::default(),
+            metrics_summary_settings: MetricsSummarySettings::default(),
+            metrics_policies_settings: MetricsPoliciesSettings::default(),
+            metrics_info_settings: MetricsInfoSettings::default(),
+            metrics_color_settings: MetricsColorSettings::default(),
+            metrics_resume_points: Vec::new(),
+            metrics_settings_panel: MetricsSettingsPanel::History,
+            metrics_settings_selection: 0,
+            metrics_settings_edit_buffer: String::new(),
+            active_metrics_setting_field: None,
             metric_timer_start: None,
             metric_last_sample_time: None,
             simulator_config: SimulatorConfig::default(),
@@ -1333,6 +1849,10 @@ impl App {
         self.selected_overlay().map(|overlay| overlay.label())
     }
 
+    pub fn discovered_runs(&self) -> &[DiscoveredRun] {
+        &self.discovered_runs
+    }
+
     fn selected_overlay(&self) -> Option<&RunOverlay> {
         self.selected_overlay_index
             .and_then(|idx| self.saved_run_overlays.get(idx))
@@ -1580,6 +2100,10 @@ impl App {
         self.metrics_history_index = 0;
     }
 
+    pub fn metrics_history_page_step(&self) -> usize {
+        self.metrics_history_settings.page_step.max(1)
+    }
+
     pub fn metrics_history_to_oldest(&mut self) {
         let history = self.training_metrics_history();
         if !history.is_empty() {
@@ -1720,7 +2244,7 @@ impl App {
         }
     }
 
-    pub fn chart_data(&self, max_points: usize) -> Option<ChartData> {
+    pub fn chart_data(&self, max_points: usize, smoothing: ChartSmoothingKind) -> Option<ChartData> {
         let metric = self.current_chart_metric()?;
         let samples = self.training_metrics_history();
         if samples.is_empty() {
@@ -1753,10 +2277,30 @@ impl App {
             return None;
         }
 
+        let points = apply_chart_smoothing(&points, smoothing);
+
         Some(ChartData {
             label: metric.label().to_string(),
             points,
         })
+    }
+
+    fn apply_multi_series_smoothing(
+        &self,
+        series: Vec<(String, Vec<(f64, f64)>)>,
+        smoothing: ChartSmoothingKind,
+        max_points: usize,
+    ) -> Vec<(String, Vec<(f64, f64)>)> {
+        series
+            .into_iter()
+            .map(|(label, mut points)| {
+                let len = points.len();
+                let start = len.saturating_sub(max_points.max(1));
+                points = points.into_iter().skip(start).collect();
+                let points = apply_chart_smoothing(&points, smoothing);
+                (label, points)
+            })
+            .collect()
     }
 
     pub fn selected_chart_value(&self) -> Option<f64> {
@@ -1776,6 +2320,28 @@ impl App {
             .iter()
             .find(|s| s.training_iteration() == Some(iteration))?;
         App::chart_value_for_sample(sample, option)
+    }
+
+    pub fn resume_markers_for_metric(
+        &self,
+        option: &ChartMetricOption,
+    ) -> Vec<(f64, Option<f64>, Color, String)> {
+        self.metrics_resume_points
+            .iter()
+            .map(|point| {
+                let y = self
+                    .training_metrics_history()
+                    .iter()
+                    .find(|s| s.training_iteration() == Some(point.iteration))
+                    .and_then(|s| App::chart_value_for_sample(s, option));
+                let color = if point.color.trim().is_empty() {
+                    self.chart_resume_marker_color()
+                } else {
+                    Self::color_from_name(&point.color)
+                };
+                (point.iteration as f64, y, color, point.label.clone())
+            })
+            .collect()
     }
 
     pub fn latest_chart_value(&self, option: &ChartMetricOption) -> Option<f64> {
@@ -1821,10 +2387,12 @@ impl App {
     pub fn chart_multi_series_data(
         &self,
         option: &ChartMetricOption,
+        max_points: usize,
+        smoothing: ChartSmoothingKind,
     ) -> Vec<(String, Vec<(f64, f64)>)> {
         let samples = self.training_metrics_history();
 
-        match option.kind() {
+        let raw = match option.kind() {
             ChartMetricKind::AllPoliciesRewardMean => {
                 // Collect all policy IDs
                 let mut policy_ids = std::collections::HashSet::new();
@@ -1923,7 +2491,9 @@ impl App {
             }
             // Non-overlay types return empty
             _ => Vec::new(),
-        }
+        };
+
+        self.apply_multi_series_smoothing(raw, smoothing, max_points.max(1))
     }
 
     fn chart_points_for_option(&self, option: &ChartMetricOption) -> Vec<(f64, f64)> {
@@ -1941,11 +2511,16 @@ impl App {
     }
 
     fn build_export_series(&self, option: &ChartMetricOption) -> Vec<ExportSeries> {
+        let smoothing = self.chart_export_style.smoothing;
         match option.kind() {
             ChartMetricKind::AllPoliciesRewardMean
             | ChartMetricKind::AllPoliciesEpisodeLenMean
             | ChartMetricKind::AllPoliciesLearnerStat(_) => self
-                .chart_multi_series_data(option)
+                .chart_multi_series_data(
+                    option,
+                    usize::MAX,
+                    smoothing,
+                )
                 .into_iter()
                 .enumerate()
                 .filter_map(|(idx, (label, points))| {
@@ -1962,7 +2537,7 @@ impl App {
                 .collect(),
             _ => {
                 let mut series = Vec::new();
-                let base_points = self.chart_points_for_option(option);
+                let base_points = apply_chart_smoothing(&self.chart_points_for_option(option), smoothing);
                 if !base_points.is_empty() {
                     series.push(ExportSeries {
                         label: option.label().to_string(),
@@ -1971,7 +2546,7 @@ impl App {
                     });
                 }
                 for (idx, overlay) in self
-                    .overlay_chart_series(option, usize::MAX)
+                    .overlay_chart_series(option, usize::MAX, smoothing, false)
                     .into_iter()
                     .enumerate()
                 {
@@ -2376,6 +2951,38 @@ impl App {
         self.metrics_focus
     }
 
+    pub fn metrics_chart_settings(&self) -> &MetricsChartSettings {
+        &self.metrics_chart_settings
+    }
+
+    pub fn metrics_history_settings(&self) -> &MetricsHistorySettings {
+        &self.metrics_history_settings
+    }
+
+    pub fn metrics_summary_settings(&self) -> &MetricsSummarySettings {
+        &self.metrics_summary_settings
+    }
+
+    pub fn metrics_policies_settings(&self) -> &MetricsPoliciesSettings {
+        &self.metrics_policies_settings
+    }
+
+    pub fn metrics_info_settings(&self) -> &MetricsInfoSettings {
+        &self.metrics_info_settings
+    }
+
+    pub fn metrics_resume_points(&self) -> &[ResumePoint] {
+        &self.metrics_resume_points
+    }
+
+    pub fn metrics_settings_edit_buffer(&self) -> &str {
+        &self.metrics_settings_edit_buffer
+    }
+
+    pub fn active_metrics_setting_field(&self) -> Option<MetricsSettingField> {
+        self.active_metrics_setting_field
+    }
+
     pub fn animations_enabled(&self) -> bool {
         self.controller_settings.animations_enabled()
     }
@@ -2617,28 +3224,43 @@ impl App {
                 }
             };
 
-        let resume_dir = trial_dir.parent().unwrap_or(&trial_dir).to_path_buf();
-        let resume_display = self.project_relative_display(&resume_dir);
+        let run_display = self.project_relative_display(&trial_dir);
         let checkpoint_display = self.project_relative_display(&checkpoint_dir);
 
-        self.training_config.rllib_resume_from = resume_dir.to_string_lossy().to_string();
+        self.training_config.rllib_resume_from = checkpoint_dir.to_string_lossy().to_string();
         self.export_config.rllib_checkpoint_path = checkpoint_dir.to_string_lossy().to_string();
         self.export_config.rllib_checkpoint_number = Some(checkpoint_number);
         if let Some(iteration) = sample.training_iteration() {
             self.metrics_resume_iteration = Some(iteration);
+            self.push_resume_point(iteration, format!("checkpoint #{checkpoint_number}"));
         } else {
             let freq = self.training_config.rllib_checkpoint_frequency as u64;
             if freq > 0 {
-                self.metrics_resume_iteration = Some(checkpoint_number as u64 * freq);
+                let iter = checkpoint_number as u64 * freq;
+                self.metrics_resume_iteration = Some(iter);
+                self.push_resume_point(iter, format!("checkpoint #{checkpoint_number}"));
             }
         }
         self.metrics_resume_label = Some(format!(
             "checkpoint #{checkpoint_number} ({checkpoint_display})"
         ));
 
+        if let Err(error) = self.persist_training_config() {
+            self.set_status(
+                format!("Failed to save training config: {}", error),
+                StatusKind::Warning,
+            );
+        }
+        if let Err(error) = self.persist_export_state() {
+            self.set_status(
+                format!("Failed to save export config: {}", error),
+                StatusKind::Warning,
+            );
+        }
+
         self.set_status(
             format!(
-                "Resume config updated → run: {resume_display}, checkpoint: #{checkpoint_number} ({checkpoint_display})"
+                "Resume config updated → checkpoint: #{checkpoint_number} ({checkpoint_display}) from run {run_display}"
             ),
             StatusKind::Success,
         );
@@ -2704,6 +3326,487 @@ impl App {
             MetricsFocus::Policies => MetricsFocus::Summary,
             MetricsFocus::Summary => MetricsFocus::History,
         };
+    }
+
+    pub fn open_metrics_settings(&mut self) {
+        let panel = self.metrics_settings_panel_for_focus();
+        self.metrics_settings_panel = panel;
+        self.metrics_settings_selection = 0;
+        self.metrics_settings_edit_buffer.clear();
+        self.active_metrics_setting_field = None;
+        self.input_mode = InputMode::MetricsSettings;
+    }
+
+    pub fn close_metrics_settings(&mut self) {
+        self.metrics_settings_edit_buffer.clear();
+        self.active_metrics_setting_field = None;
+        self.input_mode = InputMode::Normal;
+    }
+
+    pub fn metrics_settings_panel(&self) -> MetricsSettingsPanel {
+        self.metrics_settings_panel
+    }
+
+    pub fn metrics_settings_selection(&self) -> usize {
+        self.metrics_settings_selection
+    }
+
+    pub fn metrics_settings_fields(&self) -> &'static [MetricsSettingField] {
+        match self.metrics_settings_panel {
+            MetricsSettingsPanel::Chart => &METRIC_CHART_SETTING_FIELDS,
+            MetricsSettingsPanel::History => &METRIC_HISTORY_SETTING_FIELDS,
+            MetricsSettingsPanel::Summary => &METRIC_SUMMARY_SETTING_FIELDS,
+            MetricsSettingsPanel::Policies => &METRIC_POLICIES_SETTING_FIELDS,
+            MetricsSettingsPanel::Info => &METRIC_INFO_SETTING_FIELDS,
+        }
+    }
+
+    fn metrics_settings_panel_for_focus(&self) -> MetricsSettingsPanel {
+        match self.metrics_focus {
+            MetricsFocus::Chart => MetricsSettingsPanel::Chart,
+            MetricsFocus::History => MetricsSettingsPanel::History,
+            MetricsFocus::Summary => MetricsSettingsPanel::Summary,
+            MetricsFocus::Policies => MetricsSettingsPanel::Policies,
+        }
+    }
+
+    pub fn select_next_metrics_setting(&mut self) {
+        let fields = self.metrics_settings_fields();
+        if fields.is_empty() {
+            return;
+        }
+        self.metrics_settings_selection = (self.metrics_settings_selection + 1) % fields.len();
+    }
+
+    pub fn select_previous_metrics_setting(&mut self) {
+        let fields = self.metrics_settings_fields();
+        if fields.is_empty() {
+            return;
+        }
+        if self.metrics_settings_selection == 0 {
+            self.metrics_settings_selection = fields.len() - 1;
+        } else {
+            self.metrics_settings_selection -= 1;
+        }
+    }
+
+    pub fn metrics_setting_value(&self, field: MetricsSettingField) -> String {
+        match field {
+            MetricsSettingField::ChartShowLegend => format_bool(self.metrics_chart_settings.show_legend),
+            MetricsSettingField::ChartLegendPosition => format!("{:?}", self.metrics_chart_settings.legend_position),
+            MetricsSettingField::ChartShowResumeMarker => format_bool(self.metrics_chart_settings.show_resume),
+            MetricsSettingField::ChartShowSelectionMarker => format_bool(self.metrics_chart_settings.show_selection),
+            MetricsSettingField::ChartShowCaption => format_bool(self.metrics_chart_settings.show_caption),
+            MetricsSettingField::ChartXAxisLabel => self.metrics_chart_settings.x_label.clone(),
+            MetricsSettingField::ChartYAxisLabel => self.metrics_chart_settings.y_label.clone(),
+            MetricsSettingField::ChartAlignOverlaysToStart => {
+                format_bool(self.metrics_chart_settings.align_overlays_to_start)
+            }
+            MetricsSettingField::ChartMaxPoints => self
+                .metrics_chart_settings
+                .max_points
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "Auto".to_string()),
+            MetricsSettingField::ChartSmoothing => self.metrics_chart_settings.smoothing.label().to_string(),
+            MetricsSettingField::ChartPrimaryColor => self.metrics_color_settings.primary_color.clone(),
+            MetricsSettingField::ChartSelectionColor => self.metrics_color_settings.selection_color.clone(),
+            MetricsSettingField::ChartResumeBeforeColor => self.metrics_color_settings.resume_before_color.clone(),
+            MetricsSettingField::ChartResumeAfterColor => self.metrics_color_settings.resume_after_color.clone(),
+            MetricsSettingField::ChartResumeMarkerColor => self.metrics_color_settings.resume_marker_color.clone(),
+            MetricsSettingField::ChartPaletteName => self.metrics_color_settings.palette_name.clone(),
+            MetricsSettingField::HistorySortNewestFirst => format_bool(self.metrics_history_settings.sort_newest_first),
+            MetricsSettingField::HistoryAutoFollow => format_bool(self.metrics_history_settings.auto_follow_latest),
+            MetricsSettingField::HistoryPageStep => self.metrics_history_settings.page_step.to_string(),
+            MetricsSettingField::HistoryShowTimestamp => format_bool(self.metrics_history_settings.show_timestamp),
+            MetricsSettingField::HistoryShowEnvSteps => format_bool(self.metrics_history_settings.show_env_steps),
+            MetricsSettingField::HistoryShowWallClock => format_bool(self.metrics_history_settings.show_wall_clock),
+            MetricsSettingField::SummaryVerbosity => match self.metrics_summary_settings.verbosity {
+                SummaryVerbosity::Compact => "Compact".to_string(),
+                SummaryVerbosity::Detailed => "Detailed".to_string(),
+            },
+            MetricsSettingField::SummaryMaxCustom => self.metrics_summary_settings.max_custom_metrics.to_string(),
+            MetricsSettingField::SummaryShowOverlayDeltas => format_bool(self.metrics_summary_settings.show_overlay_deltas),
+            MetricsSettingField::SummaryShowThroughput => format_bool(self.metrics_summary_settings.show_throughput_rows),
+            MetricsSettingField::PoliciesDefaultView => match self.metrics_policies_settings.default_view {
+                PoliciesViewMode::List => "List".to_string(),
+                PoliciesViewMode::Expanded => "Expanded grid".to_string(),
+            },
+            MetricsSettingField::PoliciesSort => match self.metrics_policies_settings.sort {
+                PoliciesSortMode::Alphanumeric => "Policy ID (A→Z)".to_string(),
+                PoliciesSortMode::RewardDescending => "Reward μ (desc)".to_string(),
+            },
+            MetricsSettingField::PoliciesMaxLearnerStats => {
+                self.metrics_policies_settings.max_learner_stats.to_string()
+            }
+            MetricsSettingField::PoliciesShowCustomMetrics => format_bool(self.metrics_policies_settings.show_custom_metrics),
+            MetricsSettingField::PoliciesShowOverlayDeltas => format_bool(self.metrics_policies_settings.show_overlay_deltas),
+            MetricsSettingField::PoliciesStartExpanded => format_bool(self.metrics_policies_settings.start_expanded),
+            MetricsSettingField::PoliciesColorMode => match self.metrics_color_settings.policy_color_mode {
+                PolicyColorMode::Auto => "Auto".to_string(),
+                PolicyColorMode::Manual => "Manual (overrides only)".to_string(),
+                PolicyColorMode::Mixed => "Mixed (overrides + auto)".to_string(),
+            },
+            MetricsSettingField::PoliciesColorOverride => {
+                if let Some(policy_id) = self.current_policy_for_override() {
+                    let color = self
+                        .metrics_color_settings
+                        .policy_color_overrides
+                        .get(&policy_id)
+                        .cloned()
+                        .unwrap_or_else(|| "Auto".to_string());
+                    format!("{policy_id}: {color}")
+                } else {
+                    "No policy selected".to_string()
+                }
+            }
+            MetricsSettingField::InfoShowHints => format_bool(self.metrics_info_settings.show_hints),
+            MetricsSettingField::InfoShowMarkerStats => format_bool(self.metrics_info_settings.show_marker_stats),
+        }
+    }
+
+    fn metrics_setting_label(field: MetricsSettingField) -> &'static str {
+        match field {
+            MetricsSettingField::ChartShowLegend => "Show legend",
+            MetricsSettingField::ChartLegendPosition => "Legend position",
+            MetricsSettingField::ChartShowResumeMarker => "Resume marker",
+            MetricsSettingField::ChartShowSelectionMarker => "Selection marker",
+            MetricsSettingField::ChartShowCaption => "Caption/title",
+            MetricsSettingField::ChartXAxisLabel => "X axis title",
+            MetricsSettingField::ChartYAxisLabel => "Y axis title",
+            MetricsSettingField::ChartAlignOverlaysToStart => "Align overlays to start",
+            MetricsSettingField::ChartMaxPoints => "Max points (Auto)",
+            MetricsSettingField::ChartSmoothing => "Smoothing",
+            MetricsSettingField::ChartPrimaryColor => "Series color",
+            MetricsSettingField::ChartSelectionColor => "Selection color",
+            MetricsSettingField::ChartResumeBeforeColor => "Resume (before) color",
+            MetricsSettingField::ChartResumeAfterColor => "Resume (after) color",
+            MetricsSettingField::ChartResumeMarkerColor => "Resume marker color",
+            MetricsSettingField::ChartPaletteName => "Palette",
+            MetricsSettingField::HistorySortNewestFirst => "Newest first",
+            MetricsSettingField::HistoryAutoFollow => "Auto-follow latest",
+            MetricsSettingField::HistoryPageStep => "Page step",
+            MetricsSettingField::HistoryShowTimestamp => "Show timestamp",
+            MetricsSettingField::HistoryShowEnvSteps => "Show env steps",
+            MetricsSettingField::HistoryShowWallClock => "Wall-clock time",
+            MetricsSettingField::SummaryVerbosity => "Verbosity",
+            MetricsSettingField::SummaryMaxCustom => "Max custom metrics",
+            MetricsSettingField::SummaryShowOverlayDeltas => "Overlay deltas",
+            MetricsSettingField::SummaryShowThroughput => "Throughput/time rows",
+            MetricsSettingField::PoliciesDefaultView => "Default view",
+            MetricsSettingField::PoliciesSort => "Sort policies by",
+            MetricsSettingField::PoliciesMaxLearnerStats => "Max learner stats",
+            MetricsSettingField::PoliciesShowCustomMetrics => "Show custom metrics",
+            MetricsSettingField::PoliciesShowOverlayDeltas => "Overlay deltas",
+            MetricsSettingField::PoliciesStartExpanded => "Start expanded",
+            MetricsSettingField::PoliciesColorMode => "Policy color mode",
+            MetricsSettingField::PoliciesColorOverride => "Policy color override",
+            MetricsSettingField::InfoShowHints => "Show hints",
+            MetricsSettingField::InfoShowMarkerStats => "Show marker stats",
+        }
+    }
+
+    fn current_policy_for_override(&self) -> Option<String> {
+        if let Some(metric) = self.current_chart_metric() {
+            if let Some(policy) = metric.policy_id() {
+                return Some(policy.to_string());
+            }
+        }
+        self.selected_metric_sample()
+            .and_then(|sample| sample.policies().keys().next().cloned())
+    }
+
+    fn color_from_name(name: &str) -> Color {
+        let norm = name.trim().to_lowercase();
+        DEFAULT_COLOR_PALETTE
+            .iter()
+            .find(|(label, _)| label.to_lowercase() == norm)
+            .map(|(_, color)| *color)
+            .unwrap_or(Color::White)
+    }
+
+    fn palette_from_name(name: &str) -> Vec<Color> {
+        let norm = name.trim().to_lowercase();
+        if let Some((_, colors)) = COLOR_PALETTES
+            .iter()
+            .find(|(label, _)| label.to_lowercase() == norm)
+        {
+            colors.iter().map(|c| Self::color_from_name(c)).collect()
+        } else {
+            DEFAULT_COLOR_PALETTE.iter().map(|(_, c)| *c).collect()
+        }
+    }
+
+    fn palette_colors(&self) -> Vec<Color> {
+        let palette = Self::palette_from_name(&self.metrics_color_settings.palette_name);
+        if palette.is_empty() {
+            DEFAULT_COLOR_PALETTE.iter().map(|(_, c)| *c).collect()
+        } else {
+            palette
+        }
+    }
+
+    pub fn chart_primary_color(&self) -> Color {
+        Self::color_from_name(&self.metrics_color_settings.primary_color)
+    }
+
+    pub fn chart_selection_color(&self) -> Color {
+        Self::color_from_name(&self.metrics_color_settings.selection_color)
+    }
+
+    pub fn chart_resume_before_color(&self) -> Color {
+        Self::color_from_name(&self.metrics_color_settings.resume_before_color)
+    }
+
+    pub fn chart_resume_after_color(&self) -> Color {
+        Self::color_from_name(&self.metrics_color_settings.resume_after_color)
+    }
+
+    pub fn chart_resume_marker_color(&self) -> Color {
+        Self::color_from_name(&self.metrics_color_settings.resume_marker_color)
+    }
+
+    pub fn color_from_name_public(&self, name: &str) -> Color {
+        Self::color_from_name(name)
+    }
+
+    pub fn policy_color(&self, policy_id: &str, idx: usize) -> Color {
+        if let Some(name) = self
+            .metrics_color_settings
+            .policy_color_overrides
+            .get(policy_id)
+        {
+            return Self::color_from_name(name);
+        }
+        let palette = self.palette_colors();
+        if palette.is_empty() {
+            return Color::Cyan;
+        }
+        match self.metrics_color_settings.policy_color_mode {
+            PolicyColorMode::Auto => palette[idx % palette.len()],
+            PolicyColorMode::Manual => palette[idx % palette.len()],
+            PolicyColorMode::Mixed => palette[idx % palette.len()],
+        }
+    }
+
+    fn overlay_palette_color(&self, idx: usize) -> Color {
+        let palette = self.palette_colors();
+        if palette.is_empty() {
+            OVERLAY_COLORS[idx % OVERLAY_COLORS.len()]
+        } else {
+            palette[idx % palette.len()]
+        }
+    }
+
+    pub fn toggle_metrics_setting(&mut self) {
+        let field = match self.metrics_settings_fields().get(self.metrics_settings_selection) {
+            Some(f) => *f,
+            None => return,
+        };
+        if Self::metrics_setting_requires_choice(field) {
+            self.start_metrics_choice_menu(field);
+            return;
+        }
+        match field {
+            MetricsSettingField::ChartShowLegend => {
+                self.metrics_chart_settings.show_legend = !self.metrics_chart_settings.show_legend;
+            }
+            MetricsSettingField::ChartLegendPosition => {
+                // handled by choice menu
+            }
+            MetricsSettingField::ChartShowResumeMarker => {
+                self.metrics_chart_settings.show_resume = !self.metrics_chart_settings.show_resume;
+            }
+            MetricsSettingField::ChartShowSelectionMarker => {
+                self.metrics_chart_settings.show_selection = !self.metrics_chart_settings.show_selection;
+            }
+            MetricsSettingField::ChartShowCaption => {
+                self.metrics_chart_settings.show_caption = !self.metrics_chart_settings.show_caption;
+            }
+            MetricsSettingField::ChartAlignOverlaysToStart => {
+                self.metrics_chart_settings.align_overlays_to_start =
+                    !self.metrics_chart_settings.align_overlays_to_start;
+            }
+            MetricsSettingField::ChartSmoothing => {
+                // handled by choice menu
+            }
+            MetricsSettingField::HistorySortNewestFirst => {
+                self.metrics_history_settings.sort_newest_first =
+                    !self.metrics_history_settings.sort_newest_first;
+            }
+            MetricsSettingField::HistoryAutoFollow => {
+                self.metrics_history_settings.auto_follow_latest =
+                    !self.metrics_history_settings.auto_follow_latest;
+            }
+            MetricsSettingField::HistoryShowTimestamp => {
+                self.metrics_history_settings.show_timestamp =
+                    !self.metrics_history_settings.show_timestamp;
+            }
+            MetricsSettingField::HistoryShowEnvSteps => {
+                self.metrics_history_settings.show_env_steps =
+                    !self.metrics_history_settings.show_env_steps;
+            }
+            MetricsSettingField::HistoryShowWallClock => {
+                self.metrics_history_settings.show_wall_clock =
+                    !self.metrics_history_settings.show_wall_clock;
+            }
+            MetricsSettingField::SummaryVerbosity => {
+                // handled by choice menu
+            }
+            MetricsSettingField::SummaryShowOverlayDeltas => {
+                self.metrics_summary_settings.show_overlay_deltas =
+                    !self.metrics_summary_settings.show_overlay_deltas;
+            }
+            MetricsSettingField::SummaryShowThroughput => {
+                self.metrics_summary_settings.show_throughput_rows =
+                    !self.metrics_summary_settings.show_throughput_rows;
+            }
+            MetricsSettingField::PoliciesDefaultView => {
+                // handled by choice menu
+            }
+            MetricsSettingField::PoliciesSort => {
+                // handled by choice menu
+            }
+            MetricsSettingField::PoliciesShowCustomMetrics => {
+                self.metrics_policies_settings.show_custom_metrics =
+                    !self.metrics_policies_settings.show_custom_metrics;
+            }
+            MetricsSettingField::PoliciesShowOverlayDeltas => {
+                self.metrics_policies_settings.show_overlay_deltas =
+                    !self.metrics_policies_settings.show_overlay_deltas;
+            }
+            MetricsSettingField::PoliciesStartExpanded => {
+                self.metrics_policies_settings.start_expanded =
+                    !self.metrics_policies_settings.start_expanded;
+                self.metrics_policies_expanded = self.metrics_policies_settings.start_expanded;
+            }
+            MetricsSettingField::PoliciesColorMode => {
+                // handled by choice menu
+            }
+            MetricsSettingField::PoliciesColorOverride => {
+                // handled by choice menu
+            }
+            MetricsSettingField::ChartPrimaryColor
+            | MetricsSettingField::ChartSelectionColor
+            | MetricsSettingField::ChartResumeBeforeColor
+            | MetricsSettingField::ChartResumeAfterColor
+            | MetricsSettingField::ChartResumeMarkerColor
+            | MetricsSettingField::ChartPaletteName => {
+                // handled by choice menu
+            }
+            MetricsSettingField::InfoShowHints => {
+                self.metrics_info_settings.show_hints = !self.metrics_info_settings.show_hints;
+            }
+            MetricsSettingField::InfoShowMarkerStats => {
+                self.metrics_info_settings.show_marker_stats =
+                    !self.metrics_info_settings.show_marker_stats;
+            }
+            MetricsSettingField::ChartXAxisLabel
+            | MetricsSettingField::ChartYAxisLabel
+            | MetricsSettingField::ChartMaxPoints
+            | MetricsSettingField::HistoryPageStep
+            | MetricsSettingField::SummaryMaxCustom
+            | MetricsSettingField::PoliciesMaxLearnerStats => {
+                self.start_metrics_setting_edit(field);
+            }
+        }
+        self.persist_metrics_settings_if_possible();
+    }
+
+    fn metrics_setting_requires_choice(field: MetricsSettingField) -> bool {
+        matches!(
+            field,
+            MetricsSettingField::ChartLegendPosition
+                | MetricsSettingField::ChartSmoothing
+                | MetricsSettingField::SummaryVerbosity
+                | MetricsSettingField::PoliciesDefaultView
+                | MetricsSettingField::PoliciesSort
+                | MetricsSettingField::ChartPrimaryColor
+                | MetricsSettingField::ChartSelectionColor
+                | MetricsSettingField::ChartResumeBeforeColor
+                | MetricsSettingField::ChartResumeAfterColor
+                | MetricsSettingField::ChartResumeMarkerColor
+                | MetricsSettingField::ChartPaletteName
+                | MetricsSettingField::PoliciesColorMode
+                | MetricsSettingField::PoliciesColorOverride
+        )
+    }
+
+    pub fn start_metrics_setting_edit(&mut self, field: MetricsSettingField) {
+        let value = self.metrics_setting_value(field);
+        self.active_metrics_setting_field = Some(field);
+        self.metrics_settings_edit_buffer = value;
+        self.input_mode = InputMode::EditingMetricsSetting;
+    }
+
+    pub fn cancel_metrics_setting_edit(&mut self) {
+        self.metrics_settings_edit_buffer.clear();
+        self.active_metrics_setting_field = None;
+        self.input_mode = InputMode::MetricsSettings;
+    }
+
+    pub fn push_metrics_setting_char(&mut self, ch: char) {
+        if self.metrics_settings_edit_buffer.len() < 128 && !ch.is_control() {
+            self.metrics_settings_edit_buffer.push(ch);
+        }
+    }
+
+    pub fn pop_metrics_setting_char(&mut self) {
+        self.metrics_settings_edit_buffer.pop();
+    }
+
+    pub fn confirm_metrics_setting_edit(&mut self) {
+        let Some(field) = self.active_metrics_setting_field.take() else {
+            self.cancel_metrics_setting_edit();
+            return;
+        };
+        let text = self.metrics_settings_edit_buffer.trim();
+        match field {
+            MetricsSettingField::ChartXAxisLabel => {
+                self.metrics_chart_settings.x_label = text.to_string();
+            }
+            MetricsSettingField::ChartYAxisLabel => {
+                self.metrics_chart_settings.y_label = text.to_string();
+            }
+            MetricsSettingField::ChartMaxPoints => {
+                if text.is_empty() || text.eq_ignore_ascii_case("auto") {
+                    self.metrics_chart_settings.max_points = None;
+                } else if let Ok(value) = text.parse::<usize>() {
+                    if value == 0 {
+                        self.metrics_chart_settings.max_points = None;
+                    } else {
+                        self.metrics_chart_settings.max_points = Some(value.min(10_000));
+                    }
+                }
+            }
+            MetricsSettingField::HistoryPageStep => {
+                if let Ok(value) = text.parse::<usize>() {
+                    self.metrics_history_settings.page_step = value.clamp(1, 500);
+                }
+            }
+            MetricsSettingField::SummaryMaxCustom => {
+                if let Ok(value) = text.parse::<usize>() {
+                    self.metrics_summary_settings.max_custom_metrics = value.clamp(0, 20);
+                }
+            }
+            MetricsSettingField::PoliciesMaxLearnerStats => {
+                if let Ok(value) = text.parse::<usize>() {
+                    self.metrics_policies_settings.max_learner_stats = value.clamp(0, 20);
+                }
+            }
+            _ => {}
+        }
+        self.metrics_settings_edit_buffer.clear();
+        self.input_mode = InputMode::MetricsSettings;
+        self.persist_metrics_settings_if_possible();
+    }
+
+    fn persist_metrics_settings_if_possible(&mut self) {
+        if let Err(error) = self.persist_metrics_settings() {
+            self.set_status(
+                format!("Failed to save metrics settings: {error}"),
+                StatusKind::Warning,
+            );
+        }
     }
 
     pub fn metrics_summary_scroll(&self) -> usize {
@@ -2861,7 +3964,7 @@ impl App {
         );
     }
 
-    pub fn chart_export_fields(&self) -> [ChartExportOptionField; 11] {
+    pub fn chart_export_fields(&self) -> [ChartExportOptionField; 12] {
         [
             ChartExportOptionField::FileName,
             ChartExportOptionField::Theme,
@@ -2874,6 +3977,7 @@ impl App {
             ChartExportOptionField::ShowGrid,
             ChartExportOptionField::XAxisTitle,
             ChartExportOptionField::YAxisTitle,
+            ChartExportOptionField::Smoothing,
         ]
     }
 
@@ -2902,6 +4006,7 @@ impl App {
             ChartExportOptionField::ShowGrid => format_bool(opts.style.show_grid),
             ChartExportOptionField::XAxisTitle => opts.style.x_label.clone(),
             ChartExportOptionField::YAxisTitle => opts.style.y_label.clone(),
+            ChartExportOptionField::Smoothing => opts.style.smoothing.label().to_string(),
         };
         Some(value)
     }
@@ -2962,6 +4067,9 @@ impl App {
                 opts.style.show_caption = !opts.style.show_caption
             }
             ChartExportOptionField::ShowGrid => opts.style.show_grid = !opts.style.show_grid,
+            ChartExportOptionField::Smoothing => {
+                opts.style.smoothing = opts.style.smoothing.cycle(1);
+            }
             ChartExportOptionField::FileName
             | ChartExportOptionField::XAxisTitle
             | ChartExportOptionField::YAxisTitle => {
@@ -3310,7 +4418,36 @@ impl App {
             selected = options.len() - 1;
         }
         self.choice_menu = Some(ChoiceMenuState {
-            field,
+            target: ChoiceMenuTarget::Config(field),
+            label: field.label().to_string(),
+            options,
+            selected,
+        });
+        true
+    }
+
+    fn start_metrics_choice_menu(&mut self, field: MetricsSettingField) -> bool {
+        let Some(options) = self.build_metrics_choices(field) else {
+            return false;
+        };
+        if options.is_empty() {
+            return false;
+        }
+        self.config_return_mode = Some(InputMode::MetricsSettings);
+        self.input_mode = InputMode::SelectingConfigOption;
+        let current = self.metrics_setting_value(field).to_lowercase();
+        let mut selected = options
+            .iter()
+            .position(|choice| {
+                choice.value.to_lowercase() == current || choice.label.to_lowercase() == current
+            })
+            .unwrap_or(0);
+        if !options.is_empty() && selected >= options.len() {
+            selected = options.len() - 1;
+        }
+        self.choice_menu = Some(ChoiceMenuState {
+            target: ChoiceMenuTarget::Metrics(field),
+            label: Self::metrics_setting_label(field).to_string(),
             options,
             selected,
         });
@@ -3330,30 +4467,52 @@ impl App {
     }
 
     pub fn confirm_choice_selection(&mut self) -> Result<()> {
-        let (field, value) = match self.choice_menu.as_ref().and_then(|menu| {
+        let (target, value) = match self.choice_menu.as_ref().and_then(|menu| {
             menu.selected_choice()
-                .map(|choice| (menu.field, choice.value.clone()))
+                .map(|choice| (menu.target.clone(), choice.value.clone()))
         }) {
             Some(pair) => pair,
             None => return Ok(()),
         };
 
-        match self
-            .set_config_field_value(field, &value)
-            .and_then(|_| self.persist_training_config())
-        {
-            Ok(_) => {
-                self.set_status("Configuration updated", StatusKind::Success);
+        match target {
+            ChoiceMenuTarget::Config(field) => match self
+                .set_config_field_value(field, &value)
+                .and_then(|_| self.persist_training_config())
+            {
+                Ok(_) => {
+                    self.set_status("Configuration updated", StatusKind::Success);
+                    self.exit_choice_menu();
+                    self.update_validation_status();
+                    Ok(())
+                }
+                Err(error) => {
+                    self.set_status(
+                        format!("Failed to update config: {}", error),
+                        StatusKind::Error,
+                    );
+                    Ok(())
+                }
+            },
+            ChoiceMenuTarget::Metrics(field) => {
+                self.apply_metrics_choice(field, &value);
                 self.exit_choice_menu();
-                self.update_validation_status();
                 Ok(())
             }
-            Err(error) => {
-                self.set_status(
-                    format!("Failed to update config: {}", error),
-                    StatusKind::Error,
-                );
-                Ok(())
+            ChoiceMenuTarget::DiscoveredRun => {
+                if value == "manual" {
+                    self.exit_choice_menu();
+                    self.start_run_overlay_browser()?;
+                    Ok(())
+                } else {
+                    self.exit_choice_menu();
+                    let path = PathBuf::from(value);
+                    if let Some(idx) = self.discovered_runs.iter().position(|r| r.path == path) {
+                        self.selected_discovered_index = Some(idx);
+                    }
+                    self.load_run_overlay_from_rllib_dir(path)?;
+                    Ok(())
+                }
             }
         }
     }
@@ -3373,6 +4532,89 @@ impl App {
         ) {
             self.rebuild_advanced_fields();
         }
+    }
+
+    fn apply_metrics_choice(&mut self, field: MetricsSettingField, value: &str) {
+        match field {
+            MetricsSettingField::ChartLegendPosition => {
+                self.metrics_chart_settings.legend_position =
+                    match value.to_lowercase().as_str() {
+                        "auto" => ChartLegendPosition::Auto,
+                        "upperleft" | "upper_left" => ChartLegendPosition::UpperLeft,
+                        "upperright" | "upper_right" => ChartLegendPosition::UpperRight,
+                        "lowerleft" | "lower_left" => ChartLegendPosition::LowerLeft,
+                        "lowerright" | "lower_right" => ChartLegendPosition::LowerRight,
+                        "none" => ChartLegendPosition::None,
+                        _ => self.metrics_chart_settings.legend_position,
+                    };
+            }
+            MetricsSettingField::ChartSmoothing => {
+                self.metrics_chart_settings.smoothing = Self::smoothing_from_label(value)
+                    .unwrap_or(self.metrics_chart_settings.smoothing);
+            }
+            MetricsSettingField::SummaryVerbosity => {
+                self.metrics_summary_settings.verbosity = match value.to_lowercase().as_str() {
+                    "compact" => SummaryVerbosity::Compact,
+                    "detailed" => SummaryVerbosity::Detailed,
+                    _ => self.metrics_summary_settings.verbosity,
+                };
+            }
+            MetricsSettingField::PoliciesDefaultView => {
+                self.metrics_policies_settings.default_view = match value.to_lowercase().as_str() {
+                    "list" => PoliciesViewMode::List,
+                    "expanded" => PoliciesViewMode::Expanded,
+                    _ => self.metrics_policies_settings.default_view,
+                };
+                self.metrics_policies_expanded =
+                    self.metrics_policies_settings.default_view == PoliciesViewMode::Expanded;
+            }
+            MetricsSettingField::PoliciesSort => {
+                self.metrics_policies_settings.sort = match value.to_lowercase().as_str() {
+                    "alphanumeric" => PoliciesSortMode::Alphanumeric,
+                    "rewarddescending" | "reward_descending" | "reward μ" => {
+                        PoliciesSortMode::RewardDescending
+                    }
+                    _ => self.metrics_policies_settings.sort,
+                };
+            }
+            MetricsSettingField::ChartPrimaryColor => {
+                self.metrics_color_settings.primary_color = value.to_string();
+            }
+            MetricsSettingField::ChartSelectionColor => {
+                self.metrics_color_settings.selection_color = value.to_string();
+            }
+            MetricsSettingField::ChartResumeBeforeColor => {
+                self.metrics_color_settings.resume_before_color = value.to_string();
+            }
+            MetricsSettingField::ChartResumeAfterColor => {
+                self.metrics_color_settings.resume_after_color = value.to_string();
+            }
+            MetricsSettingField::ChartResumeMarkerColor => {
+                self.metrics_color_settings.resume_marker_color = value.to_string();
+            }
+            MetricsSettingField::ChartPaletteName => {
+                self.metrics_color_settings.palette_name = value.to_string();
+                self.overlay_color_cursor = 0;
+            }
+            MetricsSettingField::PoliciesColorMode => {
+                self.metrics_color_settings.policy_color_mode = match value.to_lowercase().as_str()
+                {
+                    "auto" => PolicyColorMode::Auto,
+                    "manual" => PolicyColorMode::Manual,
+                    "mixed" => PolicyColorMode::Mixed,
+                    _ => self.metrics_color_settings.policy_color_mode,
+                };
+            }
+            MetricsSettingField::PoliciesColorOverride => {
+                if let Some(policy_id) = self.current_policy_for_override() {
+                    self.metrics_color_settings
+                        .policy_color_overrides
+                        .insert(policy_id, value.to_string());
+                }
+            }
+            _ => {}
+        }
+        self.persist_metrics_settings_if_possible();
     }
 
     fn build_config_choices(&self, field: ConfigField) -> Option<Vec<ConfigChoice>> {
@@ -3427,6 +4669,140 @@ impl App {
         }
     }
 
+    fn build_metrics_choices(&mut self, field: MetricsSettingField) -> Option<Vec<ConfigChoice>> {
+        match field {
+            MetricsSettingField::ChartLegendPosition => Some(
+                [
+                    (ChartLegendPosition::Auto, "Automatic placement"),
+                    (ChartLegendPosition::UpperLeft, "Top-left corner"),
+                    (ChartLegendPosition::UpperRight, "Top-right corner"),
+                    (ChartLegendPosition::LowerLeft, "Bottom-left corner"),
+                    (ChartLegendPosition::LowerRight, "Bottom-right corner"),
+                    (ChartLegendPosition::None, "Hide legend"),
+                ]
+                .iter()
+                .map(|(pos, desc)| {
+                    ConfigChoice::new(format!("{:?}", pos), format!("{:?}", pos), desc.to_string())
+                })
+                .collect(),
+            ),
+            MetricsSettingField::ChartSmoothing => Some(
+                [
+                    (ChartSmoothingKind::None, "No smoothing"),
+                    (ChartSmoothingKind::Ema20, "EMA alpha 0.20"),
+                    (ChartSmoothingKind::Ema40, "EMA alpha 0.40"),
+                    (ChartSmoothingKind::Ema60, "EMA alpha 0.60"),
+                    (ChartSmoothingKind::Mean5, "Mean window 5"),
+                    (ChartSmoothingKind::Mean10, "Mean window 10"),
+                    (ChartSmoothingKind::Mean20, "Mean window 20"),
+                    (ChartSmoothingKind::Median5, "Median window 5"),
+                    (ChartSmoothingKind::Median9, "Median window 9"),
+                ]
+                .iter()
+                .map(|(kind, desc)| {
+                    ConfigChoice::new(kind.label(), kind.label(), desc.to_string())
+                })
+                .collect(),
+            ),
+            MetricsSettingField::SummaryVerbosity => Some(
+                [
+                    (SummaryVerbosity::Compact, "Compact"),
+                    (SummaryVerbosity::Detailed, "Detailed"),
+                ]
+                .iter()
+                .map(|(mode, desc)| ConfigChoice::new(format!("{:?}", mode), format!("{:?}", mode), desc.to_string()))
+                .collect(),
+            ),
+            MetricsSettingField::PoliciesDefaultView => Some(
+                [
+                    (PoliciesViewMode::List, "Stacked list"),
+                    (PoliciesViewMode::Expanded, "Expanded grid"),
+                ]
+                .iter()
+                .map(|(mode, desc)| ConfigChoice::new(format!("{:?}", mode), format!("{:?}", mode), desc.to_string()))
+                .collect(),
+            ),
+            MetricsSettingField::PoliciesSort => Some(
+                [
+                    (PoliciesSortMode::Alphanumeric, "Sort by ID (A→Z)"),
+                    (PoliciesSortMode::RewardDescending, "Sort by reward μ (desc)"),
+                ]
+                .iter()
+                .map(|(mode, desc)| ConfigChoice::new(format!("{:?}", mode), format!("{:?}", mode), desc.to_string()))
+                .collect(),
+            ),
+            MetricsSettingField::ChartPrimaryColor
+            | MetricsSettingField::ChartSelectionColor
+            | MetricsSettingField::ChartResumeBeforeColor
+            | MetricsSettingField::ChartResumeAfterColor
+            | MetricsSettingField::ChartResumeMarkerColor
+            | MetricsSettingField::PoliciesColorOverride => {
+                if matches!(field, MetricsSettingField::PoliciesColorOverride)
+                    && self.current_policy_for_override().is_none()
+                {
+                    self.set_status(
+                        "No policy selected. Choose a policy metric first to set its color.",
+                        StatusKind::Warning,
+                    );
+                    return None;
+                }
+                Some(Self::color_choice_options())
+            }
+            MetricsSettingField::ChartPaletteName => Some(
+                COLOR_PALETTES
+                    .iter()
+                    .map(|(name, colors)| {
+                        ConfigChoice::new(
+                            *name,
+                            *name,
+                            format!("Palette: {}", colors.join(", ")),
+                        )
+                    })
+                    .collect(),
+            ),
+            MetricsSettingField::PoliciesColorMode => Some(
+                [
+                    (PolicyColorMode::Auto, "Auto palette cycling"),
+                    (PolicyColorMode::Manual, "Manual overrides only"),
+                    (PolicyColorMode::Mixed, "Overrides + auto fallback"),
+                ]
+                .iter()
+                .map(|(mode, desc)| ConfigChoice::new(format!("{:?}", mode), format!("{:?}", mode), desc.to_string()))
+                .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    fn color_choice_options() -> Vec<ConfigChoice> {
+        DEFAULT_COLOR_PALETTE
+            .iter()
+            .map(|(name, _)| ConfigChoice::new(*name, *name, ""))
+            .collect()
+    }
+
+    fn smoothing_from_label(label: &str) -> Option<ChartSmoothingKind> {
+        let norm = label.to_lowercase();
+        match norm.as_str() {
+            "ema (α=0.20)" | "ema alpha 0.20" | "ema20" | "ema 0.20" => {
+                Some(ChartSmoothingKind::Ema20)
+            }
+            "ema (α=0.40)" | "ema alpha 0.40" | "ema40" | "ema 0.40" => {
+                Some(ChartSmoothingKind::Ema40)
+            }
+            "ema (α=0.60)" | "ema alpha 0.60" | "ema60" | "ema 0.60" => {
+                Some(ChartSmoothingKind::Ema60)
+            }
+            "mean (5)" | "mean5" => Some(ChartSmoothingKind::Mean5),
+            "mean (10)" | "mean10" => Some(ChartSmoothingKind::Mean10),
+            "mean (20)" | "mean20" => Some(ChartSmoothingKind::Mean20),
+            "median (5)" | "median5" => Some(ChartSmoothingKind::Median5),
+            "median (9)" | "median9" => Some(ChartSmoothingKind::Median9),
+            "off" | "none" => Some(ChartSmoothingKind::None),
+            _ => None,
+        }
+    }
+
     pub fn active_config_field(&self) -> Option<ConfigField> {
         self.active_config_field
     }
@@ -3465,7 +4841,7 @@ impl App {
 
     pub fn choice_menu(&self) -> Option<ChoiceMenuView<'_>> {
         self.choice_menu.as_ref().map(|menu| ChoiceMenuView {
-            field: menu.field,
+            label: &menu.label,
             options: &menu.options,
             selected: menu.selected,
         })
@@ -5462,6 +6838,114 @@ impl App {
         Ok(())
     }
 
+    fn metrics_settings_path(&self) -> Option<PathBuf> {
+        self.active_project.as_ref().map(|project| {
+            project
+                .root_path
+                .join(PROJECT_CONFIG_DIR)
+                .join(METRICS_SETTINGS_FILENAME)
+        })
+    }
+
+    fn persist_metrics_settings(&mut self) -> Result<()> {
+        if let Some(path) = self.metrics_settings_path() {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).wrap_err_with(|| {
+                    format!(
+                        "failed to create metrics settings directory {}",
+                        parent.display()
+                    )
+                })?;
+            }
+            let state = PersistedMetricsSettings {
+                chart: self.metrics_chart_settings.clone(),
+                history: self.metrics_history_settings.clone(),
+                summary: self.metrics_summary_settings.clone(),
+                policies: self.metrics_policies_settings.clone(),
+                info: self.metrics_info_settings.clone(),
+                colors: self.metrics_color_settings.clone(),
+                resume_points: self.metrics_resume_points.clone(),
+            };
+            let json = serde_json::to_string_pretty(&state).wrap_err_with(|| {
+                format!("failed to serialize metrics settings for {}", path.display())
+            })?;
+            fs::write(&path, json)
+                .wrap_err_with(|| format!("failed to write metrics settings to {}", path.display()))?;
+        }
+        Ok(())
+    }
+
+    fn load_metrics_settings_for_active_project(&mut self) -> bool {
+        let mut had_error = false;
+        if let Some(path) = self.metrics_settings_path() {
+            if path.exists() {
+                match fs::read_to_string(&path) {
+                    Ok(contents) => match serde_json::from_str::<PersistedMetricsSettings>(&contents)
+                    {
+                        Ok(state) => {
+                            self.metrics_chart_settings = state.chart;
+                            self.metrics_history_settings = state.history;
+                            self.metrics_summary_settings = state.summary;
+                            self.metrics_policies_settings = state.policies;
+                            self.metrics_info_settings = state.info;
+                            self.metrics_color_settings = state.colors;
+                            self.metrics_resume_points = state.resume_points;
+                        }
+                        Err(error) => {
+                            self.metrics_chart_settings = MetricsChartSettings::default();
+                            self.metrics_history_settings = MetricsHistorySettings::default();
+                            self.metrics_summary_settings = MetricsSummarySettings::default();
+                            self.metrics_policies_settings = MetricsPoliciesSettings::default();
+                            self.metrics_info_settings = MetricsInfoSettings::default();
+                            self.metrics_color_settings = MetricsColorSettings::default();
+                            self.metrics_resume_points = Vec::new();
+                            self.set_status(
+                                format!("Invalid metrics settings, using defaults: {}", error),
+                                StatusKind::Warning,
+                            );
+                            had_error = true;
+                        }
+                    },
+                    Err(error) => {
+                        self.metrics_chart_settings = MetricsChartSettings::default();
+                        self.metrics_history_settings = MetricsHistorySettings::default();
+                        self.metrics_summary_settings = MetricsSummarySettings::default();
+                        self.metrics_policies_settings = MetricsPoliciesSettings::default();
+                        self.metrics_info_settings = MetricsInfoSettings::default();
+                        self.metrics_color_settings = MetricsColorSettings::default();
+                        self.metrics_resume_points = Vec::new();
+                        self.set_status(
+                            format!("Failed to read metrics settings, using defaults: {error}"),
+                            StatusKind::Warning,
+                        );
+                        had_error = true;
+                    }
+                }
+            } else {
+                self.metrics_chart_settings = MetricsChartSettings::default();
+                self.metrics_history_settings = MetricsHistorySettings::default();
+                self.metrics_summary_settings = MetricsSummarySettings::default();
+                self.metrics_policies_settings = MetricsPoliciesSettings::default();
+                self.metrics_info_settings = MetricsInfoSettings::default();
+                self.metrics_resume_points = Vec::new();
+                self.metrics_color_settings = MetricsColorSettings::default();
+            }
+            self.metrics_policies_expanded = self.metrics_policies_settings.start_expanded;
+            self.sync_resume_markers_from_points();
+        }
+        had_error
+    }
+
+    fn sync_resume_markers_from_points(&mut self) {
+        if let Some(last) = self.metrics_resume_points.last() {
+            self.metrics_resume_iteration = Some(last.iteration);
+            self.metrics_resume_label = Some(last.label.clone());
+        } else {
+            self.metrics_resume_iteration = None;
+            self.metrics_resume_label = None;
+        }
+    }
+
     fn export_config_path(&self) -> Option<PathBuf> {
         self.active_project.as_ref().map(|project| {
             project
@@ -6703,10 +8187,17 @@ impl App {
                 }
                 let tuner_file = resume_path.join("tuner.pkl");
                 let legacy_tune_file = resume_path.join("tune.pkl");
-                if !tuner_file.is_file() && !legacy_tune_file.is_file() {
+                let algo_state = resume_path.join("algorithm_state.pkl");
+                let rllib_checkpoint = resume_path.join("rllib_checkpoint.json");
+                if !algo_state.is_file()
+                    && !rllib_checkpoint.is_file()
+                    && !tuner_file.is_file()
+                    && !legacy_tune_file.is_file()
+                {
                     bail!(
-                        "Resume directory is missing tuner.pkl (Ray AIR) or tune.pkl (legacy): {}",
-                        tuner_file.display()
+                        "Resume directory must contain a checkpoint (algorithm_state.pkl or rllib_checkpoint.json). \
+                        Legacy Tune runs are also accepted if tuner.pkl or tune.pkl is present: {}",
+                        resume_path.display()
                     );
                 }
             }
@@ -7012,6 +8503,165 @@ impl App {
         Ok(())
     }
 
+    fn parse_run_manifest(
+        &self,
+        run_dir: &Path,
+    ) -> Option<(String, String, u64, Option<PathBuf>, u64)> {
+        let manifest_path = run_dir.join("run_manifest.json");
+        let mut created_ts = 0;
+        if manifest_path.is_file() {
+            if let Ok(file) = fs::File::open(&manifest_path) {
+                if let Ok(value) = serde_json::from_reader::<_, Value>(file) {
+                    let algo = value
+                        .get("algorithm")
+                        .and_then(Value::as_str)
+                        .unwrap_or("RLlib")
+                        .to_string();
+                    let tag = value
+                        .get("experiment_tag")
+                        .and_then(Value::as_str)
+                        .unwrap_or_else(|| run_dir.file_name().and_then(|s| s.to_str()).unwrap_or("run"))
+                        .to_string();
+                    let created_at = value.get("created_at").and_then(Value::as_str);
+                    if let Some(ts) = created_at {
+                        if let Ok(parsed) = DateTime::parse_from_rfc3339(ts) {
+                            created_ts = parsed.timestamp() as u64;
+                        }
+                    }
+                    let resume_from = value
+                        .get("resume_from")
+                        .and_then(Value::as_str)
+                        .map(PathBuf::from);
+                    let checkpoint_frequency = value
+                        .get("checkpoint_frequency")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    return Some((algo, tag, created_ts, resume_from, checkpoint_frequency));
+                }
+            }
+        }
+
+        // Fallback to file metadata if manifest is missing or invalid
+        if let Ok(meta) = run_dir.metadata() {
+            if let Ok(modified) = meta.modified() {
+                created_ts = modified
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+            }
+        }
+        let algo = "RLlib".to_string();
+        let tag = run_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("run")
+            .to_string();
+        Some((algo, tag, created_ts, None, 0))
+    }
+
+    fn load_rllib_metrics_from_result(
+        &self,
+        result_path: &Path,
+        checkpoint_frequency: u64,
+    ) -> Result<Vec<MetricSample>> {
+        let file = fs::File::open(result_path)
+            .wrap_err_with(|| format!("failed to open result file {}", result_path.display()))?;
+        let reader = BufReader::new(file);
+        let mut metrics = Vec::new();
+        for line in reader.lines().flatten() {
+            if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                if let Some(sample) = MetricSample::from_value(&value, checkpoint_frequency) {
+                    metrics.push(sample);
+                    if metrics.len() > TRAINING_METRIC_HISTORY_LIMIT {
+                        let excess = metrics.len() - TRAINING_METRIC_HISTORY_LIMIT;
+                        metrics.drain(0..excess);
+                    }
+                }
+            }
+        }
+        Ok(metrics)
+    }
+
+    fn load_run_overlay_from_rllib_dir(&mut self, path: PathBuf) -> Result<()> {
+        if !path.is_dir() {
+            bail!("Run path is not a directory: {}", path.display());
+        }
+
+        let (algo, tag, created_ts, _resume_from, checkpoint_frequency) =
+            self.parse_run_manifest(&path)
+                .unwrap_or(("RLlib".to_string(), "run".to_string(), 0, None, 0));
+
+        let result_path = path.join("result.json");
+        if !result_path.is_file() {
+            bail!(
+                "Run directory missing result.json for metrics: {}",
+                path.display()
+            );
+        }
+
+        let metrics = self.load_rllib_metrics_from_result(&result_path, checkpoint_frequency)?;
+        if metrics.is_empty() {
+            self.set_status(
+                format!(
+                    "No metrics found in {}",
+                    self.project_relative_display(&result_path)
+                ),
+                StatusKind::Warning,
+            );
+            return Ok(());
+        }
+
+        let run_id = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("rllib_run")
+            .to_string();
+        let run_name = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .unwrap_or("rllib")
+            .to_string();
+
+        let saved_run = SavedRun::new(
+            run_id.clone(),
+            run_name.clone(),
+            tag.clone(),
+            "RLlib".to_string(),
+            created_ts,
+            0.0,
+            metrics,
+            Vec::new(),
+        );
+
+        self.push_overlay_from_run(&saved_run, path.clone())?;
+        let newly_added = self.saved_run_overlays.len().saturating_sub(1);
+        self.selected_overlay_index = Some(newly_added);
+        let label = format!("{algo} • {tag}");
+        self.set_status(
+            format!("Loaded RLlib run overlay: {label}"),
+            StatusKind::Success,
+        );
+        Ok(())
+    }
+
+    pub fn selected_discovered_label(&self) -> Option<String> {
+        self.selected_discovered_index
+            .and_then(|idx| self.discovered_runs.get(idx))
+            .map(|r| {
+                if let Some(ckpt) = r
+                    .latest_checkpoint
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .and_then(|s| s.to_str())
+                {
+                    format!("{} (latest: {ckpt})", r.label)
+                } else {
+                    r.label.clone()
+                }
+            })
+    }
+
     fn push_overlay_from_run(&mut self, saved_run: &SavedRun, path: PathBuf) -> Result<()> {
         if self
             .saved_run_overlays
@@ -7048,6 +8698,8 @@ impl App {
         &self,
         option: &ChartMetricOption,
         max_points: usize,
+        smoothing: ChartSmoothingKind,
+        align_to_start: bool,
     ) -> Vec<ChartOverlaySeries> {
         match option.kind() {
             ChartMetricKind::AllPoliciesRewardMean
@@ -7057,7 +8709,7 @@ impl App {
         }
 
         let mut overlays = Vec::new();
-        for overlay in &self.saved_run_overlays {
+        for (idx_overlay, overlay) in self.saved_run_overlays.iter().enumerate() {
             let metrics = overlay.metrics();
             let len = metrics.len();
             let start = len.saturating_sub(max_points);
@@ -7072,9 +8724,17 @@ impl App {
                 }
             }
             if !points.is_empty() {
+                if align_to_start {
+                    if let Some((first_x, _)) = points.first().copied() {
+                        for p in points.iter_mut() {
+                            p.0 -= first_x;
+                        }
+                    }
+                }
+                let points = apply_chart_smoothing(&points, smoothing);
                 overlays.push(ChartOverlaySeries {
                     label: overlay.label.clone(),
-                    color: overlay.color,
+                    color: self.overlay_palette_color(idx_overlay),
                     points,
                 });
             }
@@ -7083,8 +8743,9 @@ impl App {
     }
 
     fn next_overlay_color(&mut self) -> Color {
-        let color = OVERLAY_COLORS[self.overlay_color_cursor % OVERLAY_COLORS.len()];
-        self.overlay_color_cursor = (self.overlay_color_cursor + 1) % OVERLAY_COLORS.len();
+        let palette_len = self.palette_colors().len().max(1);
+        let color = self.overlay_palette_color(self.overlay_color_cursor);
+        self.overlay_color_cursor = (self.overlay_color_cursor + 1) % palette_len;
         color
     }
 
@@ -7119,8 +8780,9 @@ impl App {
         self.training_log_session_written = false;
         let training_error = self.load_training_config_for_active_project();
         let export_error = self.load_export_state_for_active_project();
+        let metrics_error = self.load_metrics_settings_for_active_project();
         self.refresh_projects(Some(project.logs_path.clone()))?;
-        if !training_error && !export_error {
+        if !training_error && !export_error && !metrics_error {
             self.set_status(
                 format!("Active project: {}", project.name),
                 StatusKind::Success,
@@ -7174,6 +8836,7 @@ impl App {
             self.metrics_timeline.clear();
             self.metrics_resume_iteration = None;
             self.metrics_resume_label = None;
+            self.metrics_resume_points.clear();
         }
         self.training_metrics.clear();
         self.current_run_start = Some(SystemTime::now());
@@ -7391,6 +9054,7 @@ impl App {
         self.metrics_timeline.clear();
         self.metrics_resume_iteration = None;
         self.metrics_resume_label = None;
+        self.metrics_resume_points.clear();
         self.training_metrics.clear();
         self.current_run_start = Some(SystemTime::now());
         self.metrics_history_index = 0;
@@ -7488,6 +9152,7 @@ impl App {
         self.metrics_timeline.clear();
         self.metrics_resume_iteration = None;
         self.metrics_resume_label = None;
+        self.metrics_resume_points.clear();
         self.training_metrics.clear();
         self.current_run_start = Some(SystemTime::now());
         self.metrics_history_index = 0;
@@ -9130,12 +10795,32 @@ impl App {
             self.metrics_history_index = previous_offset.saturating_add(1);
         }
         let history_len = self.training_metrics_history().len();
-        if history_len == 0 {
+        if self.metrics_history_settings.auto_follow_latest {
             self.metrics_history_index = 0;
-        } else if self.metrics_history_index >= history_len {
-            self.metrics_history_index = history_len.saturating_sub(1);
+        } else {
+            if history_len == 0 {
+                self.metrics_history_index = 0;
+            } else if self.metrics_history_index >= history_len {
+                self.metrics_history_index = history_len.saturating_sub(1);
+            }
         }
         self.ensure_chart_metric_index();
+    }
+
+    fn push_resume_point(&mut self, iteration: u64, label: String) {
+        let idx = self.metrics_resume_points.len();
+        let color_name = DEFAULT_COLOR_PALETTE
+            .iter()
+            .map(|(n, _)| n.to_string())
+            .nth(idx % DEFAULT_COLOR_PALETTE.len())
+            .unwrap_or_else(|| "Magenta".to_string());
+        self.metrics_resume_points.push(ResumePoint {
+            iteration,
+            label,
+            color: color_name,
+        });
+        self.sync_resume_markers_from_points();
+        self.persist_metrics_settings_if_possible();
     }
 
     fn append_simulator_event_entry(&mut self, entry: SimulatorEventEntry) {

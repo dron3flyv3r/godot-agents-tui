@@ -38,7 +38,7 @@ pub enum Commands {
         #[arg(long)]
         restore: Option<String>,
 
-        /// Resume from a previous run directory
+        /// Resume from a checkpoint directory (or legacy Tune run directory)
         #[arg(long)]
         resume: Option<String>,
 
