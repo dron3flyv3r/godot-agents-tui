@@ -1344,6 +1344,8 @@ pub struct App {
     metrics_policies_settings: MetricsPoliciesSettings,
     metrics_info_settings: MetricsInfoSettings,
     metrics_color_settings: MetricsColorSettings,
+    resume_baseline: Option<Vec<MetricSample>>,
+    pending_resume_point: Option<ResumePoint>,
     metrics_resume_points: Vec<ResumePoint>,
     metrics_settings_panel: MetricsSettingsPanel,
     metrics_settings_selection: usize,
@@ -1518,6 +1520,8 @@ impl App {
             metrics_policies_settings: MetricsPoliciesSettings::default(),
             metrics_info_settings: MetricsInfoSettings::default(),
             metrics_color_settings: MetricsColorSettings::default(),
+            resume_baseline: None,
+            pending_resume_point: None,
             metrics_resume_points: Vec::new(),
             metrics_settings_panel: MetricsSettingsPanel::History,
             metrics_settings_selection: 0,
@@ -2309,12 +2313,23 @@ impl App {
         App::chart_value_for_sample(sample, &metric)
     }
 
+    fn visible_resume_points(&self) -> Vec<ResumePoint> {
+        if let Some(pending) = &self.pending_resume_point {
+            vec![pending.clone()]
+        } else {
+            self.metrics_resume_points.clone()
+        }
+    }
+
     pub fn resume_marker_iteration(&self) -> Option<u64> {
-        self.metrics_resume_iteration
+        self.visible_resume_points()
+            .last()
+            .map(|p| p.iteration)
+            .or(self.metrics_resume_iteration)
     }
 
     pub fn resume_marker_value(&self, option: &ChartMetricOption) -> Option<f64> {
-        let iteration = self.metrics_resume_iteration?;
+        let iteration = self.resume_marker_iteration()?;
         let sample = self
             .training_metrics_history()
             .iter()
@@ -2326,7 +2341,7 @@ impl App {
         &self,
         option: &ChartMetricOption,
     ) -> Vec<(f64, Option<f64>, Color, String)> {
-        self.metrics_resume_points
+        self.visible_resume_points()
             .iter()
             .map(|point| {
                 let y = self
@@ -3231,14 +3246,12 @@ impl App {
         self.export_config.rllib_checkpoint_path = checkpoint_dir.to_string_lossy().to_string();
         self.export_config.rllib_checkpoint_number = Some(checkpoint_number);
         if let Some(iteration) = sample.training_iteration() {
-            self.metrics_resume_iteration = Some(iteration);
-            self.push_resume_point(iteration, format!("checkpoint #{checkpoint_number}"));
+            self.stage_resume_point(iteration, format!("checkpoint #{checkpoint_number}"));
         } else {
             let freq = self.training_config.rllib_checkpoint_frequency as u64;
             if freq > 0 {
                 let iter = checkpoint_number as u64 * freq;
-                self.metrics_resume_iteration = Some(iter);
-                self.push_resume_point(iter, format!("checkpoint #{checkpoint_number}"));
+                self.stage_resume_point(iter, format!("checkpoint #{checkpoint_number}"));
             }
         }
         self.metrics_resume_label = Some(format!(
@@ -3260,7 +3273,7 @@ impl App {
 
         self.set_status(
             format!(
-                "Resume config updated → checkpoint: #{checkpoint_number} ({checkpoint_display}) from run {run_display}"
+                "Resume config updated (marker staged) → checkpoint: #{checkpoint_number} ({checkpoint_display}) from run {run_display}"
             ),
             StatusKind::Success,
         );
@@ -6931,13 +6944,17 @@ impl App {
                 self.metrics_color_settings = MetricsColorSettings::default();
             }
             self.metrics_policies_expanded = self.metrics_policies_settings.start_expanded;
+            self.pending_resume_point = None;
             self.sync_resume_markers_from_points();
         }
         had_error
     }
 
     fn sync_resume_markers_from_points(&mut self) {
-        if let Some(last) = self.metrics_resume_points.last() {
+        if let Some(pending) = self.pending_resume_point.as_ref() {
+            self.metrics_resume_iteration = Some(pending.iteration);
+            self.metrics_resume_label = Some(pending.label.clone());
+        } else if let Some(last) = self.metrics_resume_points.last() {
             self.metrics_resume_iteration = Some(last.iteration);
             self.metrics_resume_label = Some(last.label.clone());
         } else {
@@ -8709,6 +8726,40 @@ impl App {
         }
 
         let mut overlays = Vec::new();
+
+        if let Some(baseline) = &self.resume_baseline {
+            let len = baseline.len();
+            let start = len.saturating_sub(max_points);
+            let mut points = Vec::new();
+            for (idx, sample) in baseline.iter().enumerate().skip(start) {
+                if let Some(value) = App::chart_value_for_sample(sample, option) {
+                    let x = sample
+                        .training_iteration()
+                        .map(|iter| iter as f64)
+                        .unwrap_or_else(|| idx as f64);
+                    points.push((x, value));
+                }
+            }
+            if !points.is_empty() {
+                if align_to_start {
+                    if let Some((first_x, _)) = points.first().copied() {
+                        for p in points.iter_mut() {
+                            p.0 -= first_x;
+                        }
+                    }
+                }
+                let points = apply_chart_smoothing(&points, smoothing);
+                overlays.push(ChartOverlaySeries {
+                    label: self
+                        .metrics_resume_label
+                        .clone()
+                        .unwrap_or_else(|| "Resume baseline".to_string()),
+                    color: self.chart_resume_before_color(),
+                    points,
+                });
+            }
+        }
+
         for (idx_overlay, overlay) in self.saved_run_overlays.iter().enumerate() {
             let metrics = overlay.metrics();
             let len = metrics.len();
@@ -8776,6 +8827,7 @@ impl App {
         self.selected_overlay_index = None;
         self.overlay_color_cursor = 0;
         self.drop_archived_run_view();
+        self.resume_baseline = None;
         self.active_project = Some(project.clone());
         self.training_log_session_written = false;
         let training_error = self.load_training_config_for_active_project();
@@ -8815,28 +8867,23 @@ impl App {
 
         let resuming_multi = self.training_config.mode == TrainingMode::MultiAgent
             && !self.training_config.rllib_resume_from.trim().is_empty();
-        let resume_baseline = if resuming_multi {
+        if resuming_multi {
             let mut data = self.training_metrics_history().to_vec();
             if data.len() > TRAINING_METRIC_HISTORY_LIMIT {
                 let excess = data.len() - TRAINING_METRIC_HISTORY_LIMIT;
                 data.drain(0..excess);
             }
-            data
+            self.resume_baseline = if data.is_empty() { None } else { Some(data) };
         } else {
-            Vec::new()
-        };
+            self.resume_baseline = None;
+        }
         self.drop_archived_run_view();
         self.training_receiver = None;
         self.training_cancel = None;
         self.training_running = true;
-        if resuming_multi {
-            // Keep a copy of the pre-resume metrics so the chart can show the full timeline.
-            self.metrics_timeline = resume_baseline;
-        } else {
-            self.metrics_timeline.clear();
-            self.metrics_resume_iteration = None;
-            self.metrics_resume_label = None;
-            self.metrics_resume_points.clear();
+        self.metrics_timeline.clear();
+        if !resuming_multi {
+            self.clear_resume_markers();
         }
         self.training_metrics.clear();
         self.current_run_start = Some(SystemTime::now());
@@ -8982,33 +9029,43 @@ impl App {
                             StatusKind::Info,
                         );
                     }
-                    if self.metrics_resume_iteration.is_none() {
+                    let display = self.project_relative_display(path);
+                    let mut resume_iter = self
+                        .resume_iteration_from_checkpoint(path)
+                        .or_else(|| self.pending_resume_point.as_ref().map(|p| p.iteration));
+                    if resume_iter.is_none() {
                         if let Some(number) = self.export_config.rllib_checkpoint_number {
                             let freq = self.training_config.rllib_checkpoint_frequency as u64;
                             if freq > 0 {
-                                self.metrics_resume_iteration = Some(number as u64 * freq);
-                            } else if let Some(iter) = self
-                                .metrics_timeline
-                                .last()
-                                .and_then(|s| s.training_iteration())
-                            {
-                                self.metrics_resume_iteration = Some(iter);
+                                resume_iter = Some(number as u64 * freq);
                             }
-                        } else if let Some(iter) = self
-                            .metrics_timeline
-                            .last()
-                            .and_then(|s| s.training_iteration())
-                        {
-                            self.metrics_resume_iteration = Some(iter);
                         }
                     }
-                    let display = self.project_relative_display(path);
+                    if resume_iter.is_none() {
+                        resume_iter = self
+                            .metrics_resume_iteration
+                            .or_else(|| self.metrics_timeline.last().and_then(|s| s.training_iteration()));
+                    }
+
+                    if let Some(iteration) = resume_iter {
+                        let label = if let Some(number) = self.export_config.rllib_checkpoint_number
+                        {
+                            format!("checkpoint #{number}")
+                        } else {
+                            format!("Resume baseline from {}", display)
+                        };
+                        self.stage_resume_point(iteration, label);
+                    }
                     self.metrics_resume_label = Some(format!("Resume baseline from {}", display));
                     args.push(format!("--resume={}", path.to_string_lossy()));
                 }
                 (script, args)
             }
         };
+
+        if resuming_multi {
+            self.commit_pending_resume_point();
+        }
 
         let display_cmd = format!(
             "{} -u {} {}",
@@ -9052,9 +9109,7 @@ impl App {
         self.training_cancel = None;
         self.training_running = true;
         self.metrics_timeline.clear();
-        self.metrics_resume_iteration = None;
-        self.metrics_resume_label = None;
-        self.metrics_resume_points.clear();
+        self.clear_resume_markers();
         self.training_metrics.clear();
         self.current_run_start = Some(SystemTime::now());
         self.metrics_history_index = 0;
@@ -9150,9 +9205,7 @@ impl App {
         self.training_cancel = None;
         self.training_running = true;
         self.metrics_timeline.clear();
-        self.metrics_resume_iteration = None;
-        self.metrics_resume_label = None;
-        self.metrics_resume_points.clear();
+        self.clear_resume_markers();
         self.training_metrics.clear();
         self.current_run_start = Some(SystemTime::now());
         self.metrics_history_index = 0;
@@ -10258,6 +10311,38 @@ impl App {
         suffix.parse::<u32>().ok()
     }
 
+    fn latest_checkpoint_number_in_dir(&self, path: &Path) -> Option<u32> {
+        let mut latest: Option<u32> = None;
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                let entry_path = entry.path();
+                if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                if let Some(num) = Self::checkpoint_number_from_path(&entry_path) {
+                    latest = match latest {
+                        Some(current) if current >= num => Some(current),
+                        _ => Some(num),
+                    };
+                }
+            }
+        }
+        latest
+    }
+
+    fn resume_iteration_from_checkpoint(&self, resume_path: &Path) -> Option<u64> {
+        let freq = self.training_config.rllib_checkpoint_frequency as u64;
+        if freq == 0 {
+            return None;
+        }
+        let number = if let Some(num) = Self::checkpoint_number_from_path(resume_path) {
+            Some(num)
+        } else {
+            self.latest_checkpoint_number_in_dir(resume_path)
+        }?;
+        Some(number as u64 * freq)
+    }
+
     fn sync_checkpoint_number_from_path(&mut self, value: &str) {
         self.export_config.rllib_checkpoint_number =
             Self::checkpoint_number_from_path(Path::new(value));
@@ -10807,18 +10892,45 @@ impl App {
         self.ensure_chart_metric_index();
     }
 
-    fn push_resume_point(&mut self, iteration: u64, label: String) {
-        let idx = self.metrics_resume_points.len();
-        let color_name = DEFAULT_COLOR_PALETTE
+    fn resume_marker_color_for_index(&self, idx: usize) -> String {
+        DEFAULT_COLOR_PALETTE
             .iter()
             .map(|(n, _)| n.to_string())
             .nth(idx % DEFAULT_COLOR_PALETTE.len())
-            .unwrap_or_else(|| "Magenta".to_string());
-        self.metrics_resume_points.push(ResumePoint {
+            .unwrap_or_else(|| "Magenta".to_string())
+    }
+
+    fn stage_resume_point(&mut self, iteration: u64, label: String) {
+        let color_name = self
+            .pending_resume_point
+            .as_ref()
+            .map(|p| p.color.clone())
+            .or_else(|| self.metrics_resume_points.last().map(|p| p.color.clone()))
+            .unwrap_or_else(|| self.resume_marker_color_for_index(self.metrics_resume_points.len()));
+        self.pending_resume_point = Some(ResumePoint {
             iteration,
             label,
             color: color_name,
         });
+        self.sync_resume_markers_from_points();
+    }
+
+    fn commit_pending_resume_point(&mut self) {
+        if let Some(mut pending) = self.pending_resume_point.take() {
+            if pending.color.trim().is_empty() {
+                pending.color = self.resume_marker_color_for_index(self.metrics_resume_points.len());
+            }
+            self.metrics_resume_points.clear();
+            self.metrics_resume_points.push(pending);
+            self.sync_resume_markers_from_points();
+            self.persist_metrics_settings_if_possible();
+        }
+    }
+
+    fn clear_resume_markers(&mut self) {
+        self.pending_resume_point = None;
+        self.metrics_resume_points.clear();
+        self.resume_baseline = None;
         self.sync_resume_markers_from_points();
         self.persist_metrics_settings_if_possible();
     }
