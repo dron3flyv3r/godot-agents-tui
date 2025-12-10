@@ -1,8 +1,8 @@
 pub mod config;
 pub mod file_browser;
 pub mod metrics;
-pub mod sessions;
 pub mod runs;
+pub mod sessions;
 mod state;
 
 pub use config::{ConfigField, ExportField, TrainingMode};

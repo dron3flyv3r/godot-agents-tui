@@ -22,6 +22,10 @@ pub struct Cli {
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub exp: bool,
 
+    /// Write debug logs to the given file
+    #[arg(long)]
+    pub log: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }

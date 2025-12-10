@@ -623,9 +623,9 @@ fn handle_advanced_config_input(app: &mut App, key: KeyCode) -> Result<()> {
     Ok(())
 }
 
-fn run(mode: AppMode) -> Result<()> {
+fn run(mode: AppMode, log_path: Option<std::path::PathBuf>) -> Result<()> {
     let (mut terminal, _guard) = setup_terminal()?;
-    let mut app = App::new(mode)?;
+    let mut app = App::new(mode, log_path)?;
     let mut frame_counter: u32 = 0;
 
     while !app.should_quit() {
@@ -662,7 +662,7 @@ fn main() -> Result<()> {
         } else {
             AppMode::Standard
         };
-        run(mode)?;
+        run(mode, cli.log)?;
     }
 
     Ok(())

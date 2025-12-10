@@ -80,7 +80,11 @@ impl MetricSample {
             if kind_str != "iteration" {
                 return None;
             }
-        } else if value.get("training_iteration").and_then(value_as_u64).is_none() {
+        } else if value
+            .get("training_iteration")
+            .and_then(value_as_u64)
+            .is_none()
+        {
             // Accept lines without "kind" as long as they include iteration info.
             return None;
         }

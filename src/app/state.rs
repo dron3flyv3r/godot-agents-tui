@@ -1,6 +1,7 @@
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::{error, fs};
+use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::ops::Index;
 use std::path::{Component, Path, PathBuf};
@@ -27,13 +28,13 @@ use super::config::{
 };
 use super::file_browser::{FileBrowserEntry, FileBrowserKind, FileBrowserState, FileBrowserTarget};
 use super::metrics::{ChartData, ChartMetricKind, ChartMetricOption, MetricSample};
+use super::runs::{self, RllibRunInfo, SavedRun};
 use super::sessions::{generate_session_name, SessionRecord, SessionRunLink, SessionStore};
-use super::runs::{self, SavedRun};
 use crate::domain::projects::PROJECT_CONFIG_DIR;
 use crate::domain::{ProjectInfo, ProjectManager};
 use ratatui::style::Color;
-use serde_json::{self, Value};
 use serde::{Deserialize, Serialize};
+use serde_json::{self, Value};
 
 const TRAINING_BUFFER_LIMIT: usize = 512;
 const EXPORT_BUFFER_LIMIT: usize = 512;
@@ -97,11 +98,25 @@ const COLOR_PALETTES: &[(&str, &[&str])] = &[
     ),
     (
         "Cool",
-        &["Blue", "Cyan", "LightBlue", "LightCyan", "Magenta", "LightMagenta"],
+        &[
+            "Blue",
+            "Cyan",
+            "LightBlue",
+            "LightCyan",
+            "Magenta",
+            "LightMagenta",
+        ],
     ),
     (
         "Warm",
-        &["Red", "LightRed", "Yellow", "LightYellow", "Magenta", "LightMagenta"],
+        &[
+            "Red",
+            "LightRed",
+            "Yellow",
+            "LightYellow",
+            "Magenta",
+            "LightMagenta",
+        ],
     ),
 ];
 
@@ -222,6 +237,39 @@ pub struct ResumePoint {
     pub iteration: u64,
     pub label: String,
     pub color: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CheckpointComputation {
+    pub target: u32,
+    pub offset: u64,
+    pub freq: u64,
+    pub delta: u64,
+    pub local: u64,
+    pub start: u64,
+}
+
+#[derive(Debug, Clone)]
+struct RunManifestInfo {
+    algorithm: String,
+    tag: String,
+    created_ts: u64,
+    resume_from: Option<PathBuf>,
+    checkpoint_frequency: u64,
+    checkpoint_index_offset: u64,
+    trial_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct SessionRunMeta {
+    start: u64,
+    end: u64,
+    run_path: PathBuf,
+    is_rllib: bool,
+    rllib_trial_dir: Option<PathBuf>,
+    rllib_resume_from: Option<PathBuf>,
+    checkpoint_frequency: Option<u64>,
+    checkpoint_index_offset: Option<u64>,
 }
 
 impl RunOverlay {
@@ -473,7 +521,8 @@ fn smooth_mean(points: &[(f64, f64)], window: usize) -> Vec<(f64, f64)> {
     if window == 0 {
         return points.to_vec();
     }
-    let mut buffer: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(window);
+    let mut buffer: std::collections::VecDeque<f64> =
+        std::collections::VecDeque::with_capacity(window);
     let mut smoothed = Vec::with_capacity(points.len());
     let mut sum = 0.0;
     for &(x, y) in points {
@@ -495,7 +544,8 @@ fn smooth_median(points: &[(f64, f64)], window: usize) -> Vec<(f64, f64)> {
     if window == 0 {
         return points.to_vec();
     }
-    let mut buffer: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(window);
+    let mut buffer: std::collections::VecDeque<f64> =
+        std::collections::VecDeque::with_capacity(window);
     let mut smoothed = Vec::with_capacity(points.len());
     for &(x, y) in points {
         buffer.push_back(y);
@@ -1358,6 +1408,7 @@ pub struct App {
     session_merged_metrics: Option<Vec<MetricSample>>,
     session_resume_points: Vec<ResumePoint>,
     session_ghost_runs: Vec<GhostRunSegment>,
+    session_runs_meta: Vec<SessionRunMeta>,
     current_run_start_iteration: Option<u64>,
     resume_baseline: Option<Vec<MetricSample>>,
     pending_resume_point: Option<ResumePoint>,
@@ -1430,10 +1481,11 @@ pub struct App {
 
     session_start_time: DateTime<Local>,
     training_log_session_written: bool,
+    log_path: Option<PathBuf>,
 }
 
 impl App {
-    pub fn new(mode: AppMode) -> Result<Self> {
+    pub fn new(mode: AppMode, log_path: Option<PathBuf>) -> Result<Self> {
         let project_root = default_projects_root()?;
         let project_manager = ProjectManager::new(project_root)?;
         let projects = project_manager.list_projects()?;
@@ -1540,6 +1592,7 @@ impl App {
             session_merged_metrics: None,
             session_resume_points: Vec::new(),
             session_ghost_runs: Vec::new(),
+            session_runs_meta: Vec::new(),
             current_run_start_iteration: None,
             resume_baseline: None,
             pending_resume_point: None,
@@ -1609,8 +1662,12 @@ impl App {
             ui_animation_anchor: Instant::now(),
             session_start_time: Local::now(),
             training_log_session_written: false,
+            log_path,
         };
 
+        if app.log_path.is_some() {
+            app.log_line("logging enabled");
+        }
         app.ensure_selection_valid();
         app.rebuild_export_fields();
         app.check_python_environment();
@@ -1840,6 +1897,16 @@ impl App {
 
     pub fn metrics_log_lines(&self) -> Option<&[String]> {
         self.archived_run_view.as_ref().map(|view| view.logs())
+    }
+
+    pub fn checkpoint_hint_display(&self) -> Option<CheckpointComputation> {
+        if self.training_config.mode != TrainingMode::MultiAgent {
+            return None;
+        }
+        let sample = self.selected_metric_sample()?;
+        let iter = sample.training_iteration()?;
+        let meta = self.session_run_for_iteration(iter)?;
+        self.compute_checkpoint_target(sample, meta)
     }
 
     pub fn is_viewing_saved_run(&self) -> bool {
@@ -2271,7 +2338,11 @@ impl App {
         }
     }
 
-    pub fn chart_data(&self, max_points: usize, smoothing: ChartSmoothingKind) -> Option<ChartData> {
+    pub fn chart_data(
+        &self,
+        max_points: usize,
+        smoothing: ChartSmoothingKind,
+    ) -> Option<ChartData> {
         let metric = self.current_chart_metric()?;
         let samples = self.training_metrics_history();
         if samples.is_empty() {
@@ -2567,11 +2638,7 @@ impl App {
             ChartMetricKind::AllPoliciesRewardMean
             | ChartMetricKind::AllPoliciesEpisodeLenMean
             | ChartMetricKind::AllPoliciesLearnerStat(_) => self
-                .chart_multi_series_data(
-                    option,
-                    usize::MAX,
-                    smoothing,
-                )
+                .chart_multi_series_data(option, usize::MAX, smoothing)
                 .into_iter()
                 .enumerate()
                 .filter_map(|(idx, (label, points))| {
@@ -2588,7 +2655,8 @@ impl App {
                 .collect(),
             _ => {
                 let mut series = Vec::new();
-                let base_points = apply_chart_smoothing(&self.chart_points_for_option(option), smoothing);
+                let base_points =
+                    apply_chart_smoothing(&self.chart_points_for_option(option), smoothing);
                 if !base_points.is_empty() {
                     series.push(ExportSeries {
                         label: option.label().to_string(),
@@ -3180,6 +3248,7 @@ impl App {
         &mut self,
         sample: &MetricSample,
         trial_dir: &Path,
+        target_override: Option<u32>,
     ) -> Result<Option<(PathBuf, u32)>> {
         let mut checkpoints: Vec<(u32, PathBuf)> = Vec::new();
         let entries = match fs::read_dir(trial_dir) {
@@ -3211,7 +3280,7 @@ impl App {
         }
 
         checkpoints.sort_by_key(|(num, _)| *num);
-        let target = sample.checkpoints().map(|n| n as u32);
+        let target = target_override.or_else(|| sample.checkpoints().map(|n| n as u32));
         let chosen = if let Some(t) = target {
             checkpoints
                 .iter()
@@ -3252,46 +3321,161 @@ impl App {
             }
         };
 
-        let trial_dir = match self.find_rllib_trial_dir(&sample) {
-            Some(path) => path,
+        self.log_line(format!(
+            "[checkpoint_select] sample_iter={:?} checkpoints_hint={:?} trial_id={:?}",
+            sample.training_iteration(),
+            sample.checkpoints(),
+            sample.trial_id()
+        ));
+
+        let selected_iter = sample.training_iteration().unwrap_or(0);
+        let session_meta = self.session_run_for_iteration(selected_iter).cloned();
+
+        if let Some(meta) = session_meta.as_ref() {
+            self.log_line(format!(
+                "[checkpoint_select] session_meta start={} end={} resume_from={:?} trial_dir={:?} freq={:?} offset={:?}",
+                meta.start,
+                meta.end,
+                meta.rllib_resume_from
+                    .as_ref()
+                    .map(|p| p.display().to_string()),
+                meta.rllib_trial_dir
+                    .as_ref()
+                    .map(|p| p.display().to_string()),
+                meta.checkpoint_frequency,
+                meta.checkpoint_index_offset
+            ));
+        } else {
+            self.log_line("[checkpoint_select] no session meta for iteration");
+        }
+
+        let mut trial_dir = session_meta
+            .as_ref()
+            .and_then(|meta| meta.rllib_trial_dir.clone())
+            .or_else(|| self.find_rllib_trial_dir(&sample));
+
+        let mut checkpoint_dir: Option<PathBuf> = None;
+        let mut checkpoint_number: Option<u32> = None;
+        let mut checkpoint_offset = session_meta
+            .as_ref()
+            .and_then(|meta| meta.checkpoint_index_offset)
+            .unwrap_or(0);
+        let mut checkpoint_freq = session_meta
+            .as_ref()
+            .and_then(|meta| meta.checkpoint_frequency)
+            .filter(|f| *f > 0)
+            .unwrap_or_else(|| self.training_config.rllib_checkpoint_frequency as u64);
+
+        let target_comp = session_meta
+            .as_ref()
+            .and_then(|meta| self.compute_checkpoint_target(&sample, meta));
+
+        if let Some(ref comp) = target_comp {
+            checkpoint_freq = comp.freq;
+            checkpoint_offset = comp.offset;
+        }
+
+        let target_hint = target_comp.as_ref().map(|comp| {
+            (
+                comp.target,
+                comp.delta,
+                comp.local,
+                comp.offset,
+                comp.start,
+                comp.freq,
+            )
+        });
+
+        if let Some(t) = target_hint {
+            self.log_line(format!(
+                "[checkpoint_select] computed target hint {} (delta={}, local={}, offset={}, freq={}, start={})",
+                t.0, t.1, t.2, t.3, t.5, t.4
+            ));
+        }
+
+        if let Some(ref dir) = trial_dir {
+            let target_value = target_hint.map(|t| t.0);
+            if let Some((dir, num)) = self.select_checkpoint_dir(&sample, dir, target_value)? {
+                let display = dir.display().to_string();
+                checkpoint_number = Some(num);
+                checkpoint_dir = Some(dir);
+                self.log_line(format!(
+                    "[checkpoint_select] matched checkpoint via trial_dir={} number={}",
+                    display, num
+                ));
+            }
+        }
+
+        if checkpoint_dir.is_none() {
+            if let Some(meta) = session_meta.as_ref() {
+                if let Some(resume) = meta.rllib_resume_from.clone() {
+                    checkpoint_number = Self::checkpoint_number_from_path(&resume);
+                    checkpoint_dir = Some(resume);
+                    if trial_dir.is_none() {
+                        trial_dir = meta.rllib_trial_dir.clone();
+                    }
+                    self.log_line(format!(
+                        "[checkpoint_select] fallback using stored resume_from={} number_hint={:?}",
+                        checkpoint_dir
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "??".to_string()),
+                        checkpoint_number
+                    ));
+                }
+            }
+        }
+
+        let checkpoint_dir = match checkpoint_dir {
+            Some(dir) => dir,
             None => {
+                self.log_line(
+                    "[checkpoint_select] failed: no checkpoint directory resolved for selection",
+                );
                 self.set_status(
-                    "Could not locate a matching RLlib run directory for this sample.",
+                    "No checkpoints found for the selected point (checked trial directory and stored resume references).",
                     StatusKind::Warning,
                 );
                 return Ok(());
             }
         };
 
-        let (checkpoint_dir, checkpoint_number) =
-            match self.select_checkpoint_dir(&sample, &trial_dir)? {
-                Some((dir, num)) => (dir, num),
-                None => {
-                    self.set_status(
-                        "No checkpoints found in the matched RLlib run directory.",
-                        StatusKind::Warning,
-                    );
-                    return Ok(());
-                }
-            };
-
-        let run_display = self.project_relative_display(&trial_dir);
+        let run_display = trial_dir
+            .as_ref()
+            .map(|dir| self.project_relative_display(dir))
+            .unwrap_or_else(|| "unknown run".to_string());
         let checkpoint_display = self.project_relative_display(&checkpoint_dir);
 
         self.training_config.rllib_resume_from = checkpoint_dir.to_string_lossy().to_string();
         self.export_config.rllib_checkpoint_path = checkpoint_dir.to_string_lossy().to_string();
-        self.export_config.rllib_checkpoint_number = Some(checkpoint_number);
-        if let Some(iteration) = sample.training_iteration() {
-            self.stage_resume_point(iteration, format!("checkpoint #{checkpoint_number}"));
-        } else {
-            let freq = self.training_config.rllib_checkpoint_frequency as u64;
+        self.export_config.rllib_checkpoint_number = checkpoint_number;
+
+        let mut resume_iter = sample.training_iteration();
+        if resume_iter.is_none() {
+            let freq = checkpoint_freq;
             if freq > 0 {
-                let iter = checkpoint_number as u64 * freq;
-                self.stage_resume_point(iter, format!("checkpoint #{checkpoint_number}"));
+                if let Some(num) = checkpoint_number {
+                    let effective_num = num.saturating_sub(checkpoint_offset as u32) as u64;
+                    resume_iter = Some(effective_num * freq);
+                } else if let Some(t) = target_hint.map(|t| t.0) {
+                    let effective_num = t.saturating_sub(checkpoint_offset as u32) as u64;
+                    resume_iter = Some(effective_num * freq);
+                }
             }
         }
-        self.metrics_resume_label = Some(format!(
-            "checkpoint #{checkpoint_number} ({checkpoint_display})"
+
+        let marker_label = checkpoint_number
+            .map(|num| format!("checkpoint #{num}"))
+            .unwrap_or_else(|| "checkpoint".to_string());
+
+        if let Some(iteration) = resume_iter {
+            self.stage_resume_point(iteration, marker_label.clone());
+        }
+        self.metrics_resume_label = Some(format!("{marker_label} ({checkpoint_display})"));
+
+        self.log_line(format!(
+            "[checkpoint_select] applied checkpoint={} number={:?} resume_iter={:?} run_display={}",
+            checkpoint_display, checkpoint_number, resume_iter, run_display
         ));
 
         if let Err(error) = self.persist_training_config() {
@@ -3309,7 +3493,7 @@ impl App {
 
         self.set_status(
             format!(
-                "Resume config updated (marker staged) → checkpoint: #{checkpoint_number} ({checkpoint_display}) from run {run_display}"
+                "Resume config updated (marker staged) → checkpoint: {checkpoint_display} from run {run_display}"
             ),
             StatusKind::Success,
         );
@@ -3452,8 +3636,10 @@ impl App {
             "Start a fresh session",
         ));
         if let Some(project) = &self.active_project {
-            for session in &self.sessions.sessions {
-                let desc = self.describe_session(session, project);
+            let mut sessions = self.sessions.sessions.clone();
+            sessions.sort_by_key(|s| Reverse(s.last_used.max(s.created_at)));
+            for session in sessions {
+                let desc = self.describe_session(&session, project);
                 options.push(ConfigChoice::new(
                     format!("{} ({})", session.name, session.id),
                     session.id.clone(),
@@ -3485,9 +3671,11 @@ impl App {
             .description
             .clone()
             .unwrap_or_else(|| "No description".to_string());
-        let created = DateTime::<Local>::from(std::time::UNIX_EPOCH + Duration::from_secs(session.created_at))
-            .format("%Y-%m-%d %H:%M")
-            .to_string();
+        let created = DateTime::<Local>::from(
+            std::time::UNIX_EPOCH + Duration::from_secs(session.created_at),
+        )
+        .format("%Y-%m-%d %H:%M")
+        .to_string();
         format!(
             "{} | runs: {} | span: {} iters | last: {} | created: {}",
             desc,
@@ -3516,11 +3704,21 @@ impl App {
 
     pub fn metrics_setting_value(&self, field: MetricsSettingField) -> String {
         match field {
-            MetricsSettingField::ChartShowLegend => format_bool(self.metrics_chart_settings.show_legend),
-            MetricsSettingField::ChartLegendPosition => format!("{:?}", self.metrics_chart_settings.legend_position),
-            MetricsSettingField::ChartShowResumeMarker => format_bool(self.metrics_chart_settings.show_resume),
-            MetricsSettingField::ChartShowSelectionMarker => format_bool(self.metrics_chart_settings.show_selection),
-            MetricsSettingField::ChartShowCaption => format_bool(self.metrics_chart_settings.show_caption),
+            MetricsSettingField::ChartShowLegend => {
+                format_bool(self.metrics_chart_settings.show_legend)
+            }
+            MetricsSettingField::ChartLegendPosition => {
+                format!("{:?}", self.metrics_chart_settings.legend_position)
+            }
+            MetricsSettingField::ChartShowResumeMarker => {
+                format_bool(self.metrics_chart_settings.show_resume)
+            }
+            MetricsSettingField::ChartShowSelectionMarker => {
+                format_bool(self.metrics_chart_settings.show_selection)
+            }
+            MetricsSettingField::ChartShowCaption => {
+                format_bool(self.metrics_chart_settings.show_caption)
+            }
             MetricsSettingField::ChartXAxisLabel => self.metrics_chart_settings.x_label.clone(),
             MetricsSettingField::ChartYAxisLabel => self.metrics_chart_settings.y_label.clone(),
             MetricsSettingField::ChartAlignOverlaysToStart => {
@@ -3531,30 +3729,66 @@ impl App {
                 .max_points
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "Auto".to_string()),
-            MetricsSettingField::ChartSmoothing => self.metrics_chart_settings.smoothing.label().to_string(),
-            MetricsSettingField::ChartPrimaryColor => self.metrics_color_settings.primary_color.clone(),
-            MetricsSettingField::ChartSelectionColor => self.metrics_color_settings.selection_color.clone(),
-            MetricsSettingField::ChartResumeBeforeColor => self.metrics_color_settings.resume_before_color.clone(),
-            MetricsSettingField::ChartResumeAfterColor => self.metrics_color_settings.resume_after_color.clone(),
-            MetricsSettingField::ChartResumeMarkerColor => self.metrics_color_settings.resume_marker_color.clone(),
-            MetricsSettingField::ChartPaletteName => self.metrics_color_settings.palette_name.clone(),
-            MetricsSettingField::HistorySortNewestFirst => format_bool(self.metrics_history_settings.sort_newest_first),
-            MetricsSettingField::HistoryAutoFollow => format_bool(self.metrics_history_settings.auto_follow_latest),
-            MetricsSettingField::HistoryPageStep => self.metrics_history_settings.page_step.to_string(),
-            MetricsSettingField::HistoryShowTimestamp => format_bool(self.metrics_history_settings.show_timestamp),
-            MetricsSettingField::HistoryShowEnvSteps => format_bool(self.metrics_history_settings.show_env_steps),
-            MetricsSettingField::HistoryShowWallClock => format_bool(self.metrics_history_settings.show_wall_clock),
-            MetricsSettingField::SummaryVerbosity => match self.metrics_summary_settings.verbosity {
-                SummaryVerbosity::Compact => "Compact".to_string(),
-                SummaryVerbosity::Detailed => "Detailed".to_string(),
-            },
-            MetricsSettingField::SummaryMaxCustom => self.metrics_summary_settings.max_custom_metrics.to_string(),
-            MetricsSettingField::SummaryShowOverlayDeltas => format_bool(self.metrics_summary_settings.show_overlay_deltas),
-            MetricsSettingField::SummaryShowThroughput => format_bool(self.metrics_summary_settings.show_throughput_rows),
-            MetricsSettingField::PoliciesDefaultView => match self.metrics_policies_settings.default_view {
-                PoliciesViewMode::List => "List".to_string(),
-                PoliciesViewMode::Expanded => "Expanded grid".to_string(),
-            },
+            MetricsSettingField::ChartSmoothing => {
+                self.metrics_chart_settings.smoothing.label().to_string()
+            }
+            MetricsSettingField::ChartPrimaryColor => {
+                self.metrics_color_settings.primary_color.clone()
+            }
+            MetricsSettingField::ChartSelectionColor => {
+                self.metrics_color_settings.selection_color.clone()
+            }
+            MetricsSettingField::ChartResumeBeforeColor => {
+                self.metrics_color_settings.resume_before_color.clone()
+            }
+            MetricsSettingField::ChartResumeAfterColor => {
+                self.metrics_color_settings.resume_after_color.clone()
+            }
+            MetricsSettingField::ChartResumeMarkerColor => {
+                self.metrics_color_settings.resume_marker_color.clone()
+            }
+            MetricsSettingField::ChartPaletteName => {
+                self.metrics_color_settings.palette_name.clone()
+            }
+            MetricsSettingField::HistorySortNewestFirst => {
+                format_bool(self.metrics_history_settings.sort_newest_first)
+            }
+            MetricsSettingField::HistoryAutoFollow => {
+                format_bool(self.metrics_history_settings.auto_follow_latest)
+            }
+            MetricsSettingField::HistoryPageStep => {
+                self.metrics_history_settings.page_step.to_string()
+            }
+            MetricsSettingField::HistoryShowTimestamp => {
+                format_bool(self.metrics_history_settings.show_timestamp)
+            }
+            MetricsSettingField::HistoryShowEnvSteps => {
+                format_bool(self.metrics_history_settings.show_env_steps)
+            }
+            MetricsSettingField::HistoryShowWallClock => {
+                format_bool(self.metrics_history_settings.show_wall_clock)
+            }
+            MetricsSettingField::SummaryVerbosity => {
+                match self.metrics_summary_settings.verbosity {
+                    SummaryVerbosity::Compact => "Compact".to_string(),
+                    SummaryVerbosity::Detailed => "Detailed".to_string(),
+                }
+            }
+            MetricsSettingField::SummaryMaxCustom => {
+                self.metrics_summary_settings.max_custom_metrics.to_string()
+            }
+            MetricsSettingField::SummaryShowOverlayDeltas => {
+                format_bool(self.metrics_summary_settings.show_overlay_deltas)
+            }
+            MetricsSettingField::SummaryShowThroughput => {
+                format_bool(self.metrics_summary_settings.show_throughput_rows)
+            }
+            MetricsSettingField::PoliciesDefaultView => {
+                match self.metrics_policies_settings.default_view {
+                    PoliciesViewMode::List => "List".to_string(),
+                    PoliciesViewMode::Expanded => "Expanded grid".to_string(),
+                }
+            }
             MetricsSettingField::PoliciesSort => match self.metrics_policies_settings.sort {
                 PoliciesSortMode::Alphanumeric => "Policy ID (A→Z)".to_string(),
                 PoliciesSortMode::RewardDescending => "Reward μ (desc)".to_string(),
@@ -3562,14 +3796,22 @@ impl App {
             MetricsSettingField::PoliciesMaxLearnerStats => {
                 self.metrics_policies_settings.max_learner_stats.to_string()
             }
-            MetricsSettingField::PoliciesShowCustomMetrics => format_bool(self.metrics_policies_settings.show_custom_metrics),
-            MetricsSettingField::PoliciesShowOverlayDeltas => format_bool(self.metrics_policies_settings.show_overlay_deltas),
-            MetricsSettingField::PoliciesStartExpanded => format_bool(self.metrics_policies_settings.start_expanded),
-            MetricsSettingField::PoliciesColorMode => match self.metrics_color_settings.policy_color_mode {
-                PolicyColorMode::Auto => "Auto".to_string(),
-                PolicyColorMode::Manual => "Manual (overrides only)".to_string(),
-                PolicyColorMode::Mixed => "Mixed (overrides + auto)".to_string(),
-            },
+            MetricsSettingField::PoliciesShowCustomMetrics => {
+                format_bool(self.metrics_policies_settings.show_custom_metrics)
+            }
+            MetricsSettingField::PoliciesShowOverlayDeltas => {
+                format_bool(self.metrics_policies_settings.show_overlay_deltas)
+            }
+            MetricsSettingField::PoliciesStartExpanded => {
+                format_bool(self.metrics_policies_settings.start_expanded)
+            }
+            MetricsSettingField::PoliciesColorMode => {
+                match self.metrics_color_settings.policy_color_mode {
+                    PolicyColorMode::Auto => "Auto".to_string(),
+                    PolicyColorMode::Manual => "Manual (overrides only)".to_string(),
+                    PolicyColorMode::Mixed => "Mixed (overrides + auto)".to_string(),
+                }
+            }
             MetricsSettingField::PoliciesColorOverride => {
                 if let Some(policy_id) = self.current_policy_for_override() {
                     let color = self
@@ -3583,8 +3825,12 @@ impl App {
                     "No policy selected".to_string()
                 }
             }
-            MetricsSettingField::InfoShowHints => format_bool(self.metrics_info_settings.show_hints),
-            MetricsSettingField::InfoShowMarkerStats => format_bool(self.metrics_info_settings.show_marker_stats),
+            MetricsSettingField::InfoShowHints => {
+                format_bool(self.metrics_info_settings.show_hints)
+            }
+            MetricsSettingField::InfoShowMarkerStats => {
+                format_bool(self.metrics_info_settings.show_marker_stats)
+            }
         }
     }
 
@@ -3722,7 +3968,10 @@ impl App {
     }
 
     pub fn toggle_metrics_setting(&mut self) {
-        let field = match self.metrics_settings_fields().get(self.metrics_settings_selection) {
+        let field = match self
+            .metrics_settings_fields()
+            .get(self.metrics_settings_selection)
+        {
             Some(f) => *f,
             None => return,
         };
@@ -3741,10 +3990,12 @@ impl App {
                 self.metrics_chart_settings.show_resume = !self.metrics_chart_settings.show_resume;
             }
             MetricsSettingField::ChartShowSelectionMarker => {
-                self.metrics_chart_settings.show_selection = !self.metrics_chart_settings.show_selection;
+                self.metrics_chart_settings.show_selection =
+                    !self.metrics_chart_settings.show_selection;
             }
             MetricsSettingField::ChartShowCaption => {
-                self.metrics_chart_settings.show_caption = !self.metrics_chart_settings.show_caption;
+                self.metrics_chart_settings.show_caption =
+                    !self.metrics_chart_settings.show_caption;
             }
             MetricsSettingField::ChartAlignOverlaysToStart => {
                 self.metrics_chart_settings.align_overlays_to_start =
@@ -4649,6 +4900,7 @@ impl App {
                         self.session_merged_metrics = None;
                         self.session_resume_points.clear();
                         self.session_ghost_runs.clear();
+                        self.session_runs_meta.clear();
                         self.metrics_resume_iteration = None;
                         self.metrics_resume_label = None;
                         self.set_status("Session view cleared", StatusKind::Info);
@@ -4682,16 +4934,15 @@ impl App {
     fn apply_metrics_choice(&mut self, field: MetricsSettingField, value: &str) {
         match field {
             MetricsSettingField::ChartLegendPosition => {
-                self.metrics_chart_settings.legend_position =
-                    match value.to_lowercase().as_str() {
-                        "auto" => ChartLegendPosition::Auto,
-                        "upperleft" | "upper_left" => ChartLegendPosition::UpperLeft,
-                        "upperright" | "upper_right" => ChartLegendPosition::UpperRight,
-                        "lowerleft" | "lower_left" => ChartLegendPosition::LowerLeft,
-                        "lowerright" | "lower_right" => ChartLegendPosition::LowerRight,
-                        "none" => ChartLegendPosition::None,
-                        _ => self.metrics_chart_settings.legend_position,
-                    };
+                self.metrics_chart_settings.legend_position = match value.to_lowercase().as_str() {
+                    "auto" => ChartLegendPosition::Auto,
+                    "upperleft" | "upper_left" => ChartLegendPosition::UpperLeft,
+                    "upperright" | "upper_right" => ChartLegendPosition::UpperRight,
+                    "lowerleft" | "lower_left" => ChartLegendPosition::LowerLeft,
+                    "lowerright" | "lower_right" => ChartLegendPosition::LowerRight,
+                    "none" => ChartLegendPosition::None,
+                    _ => self.metrics_chart_settings.legend_position,
+                };
             }
             MetricsSettingField::ChartSmoothing => {
                 self.metrics_chart_settings.smoothing = Self::smoothing_from_label(value)
@@ -4844,9 +5095,7 @@ impl App {
                     (ChartSmoothingKind::Median9, "Median window 9"),
                 ]
                 .iter()
-                .map(|(kind, desc)| {
-                    ConfigChoice::new(kind.label(), kind.label(), desc.to_string())
-                })
+                .map(|(kind, desc)| ConfigChoice::new(kind.label(), kind.label(), desc.to_string()))
                 .collect(),
             ),
             MetricsSettingField::SummaryVerbosity => Some(
@@ -4855,7 +5104,13 @@ impl App {
                     (SummaryVerbosity::Detailed, "Detailed"),
                 ]
                 .iter()
-                .map(|(mode, desc)| ConfigChoice::new(format!("{:?}", mode), format!("{:?}", mode), desc.to_string()))
+                .map(|(mode, desc)| {
+                    ConfigChoice::new(
+                        format!("{:?}", mode),
+                        format!("{:?}", mode),
+                        desc.to_string(),
+                    )
+                })
                 .collect(),
             ),
             MetricsSettingField::PoliciesDefaultView => Some(
@@ -4864,16 +5119,31 @@ impl App {
                     (PoliciesViewMode::Expanded, "Expanded grid"),
                 ]
                 .iter()
-                .map(|(mode, desc)| ConfigChoice::new(format!("{:?}", mode), format!("{:?}", mode), desc.to_string()))
+                .map(|(mode, desc)| {
+                    ConfigChoice::new(
+                        format!("{:?}", mode),
+                        format!("{:?}", mode),
+                        desc.to_string(),
+                    )
+                })
                 .collect(),
             ),
             MetricsSettingField::PoliciesSort => Some(
                 [
                     (PoliciesSortMode::Alphanumeric, "Sort by ID (A→Z)"),
-                    (PoliciesSortMode::RewardDescending, "Sort by reward μ (desc)"),
+                    (
+                        PoliciesSortMode::RewardDescending,
+                        "Sort by reward μ (desc)",
+                    ),
                 ]
                 .iter()
-                .map(|(mode, desc)| ConfigChoice::new(format!("{:?}", mode), format!("{:?}", mode), desc.to_string()))
+                .map(|(mode, desc)| {
+                    ConfigChoice::new(
+                        format!("{:?}", mode),
+                        format!("{:?}", mode),
+                        desc.to_string(),
+                    )
+                })
                 .collect(),
             ),
             MetricsSettingField::ChartPrimaryColor
@@ -4897,11 +5167,7 @@ impl App {
                 COLOR_PALETTES
                     .iter()
                     .map(|(name, colors)| {
-                        ConfigChoice::new(
-                            *name,
-                            *name,
-                            format!("Palette: {}", colors.join(", ")),
-                        )
+                        ConfigChoice::new(*name, *name, format!("Palette: {}", colors.join(", ")))
                     })
                     .collect(),
             ),
@@ -4912,7 +5178,13 @@ impl App {
                     (PolicyColorMode::Mixed, "Overrides + auto fallback"),
                 ]
                 .iter()
-                .map(|(mode, desc)| ConfigChoice::new(format!("{:?}", mode), format!("{:?}", mode), desc.to_string()))
+                .map(|(mode, desc)| {
+                    ConfigChoice::new(
+                        format!("{:?}", mode),
+                        format!("{:?}", mode),
+                        desc.to_string(),
+                    )
+                })
                 .collect(),
             ),
             _ => None,
@@ -6922,19 +7194,37 @@ impl App {
 
     fn active_session_mut(&mut self) -> Option<&mut SessionRecord> {
         let id = self.active_session_id.clone()?;
-        self.sessions
-            .sessions
-            .iter_mut()
-            .find(|s| s.id == id)
+        self.sessions.sessions.iter_mut().find(|s| s.id == id)
+    }
+
+    fn now_timestamp() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    fn log_line(&self, message: impl AsRef<str>) {
+        if let Some(path) = &self.log_path {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(
+                    file,
+                    "[{}] {}",
+                    Local::now().format("%Y-%m-%d %H:%M:%S"),
+                    message.as_ref()
+                );
+            }
+        }
     }
 
     fn run_iter_span(metrics: &[MetricSample]) -> Option<(u64, u64)> {
         let mut min_iter = None;
         let mut max_iter = None;
         for (idx, sample) in metrics.iter().enumerate() {
-            let iter = sample
-                .training_iteration()
-                .unwrap_or_else(|| idx as u64);
+            let iter = sample.training_iteration().unwrap_or_else(|| idx as u64);
             min_iter = Some(min_iter.map_or(iter, |m: u64| m.min(iter)));
             max_iter = Some(max_iter.map_or(iter, |m: u64| m.max(iter)));
         }
@@ -6963,10 +7253,60 @@ impl App {
         next_start
     }
 
+    fn session_run_for_iteration(&self, iteration: u64) -> Option<&SessionRunMeta> {
+        for (idx, meta) in self.session_runs_meta.iter().enumerate() {
+            let next_start = self.session_runs_meta.get(idx + 1).map(|m| m.start);
+            let in_range = match next_start {
+                Some(boundary) => iteration >= meta.start && iteration < boundary,
+                None => iteration >= meta.start,
+            };
+            if in_range {
+                return Some(meta);
+            }
+        }
+        None
+    }
+
+    fn compute_checkpoint_target(
+        &self,
+        sample: &MetricSample,
+        meta: &SessionRunMeta,
+    ) -> Option<CheckpointComputation> {
+        if self.training_config.mode != TrainingMode::MultiAgent {
+            return None;
+        }
+        let iter = sample.training_iteration()?;
+        let freq = meta
+            .checkpoint_frequency
+            .filter(|f| *f > 0)
+            .unwrap_or_else(|| self.training_config.rllib_checkpoint_frequency as u64);
+        if freq == 0 {
+            return None;
+        }
+        let delta = iter.saturating_sub(meta.start);
+        let mut local = delta / freq;
+        if delta < freq {
+            local = 0;
+        } else {
+            local = local.saturating_sub(1);
+        }
+        let offset = meta.checkpoint_index_offset.unwrap_or(0);
+        let target = offset.saturating_add(local) as u32;
+        Some(CheckpointComputation {
+            target,
+            offset,
+            freq,
+            delta,
+            local,
+            start: meta.start,
+        })
+    }
+
     fn refresh_session_view(&mut self) -> Result<()> {
         self.session_merged_metrics = None;
         self.session_resume_points.clear();
         self.session_ghost_runs.clear();
+        self.session_runs_meta.clear();
 
         let Some(project_root) = self.active_project.as_ref().map(|p| p.root_path.clone()) else {
             return Ok(());
@@ -6980,6 +7320,7 @@ impl App {
             start: u64,
             label: String,
             metrics: Vec<MetricSample>,
+            meta: SessionRunMeta,
         }
 
         let mut loaded: Vec<LoadedRun> = Vec::new();
@@ -6991,10 +7332,41 @@ impl App {
                     if run.metrics.is_empty() {
                         continue;
                     }
+                    let Some((lo, hi)) = Self::run_iter_span(&run.metrics) else {
+                        continue;
+                    };
+                    let length = hi.saturating_sub(lo);
+                    let end = link.start_iteration.saturating_add(length);
+                    let (trial_dir, resume_from, checkpoint_frequency, checkpoint_index_offset) =
+                        if let Some(info) = run.rllib_info.as_ref() {
+                            (
+                                info.trial_dir
+                                    .as_ref()
+                                    .and_then(|p| self.resolve_saved_path(p.as_str())),
+                                info.resume_from
+                                    .as_ref()
+                                    .and_then(|p| self.resolve_saved_path(p.as_str())),
+                                info.checkpoint_frequency,
+                                info.checkpoint_index_offset,
+                            )
+                        } else {
+                            (None, None, None, None)
+                        };
+                    let meta = SessionRunMeta {
+                        start: link.start_iteration,
+                        end,
+                        run_path: path.clone(),
+                        is_rllib: run.training_mode.to_lowercase().contains("rllib"),
+                        rllib_trial_dir: trial_dir,
+                        rllib_resume_from: resume_from,
+                        checkpoint_frequency,
+                        checkpoint_index_offset,
+                    };
                     loaded.push(LoadedRun {
                         start: link.start_iteration,
                         label: run.name.clone(),
                         metrics: run.metrics.clone(),
+                        meta,
                     });
                 }
                 Err(error) => {
@@ -7032,7 +7404,9 @@ impl App {
             let mut ghost_samples: Vec<MetricSample> = Vec::new();
             for (idx, sample) in run.metrics.iter().enumerate() {
                 let local_iter = sample.training_iteration().unwrap_or(idx as u64);
-                let shifted = run.start.saturating_add(local_iter.saturating_sub(base_iter));
+                let shifted = run
+                    .start
+                    .saturating_add(local_iter.saturating_sub(base_iter));
                 let mut new_sample = sample.clone();
                 new_sample.set_training_iteration(shifted);
                 new_sample.clear_time_fields();
@@ -7067,11 +7441,9 @@ impl App {
         self.session_merged_metrics = Some(merged);
         self.session_resume_points = resume_points;
         self.session_ghost_runs = ghost_runs;
+        self.session_runs_meta = loaded.iter().map(|r| r.meta.clone()).collect();
         self.metrics_resume_iteration = self.session_resume_points.last().map(|p| p.iteration);
-        self.metrics_resume_label = self
-            .session_resume_points
-            .last()
-            .map(|p| p.label.clone());
+        self.metrics_resume_label = self.session_resume_points.last().map(|p| p.label.clone());
         self.metrics_history_index = 0;
         for warn in warnings {
             self.set_status(warn, StatusKind::Warning);
@@ -7087,16 +7459,14 @@ impl App {
             );
             return Ok(());
         }
-        let seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let seed = Self::now_timestamp();
         let name = generate_session_name(seed);
         let id = format!("sess-{seed:x}");
         let record = SessionRecord {
             id: id.clone(),
             name: name.clone(),
             created_at: seed,
+            last_used: seed,
             description: Some(format!("Session {name}")),
             runs: Vec::new(),
         };
@@ -7104,31 +7474,19 @@ impl App {
         self.active_session_id = Some(id.clone());
         self.persist_sessions().ok();
         self.refresh_session_view()?;
-        self.set_status(
-            format!("Created new session {}", name),
-            StatusKind::Success,
-        );
+        self.set_status(format!("Created new session {}", name), StatusKind::Success);
         Ok(())
     }
 
     fn set_active_session_by_id(&mut self, id: &str) -> Result<()> {
-        if self
-            .sessions
-            .sessions
-            .iter()
-            .any(|session| session.id == id)
-        {
+        if let Some(session) = self.sessions.sessions.iter_mut().find(|s| s.id == id) {
+            session.last_used = Self::now_timestamp();
+            self.persist_sessions().ok();
             self.active_session_id = Some(id.to_string());
             self.refresh_session_view()?;
-            self.set_status(
-                format!("Loaded session {}", id),
-                StatusKind::Success,
-            );
+            self.set_status(format!("Loaded session {}", id), StatusKind::Success);
         } else {
-            self.set_status(
-                format!("Session {} not found", id),
-                StatusKind::Warning,
-            );
+            self.set_status(format!("Session {} not found", id), StatusKind::Warning);
         }
         Ok(())
     }
@@ -7159,6 +7517,7 @@ impl App {
             run_path: rel_path.to_string_lossy().to_string(),
             start_iteration,
         });
+        session.last_used = Self::now_timestamp();
         if let Err(err) = self.persist_sessions() {
             self.set_status(
                 format!("Failed to save sessions: {}", err),
@@ -7263,10 +7622,7 @@ impl App {
         if let Some(path) = self.sessions_path() {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).wrap_err_with(|| {
-                    format!(
-                        "failed to create session directory {}",
-                        parent.display()
-                    )
+                    format!("failed to create session directory {}", parent.display())
                 })?;
             }
             let json = serde_json::to_string_pretty(&self.sessions).wrap_err_with(|| {
@@ -7285,13 +7641,17 @@ impl App {
         self.session_merged_metrics = None;
         self.session_resume_points.clear();
         self.session_ghost_runs.clear();
+        self.session_runs_meta.clear();
+        let mut needs_save = false;
 
         if let Some(path) = self.sessions_path() {
             if path.exists() {
                 match fs::read_to_string(&path) {
                     Ok(contents) => match serde_json::from_str::<SessionStore>(&contents) {
                         Ok(store) => {
-                            self.sessions = store;
+                            let (migrated, changed) = store.migrate();
+                            self.sessions = migrated;
+                            needs_save |= changed;
                         }
                         Err(error) => {
                             self.sessions = SessionStore::default();
@@ -7312,6 +7672,18 @@ impl App {
                     }
                 }
             }
+        }
+
+        for session in &mut self.sessions.sessions {
+            if session.last_used == 0 {
+                session.last_used = session.created_at;
+                needs_save = true;
+            }
+        }
+
+        if needs_save {
+            self.persist_sessions().ok();
+            self.set_status("Session store upgraded to latest format.", StatusKind::Info);
         }
 
         had_error
@@ -7337,10 +7709,14 @@ impl App {
                 resume_points: self.metrics_resume_points.clone(),
             };
             let json = serde_json::to_string_pretty(&state).wrap_err_with(|| {
-                format!("failed to serialize metrics settings for {}", path.display())
+                format!(
+                    "failed to serialize metrics settings for {}",
+                    path.display()
+                )
             })?;
-            fs::write(&path, json)
-                .wrap_err_with(|| format!("failed to write metrics settings to {}", path.display()))?;
+            fs::write(&path, json).wrap_err_with(|| {
+                format!("failed to write metrics settings to {}", path.display())
+            })?;
         }
         Ok(())
     }
@@ -7350,32 +7726,33 @@ impl App {
         if let Some(path) = self.metrics_settings_path() {
             if path.exists() {
                 match fs::read_to_string(&path) {
-                    Ok(contents) => match serde_json::from_str::<PersistedMetricsSettings>(&contents)
-                    {
-                        Ok(state) => {
-                            self.metrics_chart_settings = state.chart;
-                            self.metrics_history_settings = state.history;
-                            self.metrics_summary_settings = state.summary;
-                            self.metrics_policies_settings = state.policies;
-                            self.metrics_info_settings = state.info;
-                            self.metrics_color_settings = state.colors;
-                            self.metrics_resume_points = state.resume_points;
+                    Ok(contents) => {
+                        match serde_json::from_str::<PersistedMetricsSettings>(&contents) {
+                            Ok(state) => {
+                                self.metrics_chart_settings = state.chart;
+                                self.metrics_history_settings = state.history;
+                                self.metrics_summary_settings = state.summary;
+                                self.metrics_policies_settings = state.policies;
+                                self.metrics_info_settings = state.info;
+                                self.metrics_color_settings = state.colors;
+                                self.metrics_resume_points = state.resume_points;
+                            }
+                            Err(error) => {
+                                self.metrics_chart_settings = MetricsChartSettings::default();
+                                self.metrics_history_settings = MetricsHistorySettings::default();
+                                self.metrics_summary_settings = MetricsSummarySettings::default();
+                                self.metrics_policies_settings = MetricsPoliciesSettings::default();
+                                self.metrics_info_settings = MetricsInfoSettings::default();
+                                self.metrics_color_settings = MetricsColorSettings::default();
+                                self.metrics_resume_points = Vec::new();
+                                self.set_status(
+                                    format!("Invalid metrics settings, using defaults: {}", error),
+                                    StatusKind::Warning,
+                                );
+                                had_error = true;
+                            }
                         }
-                        Err(error) => {
-                            self.metrics_chart_settings = MetricsChartSettings::default();
-                            self.metrics_history_settings = MetricsHistorySettings::default();
-                            self.metrics_summary_settings = MetricsSummarySettings::default();
-                            self.metrics_policies_settings = MetricsPoliciesSettings::default();
-                            self.metrics_info_settings = MetricsInfoSettings::default();
-                            self.metrics_color_settings = MetricsColorSettings::default();
-                            self.metrics_resume_points = Vec::new();
-                            self.set_status(
-                                format!("Invalid metrics settings, using defaults: {}", error),
-                                StatusKind::Warning,
-                            );
-                            had_error = true;
-                        }
-                    },
+                    }
                     Err(error) => {
                         self.metrics_chart_settings = MetricsChartSettings::default();
                         self.metrics_history_settings = MetricsHistorySettings::default();
@@ -8977,24 +9354,37 @@ impl App {
         Ok(())
     }
 
-    fn parse_run_manifest(
-        &self,
-        run_dir: &Path,
-    ) -> Option<(String, String, u64, Option<PathBuf>, u64)> {
+    fn parse_run_manifest(&self, run_dir: &Path) -> Option<RunManifestInfo> {
         let manifest_path = run_dir.join("run_manifest.json");
-        let mut created_ts = 0;
+        let mut created_ts = 0u64;
+        let mut resume_from: Option<PathBuf> = None;
+        let mut checkpoint_frequency: u64 = 0;
+        let mut checkpoint_index_offset: u64 = 0;
+        let mut algorithm = "RLlib".to_string();
+        let mut tag = run_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("run")
+            .to_string();
+        let mut trial_dir: Option<PathBuf> = Some(run_dir.to_path_buf());
+
         if manifest_path.is_file() {
             if let Ok(file) = fs::File::open(&manifest_path) {
                 if let Ok(value) = serde_json::from_reader::<_, Value>(file) {
-                    let algo = value
+                    algorithm = value
                         .get("algorithm")
                         .and_then(Value::as_str)
                         .unwrap_or("RLlib")
                         .to_string();
-                    let tag = value
+                    tag = value
                         .get("experiment_tag")
                         .and_then(Value::as_str)
-                        .unwrap_or_else(|| run_dir.file_name().and_then(|s| s.to_str()).unwrap_or("run"))
+                        .unwrap_or_else(|| {
+                            run_dir
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("run")
+                        })
                         .to_string();
                     let created_at = value.get("created_at").and_then(Value::as_str);
                     if let Some(ts) = created_at {
@@ -9002,15 +9392,23 @@ impl App {
                             created_ts = parsed.timestamp() as u64;
                         }
                     }
-                    let resume_from = value
+                    resume_from = value
                         .get("resume_from")
                         .and_then(Value::as_str)
                         .map(PathBuf::from);
-                    let checkpoint_frequency = value
+                    checkpoint_frequency = value
                         .get("checkpoint_frequency")
                         .and_then(Value::as_u64)
                         .unwrap_or(0);
-                    return Some((algo, tag, created_ts, resume_from, checkpoint_frequency));
+                    checkpoint_index_offset = value
+                        .get("checkpoint_index_offset")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    trial_dir = value
+                        .get("trial_dir")
+                        .and_then(Value::as_str)
+                        .map(PathBuf::from)
+                        .or_else(|| Some(run_dir.to_path_buf()));
                 }
             }
         }
@@ -9024,13 +9422,52 @@ impl App {
                     .as_secs();
             }
         }
-        let algo = "RLlib".to_string();
-        let tag = run_dir
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("run")
-            .to_string();
-        Some((algo, tag, created_ts, None, 0))
+        Some(RunManifestInfo {
+            algorithm,
+            tag,
+            created_ts,
+            resume_from,
+            checkpoint_frequency,
+            checkpoint_index_offset,
+            trial_dir,
+        })
+    }
+
+    fn project_relative_value(&self, path: &Path) -> String {
+        if let Some(project) = &self.active_project {
+            if let Ok(relative) = path.strip_prefix(&project.root_path) {
+                return relative.to_string_lossy().to_string();
+            }
+        }
+        path.to_string_lossy().to_string()
+    }
+
+    fn resolve_saved_path(&self, value: &str) -> Option<PathBuf> {
+        let path = PathBuf::from(value);
+        if path.is_absolute() {
+            Some(path)
+        } else {
+            self.active_project
+                .as_ref()
+                .map(|project| project.root_path.join(path))
+        }
+    }
+
+    fn rllib_info_from_manifest(&self, manifest: &RunManifestInfo) -> RllibRunInfo {
+        let trial_dir = manifest
+            .trial_dir
+            .as_ref()
+            .map(|p| self.project_relative_value(p));
+        let resume_from = manifest
+            .resume_from
+            .as_ref()
+            .map(|p| self.project_relative_value(p));
+        RllibRunInfo {
+            trial_dir,
+            resume_from,
+            checkpoint_frequency: Some(manifest.checkpoint_frequency),
+            checkpoint_index_offset: Some(manifest.checkpoint_index_offset),
+        }
     }
 
     fn load_rllib_metrics_from_result(
@@ -9061,9 +9498,22 @@ impl App {
             bail!("Run path is not a directory: {}", path.display());
         }
 
-        let (algo, tag, created_ts, _resume_from, checkpoint_frequency) =
-            self.parse_run_manifest(&path)
-                .unwrap_or(("RLlib".to_string(), "run".to_string(), 0, None, 0));
+        let manifest = self.parse_run_manifest(&path);
+        let checkpoint_frequency = manifest
+            .as_ref()
+            .map(|m| m.checkpoint_frequency)
+            .unwrap_or(0);
+        let algo = manifest
+            .as_ref()
+            .map(|m| m.algorithm.clone())
+            .unwrap_or_else(|| "RLlib".to_string());
+        let tag = manifest.as_ref().map(|m| m.tag.clone()).unwrap_or_else(|| {
+            path.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("run")
+                .to_string()
+        });
+        let created_ts = manifest.as_ref().map(|m| m.created_ts).unwrap_or(0);
 
         let result_path = path.join("result.json");
         if !result_path.is_file() {
@@ -9106,6 +9556,7 @@ impl App {
             0.0,
             metrics,
             Vec::new(),
+            manifest.as_ref().map(|m| self.rllib_info_from_manifest(m)),
         );
 
         self.push_overlay_from_run(&saved_run, path.clone())?;
@@ -9369,6 +9820,7 @@ impl App {
         self.session_merged_metrics = None;
         self.session_resume_points.clear();
         self.session_ghost_runs.clear();
+        self.session_runs_meta.clear();
         self.drop_archived_run_view();
         self.training_receiver = None;
         self.training_cancel = None;
@@ -9539,9 +9991,11 @@ impl App {
                         }
                     }
                     if resume_iter.is_none() {
-                        resume_iter = self
-                            .metrics_resume_iteration
-                            .or_else(|| self.metrics_timeline.last().and_then(|s| s.training_iteration()));
+                        resume_iter = self.metrics_resume_iteration.or_else(|| {
+                            self.metrics_timeline
+                                .last()
+                                .and_then(|s| s.training_iteration())
+                        });
                     }
 
                     if let Some(iteration) = resume_iter {
@@ -9613,6 +10067,7 @@ impl App {
         self.session_merged_metrics = None;
         self.session_resume_points.clear();
         self.session_ghost_runs.clear();
+        self.session_runs_meta.clear();
         self.current_run_start_iteration = None;
         self.training_metrics.clear();
         self.current_run_start = Some(SystemTime::now());
@@ -10943,6 +11398,24 @@ impl App {
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
 
+        let mut rllib_info: Option<RllibRunInfo> = None;
+        if self.training_config.mode == TrainingMode::MultiAgent {
+            if let Some(sample) = self.metrics_timeline.last() {
+                if let Some(trial_dir) = self.find_rllib_trial_dir(sample) {
+                    let manifest = self.parse_run_manifest(&trial_dir);
+                    rllib_info = manifest
+                        .as_ref()
+                        .map(|m| self.rllib_info_from_manifest(m))
+                        .or_else(|| {
+                            Some(RllibRunInfo {
+                                trial_dir: Some(self.project_relative_value(&trial_dir)),
+                                ..Default::default()
+                            })
+                        });
+                }
+            }
+        }
+
         let run = SavedRun::new(
             file_name.clone(),
             project.name.clone(),
@@ -10955,6 +11428,7 @@ impl App {
             duration_seconds,
             self.metrics_timeline.clone(),
             self.training_output.clone(),
+            rllib_info,
         );
 
         match runs::save_saved_run(&path, &run) {
@@ -11417,7 +11891,9 @@ impl App {
             .as_ref()
             .map(|p| p.color.clone())
             .or_else(|| self.metrics_resume_points.last().map(|p| p.color.clone()))
-            .unwrap_or_else(|| self.resume_marker_color_for_index(self.metrics_resume_points.len()));
+            .unwrap_or_else(|| {
+                self.resume_marker_color_for_index(self.metrics_resume_points.len())
+            });
         self.pending_resume_point = Some(ResumePoint {
             iteration,
             label,
@@ -11429,7 +11905,8 @@ impl App {
     fn commit_pending_resume_point(&mut self) {
         if let Some(mut pending) = self.pending_resume_point.take() {
             if pending.color.trim().is_empty() {
-                pending.color = self.resume_marker_color_for_index(self.metrics_resume_points.len());
+                pending.color =
+                    self.resume_marker_color_for_index(self.metrics_resume_points.len());
             }
             self.metrics_resume_points.clear();
             self.metrics_resume_points.push(pending);

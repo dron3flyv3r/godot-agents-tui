@@ -7,10 +7,23 @@ use serde::{Deserialize, Serialize};
 use crate::app::metrics::MetricSample;
 
 /// Increment this when the stored JSON schema changes.
-pub const RUN_FILE_VERSION: u32 = 1;
+pub const RUN_FILE_VERSION: u32 = 2;
 
 fn default_run_version() -> u32 {
     0
+}
+
+/// RLlib-specific provenance for locating checkpoints and resume points.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RllibRunInfo {
+    /// Absolute or project-relative trial directory containing checkpoints.
+    pub trial_dir: Option<String>,
+    /// Absolute or project-relative checkpoint used to start this run (if any).
+    pub resume_from: Option<String>,
+    /// Checkpoint frequency used during the run.
+    pub checkpoint_frequency: Option<u64>,
+    /// Index offset applied to checkpoints when resuming.
+    pub checkpoint_index_offset: Option<u64>,
 }
 
 /// Representation of a stored training run with embedded metrics and logs.
@@ -27,6 +40,8 @@ pub struct SavedRun {
     pub metrics: Vec<MetricSample>,
     #[serde(default)]
     pub training_output: Vec<String>,
+    #[serde(default)]
+    pub rllib_info: Option<RllibRunInfo>,
 }
 
 impl SavedRun {
@@ -39,6 +54,7 @@ impl SavedRun {
         duration_seconds: f64,
         metrics: Vec<MetricSample>,
         training_output: Vec<String>,
+        rllib_info: Option<RllibRunInfo>,
     ) -> Self {
         Self {
             version: RUN_FILE_VERSION,
@@ -50,6 +66,7 @@ impl SavedRun {
             duration_seconds,
             metrics,
             training_output,
+            rllib_info,
         }
     }
 }

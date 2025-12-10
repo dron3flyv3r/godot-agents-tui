@@ -1707,31 +1707,26 @@ fn render_metrics_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let available_height = area.height.saturating_sub(2) as usize; // Account for borders
 
         // Header with position - always on one line - Selected: <position>  Iter: <iteration>  Checkpoint: <number>
-        let checkpoint_display = sample
-            .checkpoints()
-            .map(|c| {
-            let val = c as i64 - 1;
-            if val < 0 {
-                "-".to_string()
-            } else {
-                val.to_string()
-            }
-            })
-            .unwrap_or_else(|| "-".to_string());
+        // Get the target from app.checkpoint_hint_display() if available
+        let checkpoint_display = if let Some(hint) = app.checkpoint_hint_display() {
+            format!("{}", hint.target)
+        } else {
+            "-".to_string()
+        };
 
         lines.push(Line::from(vec![
             Span::styled("Selected: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-            position_text,
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+                position_text,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
             Span::styled("Iter: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-            format_option_u64(sample.training_iteration()),
-            Style::default().fg(Color::Cyan),
+                format_option_u64(sample.training_iteration()),
+                Style::default().fg(Color::Cyan),
             ),
             Span::raw("  "),
             Span::styled("Checkpoint: ", Style::default().fg(Color::DarkGray)),
@@ -1851,6 +1846,16 @@ fn render_metrics_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
             }
         }
 
+        if let Some(hint) = app.checkpoint_hint_display() {
+            lines.push(Line::from(vec![
+                Span::styled("Local Run: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!(
+                    "local={}, offset={}, freq={}, Δ={}, start={}",
+                    hint.local, hint.offset, hint.freq, hint.delta, hint.start
+                )),
+            ]));
+        }
+
         // Only show detailed steps if we have enough vertical space
         if summary_settings.verbosity == SummaryVerbosity::Detailed && available_height >= 12 {
             // Environment steps - split into two lines for clarity
@@ -1912,9 +1917,10 @@ fn render_metrics_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
             && !sample.custom_metrics().is_empty()
             && summary_settings.max_custom_metrics > 0
         {
-            if let Some(custom_line) =
-                summarize_custom_metrics(sample.custom_metrics(), summary_settings.max_custom_metrics)
-            {
+            if let Some(custom_line) = summarize_custom_metrics(
+                sample.custom_metrics(),
+                summary_settings.max_custom_metrics,
+            ) {
                 lines.push(custom_line);
             }
         }
@@ -1990,7 +1996,9 @@ fn render_metrics_history(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let selected_display_index = if settings.sort_newest_first {
         selected_offset_from_latest
     } else {
-        total.saturating_sub(1).saturating_sub(selected_offset_from_latest)
+        total
+            .saturating_sub(1)
+            .saturating_sub(selected_offset_from_latest)
     };
 
     let max_start = total.saturating_sub(available_rows);
@@ -2070,18 +2078,18 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
     if chart_settings.show_caption && chart_settings.show_resume {
         if let Some(iter) = app.resume_marker_iteration() {
-        let metric_opt = app.current_chart_metric();
-        let pre = metric_opt
-            .as_ref()
-            .and_then(|m| app.resume_marker_value(m))
-            .map(|v| format!("{v:.3}"))
-            .unwrap_or_else(|| "-".to_string());
-        let post = metric_opt
-            .as_ref()
-            .and_then(|m| app.latest_chart_value(m))
-            .map(|v| format!("{v:.3}"))
-            .unwrap_or_else(|| "-".to_string());
-        title.push_str(&format!(" • Resume @ {iter} (pre {pre} → live {post})"));
+            let metric_opt = app.current_chart_metric();
+            let pre = metric_opt
+                .as_ref()
+                .and_then(|m| app.resume_marker_value(m))
+                .map(|v| format!("{v:.3}"))
+                .unwrap_or_else(|| "-".to_string());
+            let post = metric_opt
+                .as_ref()
+                .and_then(|m| app.latest_chart_value(m))
+                .map(|v| format!("{v:.3}"))
+                .unwrap_or_else(|| "-".to_string());
+            title.push_str(&format!(" • Resume @ {iter} (pre {pre} → live {post})"));
         }
     }
 
@@ -2387,8 +2395,7 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
         };
         chart = chart.legend_position(Some(legend_pos));
     } else {
-        chart =
-            chart.hidden_legend_constraints((Constraint::Length(0), Constraint::Length(0)));
+        chart = chart.hidden_legend_constraints((Constraint::Length(0), Constraint::Length(0)));
     }
 
     frame.render_widget(chart, area);
@@ -2411,7 +2418,8 @@ fn render_multi_series_chart(
     let max_points = chart_settings
         .max_points
         .unwrap_or_else(|| (area.width as usize).saturating_mul(4).max(1));
-    let multi_data = app.chart_multi_series_data(metric_option, max_points, chart_settings.smoothing);
+    let multi_data =
+        app.chart_multi_series_data(metric_option, max_points, chart_settings.smoothing);
 
     if multi_data.is_empty() {
         let placeholder = Paragraph::new("No data for overlay chart yet.")
@@ -2599,16 +2607,15 @@ fn render_multi_series_chart(
     if chart_settings.show_legend {
         let legend_pos = match chart_settings.legend_position {
             ChartLegendPosition::Auto => LegendPosition::Top,
-            ChartLegendPosition::UpperLeft => LegendPosition::Top,
-            ChartLegendPosition::UpperRight => LegendPosition::Top,
-            ChartLegendPosition::LowerLeft => LegendPosition::Bottom,
-            ChartLegendPosition::LowerRight => LegendPosition::Bottom,
+            ChartLegendPosition::UpperLeft => LegendPosition::TopLeft,
+            ChartLegendPosition::UpperRight => LegendPosition::TopRight,
+            ChartLegendPosition::LowerLeft => LegendPosition::BottomLeft,
+            ChartLegendPosition::LowerRight => LegendPosition::BottomRight,
             ChartLegendPosition::None => LegendPosition::Top,
         };
         chart = chart.legend_position(Some(legend_pos));
     } else {
-        chart =
-            chart.hidden_legend_constraints((Constraint::Length(0), Constraint::Length(0)));
+        chart = chart.hidden_legend_constraints((Constraint::Length(0), Constraint::Length(0)));
     }
 
     frame.render_widget(chart, area);
@@ -3009,10 +3016,12 @@ fn render_metrics_policies(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
         if settings.show_overlay_deltas {
             if let Some(comp) = comparison.as_ref() {
-                if let Some(line) = render_compact_policy_delta("Δ Reward μ: ", comp.reward_mean) {
+                if let Some(line) = render_compact_policy_delta("Δ Reward μ: ", comp.reward_mean)
+                {
                     lines.push(line);
                 }
-                if let Some(line) = render_compact_policy_delta("Δ Ep len: ", comp.episode_len_mean) {
+                if let Some(line) = render_compact_policy_delta("Δ Ep len: ", comp.episode_len_mean)
+                {
                     lines.push(line);
                 }
             }
@@ -3336,29 +3345,31 @@ fn render_single_policy_detailed(
 
     if settings.show_overlay_deltas {
         if let Some(comp) = app.policy_comparison(policy_id) {
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![Span::styled(
-            format!("Comparison vs {}", comp.baseline_label),
-            Style::default()
-                .fg(Color::LightCyan)
-                .add_modifier(Modifier::BOLD),
-        )]));
-        if let Some(line) = render_expanded_policy_delta("Reward μ", comp.reward_mean) {
-            lines.push(line);
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled(
+                format!("Comparison vs {}", comp.baseline_label),
+                Style::default()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            )]));
+            if let Some(line) = render_expanded_policy_delta("Reward μ", comp.reward_mean) {
+                lines.push(line);
+            }
+            if let Some(line) = render_expanded_policy_delta("Reward min", comp.reward_min) {
+                lines.push(line);
+            }
+            if let Some(line) = render_expanded_policy_delta("Reward max", comp.reward_max) {
+                lines.push(line);
+            }
+            if let Some(line) = render_expanded_policy_delta("Ep len μ", comp.episode_len_mean) {
+                lines.push(line);
+            }
+            if let Some(line) =
+                render_expanded_policy_delta_u64("Completed", comp.completed_episodes)
+            {
+                lines.push(line);
+            }
         }
-        if let Some(line) = render_expanded_policy_delta("Reward min", comp.reward_min) {
-            lines.push(line);
-        }
-        if let Some(line) = render_expanded_policy_delta("Reward max", comp.reward_max) {
-            lines.push(line);
-        }
-        if let Some(line) = render_expanded_policy_delta("Ep len μ", comp.episode_len_mean) {
-            lines.push(line);
-        }
-        if let Some(line) = render_expanded_policy_delta_u64("Completed", comp.completed_episodes) {
-            lines.push(line);
-        }
-    }
     }
 
     // Apply vertical scroll with bounds checking
@@ -4234,12 +4245,14 @@ fn metrics_help_lines(app: &App) -> Vec<String> {
         "x (chart focus)  Export chart as PNG (adjust options after choosing path)".to_string(),
         "l                Load a saved run as the primary view (no overlays)".to_string(),
         "c                Load a saved run overlay from disk".to_string(),
-        "f / g / G        Refresh detected RLlib runs • load latest detected • cycle+load".to_string(),
+        "f / g / G        Refresh detected RLlib runs • load latest detected • cycle+load"
+            .to_string(),
         "C                Clear all overlays".to_string(),
         "o                Toggle viewing the selected saved run".to_string(),
         "O                Cycle through loaded runs".to_string(),
         "v                Return to live metrics when viewing a run".to_string(),
-        "r                Apply the selected checkpoint directory to the training config".to_string(),
+        "r                Apply the selected checkpoint directory to the training config"
+            .to_string(),
     ];
     if app.has_saved_run_overlays() {
         if let Some(label) = app.selected_overlay_label() {
@@ -4774,19 +4787,20 @@ pub fn render_metrics_settings(frame: &mut Frame<'_>, app: &App) {
         .min(fields.len().saturating_sub(1));
     state.select(Some(selected));
 
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title("Options")
-            .title_alignment(Alignment::Center),
-    )
-    .highlight_style(
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    )
-    .highlight_symbol("› ");
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title("Options")
+                .title_alignment(Alignment::Center),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("› ");
 
     frame.render_stateful_widget(list, layout[1], &mut state);
 
