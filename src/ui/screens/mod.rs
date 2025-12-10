@@ -2436,8 +2436,8 @@ fn render_multi_series_chart(
     let mut x_min = f64::INFINITY;
     let mut x_max = f64::NEG_INFINITY;
 
-    for (_, points) in &multi_data {
-        for &(x, y) in points {
+    for entry in &multi_data {
+        for &(x, y) in &entry.points {
             if x.is_finite() {
                 x_min = x_min.min(x);
                 x_max = x_max.max(x);
@@ -2479,20 +2479,37 @@ fn render_multi_series_chart(
         x_max = x_min + 1.0;
     }
 
-    // Create datasets for each policy
-    let mut datasets: Vec<Dataset> = multi_data
-        .iter()
-        .enumerate()
-        .map(|(idx, (policy_id, points))| {
-            let color = app.policy_color(policy_id, idx);
+    // Ghost series first (drawn under primaries), then primaries.
+    let ghost_palette = [
+        Color::DarkGray,
+        Color::Gray,
+        Color::Rgb(180, 180, 180),
+        Color::White,
+    ];
+    let mut datasets: Vec<Dataset> = Vec::new();
+    for entry in multi_data.iter().filter(|e| e.is_ghost) {
+        let color = ghost_palette[entry.ghost_index % ghost_palette.len()];
+        datasets.push(
             Dataset::default()
-                .name(policy_id.clone())
+                // Blank name keeps ghosts out of the legend while still rendering.
+                .name(String::new())
                 .marker(Marker::Braille)
                 .graph_type(GraphType::Line)
                 .style(Style::default().fg(color))
-                .data(points)
-        })
-        .collect();
+                .data(&entry.points),
+        );
+    }
+    for (idx, entry) in multi_data.iter().filter(|e| !e.is_ghost).enumerate() {
+        let color = app.policy_color(&entry.policy_id, idx);
+        datasets.push(
+            Dataset::default()
+                .name(entry.label.clone())
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(color))
+                .data(&entry.points),
+        );
+    }
 
     let selected_x = app
         .selected_metric_sample()
@@ -3504,6 +3521,7 @@ fn metrics_setting_label(field: MetricsSettingField) -> &'static str {
         MetricsSettingField::ChartShowResumeMarker => "Resume marker",
         MetricsSettingField::ChartShowSelectionMarker => "Selection marker",
         MetricsSettingField::ChartShowCaption => "Caption/title",
+        MetricsSettingField::ChartShowGhostOverlays => "Show ghost overlays",
         MetricsSettingField::ChartXAxisLabel => "X axis title",
         MetricsSettingField::ChartYAxisLabel => "Y axis title",
         MetricsSettingField::ChartAlignOverlaysToStart => "Align overlays to start",

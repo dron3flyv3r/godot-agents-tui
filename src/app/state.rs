@@ -389,6 +389,15 @@ struct GhostRunSegment {
     label: String,
     metrics: Vec<MetricSample>,
 }
+
+#[derive(Debug, Clone)]
+pub struct MultiSeriesEntry {
+    pub label: String,
+    pub policy_id: String,
+    pub points: Vec<(f64, f64)>,
+    pub is_ghost: bool,
+    pub ghost_index: usize,
+}
 #[derive(Debug, Clone)]
 pub struct ChartOverlaySeries {
     pub label: String,
@@ -608,12 +617,13 @@ pub enum ChartLegendPosition {
     None,
 }
 
-const METRIC_CHART_SETTING_FIELDS: [MetricsSettingField; 16] = [
+const METRIC_CHART_SETTING_FIELDS: [MetricsSettingField; 17] = [
     MetricsSettingField::ChartShowLegend,
     MetricsSettingField::ChartLegendPosition,
     MetricsSettingField::ChartShowResumeMarker,
     MetricsSettingField::ChartShowSelectionMarker,
     MetricsSettingField::ChartShowCaption,
+    MetricsSettingField::ChartShowGhostOverlays,
     MetricsSettingField::ChartXAxisLabel,
     MetricsSettingField::ChartYAxisLabel,
     MetricsSettingField::ChartAlignOverlaysToStart,
@@ -675,6 +685,7 @@ pub enum MetricsSettingField {
     ChartShowResumeMarker,
     ChartShowSelectionMarker,
     ChartShowCaption,
+    ChartShowGhostOverlays,
     ChartXAxisLabel,
     ChartYAxisLabel,
     ChartAlignOverlaysToStart,
@@ -740,6 +751,7 @@ pub struct MetricsChartSettings {
     pub show_resume: bool,
     pub show_selection: bool,
     pub show_caption: bool,
+    pub show_ghost_overlays: bool,
     pub x_label: String,
     pub y_label: String,
     pub align_overlays_to_start: bool,
@@ -755,6 +767,7 @@ impl Default for MetricsChartSettings {
             show_resume: true,
             show_selection: true,
             show_caption: true,
+            show_ghost_overlays: true,
             x_label: "Training iteration".to_string(),
             y_label: String::new(),
             align_overlays_to_start: false,
@@ -2385,18 +2398,18 @@ impl App {
 
     fn apply_multi_series_smoothing(
         &self,
-        series: Vec<(String, Vec<(f64, f64)>)>,
+        series: Vec<MultiSeriesEntry>,
         smoothing: ChartSmoothingKind,
         max_points: usize,
-    ) -> Vec<(String, Vec<(f64, f64)>)> {
+    ) -> Vec<MultiSeriesEntry> {
         series
             .into_iter()
-            .map(|(label, mut points)| {
-                let len = points.len();
+            .map(|mut entry| {
+                let len = entry.points.len();
                 let start = len.saturating_sub(max_points.max(1));
-                points = points.into_iter().skip(start).collect();
-                let points = apply_chart_smoothing(&points, smoothing);
-                (label, points)
+                entry.points = entry.points.into_iter().skip(start).collect();
+                entry.points = apply_chart_smoothing(&entry.points, smoothing);
+                entry
             })
             .collect()
     }
@@ -2511,109 +2524,101 @@ impl App {
         option: &ChartMetricOption,
         max_points: usize,
         smoothing: ChartSmoothingKind,
-    ) -> Vec<(String, Vec<(f64, f64)>)> {
-        let samples = self.training_metrics_history();
-
-        let raw = match option.kind() {
-            ChartMetricKind::AllPoliciesRewardMean => {
-                // Collect all policy IDs
-                let mut policy_ids = std::collections::HashSet::new();
-                for sample in samples {
-                    for id in sample.policies().keys() {
-                        policy_ids.insert(id.clone());
-                    }
+    ) -> Vec<MultiSeriesEntry> {
+        fn collect_policy_series(
+            samples: &[MetricSample],
+            kind: &ChartMetricKind,
+            label_suffix: Option<&str>,
+            is_ghost: bool,
+            ghost_index: usize,
+        ) -> Vec<MultiSeriesEntry> {
+            use std::collections::HashSet;
+            let mut policy_ids = HashSet::new();
+            for sample in samples {
+                for id in sample.policies().keys() {
+                    policy_ids.insert(id.clone());
                 }
+            }
 
-                // Sort policy IDs
-                let mut sorted_ids: Vec<_> = policy_ids.into_iter().collect();
-                sorted_ids.sort_by(|a, b| {
-                    crate::ui::alphanumeric_sort_key(a).cmp(&crate::ui::alphanumeric_sort_key(b))
-                });
+            let mut sorted_ids: Vec<_> = policy_ids.into_iter().collect();
+            sorted_ids.sort_by(|a, b| {
+                crate::ui::alphanumeric_sort_key(a).cmp(&crate::ui::alphanumeric_sort_key(b))
+            });
 
-                // Build series for each policy
-                sorted_ids
-                    .into_iter()
-                    .map(|policy_id| {
-                        let data: Vec<(f64, f64)> = samples
-                            .iter()
-                            .filter_map(|sample| {
-                                let x = sample.training_iteration()? as f64;
-                                let y = sample
+            sorted_ids
+                .into_iter()
+                .map(|policy_id| {
+                    let label = if let Some(suffix) = label_suffix {
+                        format!("{policy_id} ({suffix})")
+                    } else {
+                        policy_id.clone()
+                    };
+                    let data: Vec<(f64, f64)> = samples
+                        .iter()
+                        .filter_map(|sample| {
+                            let x = sample.training_iteration()? as f64;
+                            let y = match kind {
+                                ChartMetricKind::AllPoliciesRewardMean => sample
                                     .policies()
                                     .get(&policy_id)
-                                    .and_then(|m| m.reward_mean())?;
-                                Some((x, y))
-                            })
-                            .collect();
-                        (policy_id, data)
-                    })
-                    .collect()
-            }
-            ChartMetricKind::AllPoliciesEpisodeLenMean => {
-                let mut policy_ids = std::collections::HashSet::new();
-                for sample in samples {
-                    for id in sample.policies().keys() {
-                        policy_ids.insert(id.clone());
-                    }
-                }
-
-                let mut sorted_ids: Vec<_> = policy_ids.into_iter().collect();
-                sorted_ids.sort_by(|a, b| {
-                    crate::ui::alphanumeric_sort_key(a).cmp(&crate::ui::alphanumeric_sort_key(b))
-                });
-
-                sorted_ids
-                    .into_iter()
-                    .map(|policy_id| {
-                        let data: Vec<(f64, f64)> = samples
-                            .iter()
-                            .filter_map(|sample| {
-                                let x = sample.training_iteration()? as f64;
-                                let y = sample
+                                    .and_then(|m| m.reward_mean()),
+                                ChartMetricKind::AllPoliciesEpisodeLenMean => sample
                                     .policies()
                                     .get(&policy_id)
-                                    .and_then(|m| m.episode_len_mean())?;
-                                Some((x, y))
-                            })
-                            .collect();
-                        (policy_id, data)
-                    })
-                    .collect()
-            }
-            ChartMetricKind::AllPoliciesLearnerStat(stat_key) => {
-                let mut policy_ids = std::collections::HashSet::new();
-                for sample in samples {
-                    for id in sample.policies().keys() {
-                        policy_ids.insert(id.clone());
-                    }
-                }
-
-                let mut sorted_ids: Vec<_> = policy_ids.into_iter().collect();
-                sorted_ids.sort_by(|a, b| {
-                    crate::ui::alphanumeric_sort_key(a).cmp(&crate::ui::alphanumeric_sort_key(b))
-                });
-
-                sorted_ids
-                    .into_iter()
-                    .map(|policy_id| {
-                        let data: Vec<(f64, f64)> = samples
-                            .iter()
-                            .filter_map(|sample| {
-                                let x = sample.training_iteration()? as f64;
-                                let y = sample
+                                    .and_then(|m| m.episode_len_mean()),
+                                ChartMetricKind::AllPoliciesLearnerStat(stat_key) => sample
                                     .policies()
                                     .get(&policy_id)
-                                    .and_then(|m| m.learner_stats().get(stat_key).copied())?;
-                                Some((x, y))
-                            })
-                            .collect();
-                        (policy_id, data)
-                    })
-                    .collect()
-            }
+                                    .and_then(|m| m.learner_stats().get(stat_key).copied()),
+                                _ => None,
+                            }?;
+                            Some((x, y))
+                        })
+                        .collect();
+                    MultiSeriesEntry {
+                        label,
+                        policy_id: policy_id.clone(),
+                        points: data,
+                        is_ghost,
+                        ghost_index,
+                    }
+                })
+                .collect()
+        }
+
+        let mut raw = match option.kind() {
+            ChartMetricKind::AllPoliciesRewardMean
+            | ChartMetricKind::AllPoliciesEpisodeLenMean
+            | ChartMetricKind::AllPoliciesLearnerStat(_) => collect_policy_series(
+                self.training_metrics_history(),
+                option.kind(),
+                None,
+                false,
+                0,
+            ),
             // Non-overlay types return empty
             _ => Vec::new(),
         };
+
+        // Add ghost run overlays when viewing session merges.
+        if matches!(
+            option.kind(),
+            ChartMetricKind::AllPoliciesRewardMean
+                | ChartMetricKind::AllPoliciesEpisodeLenMean
+                | ChartMetricKind::AllPoliciesLearnerStat(_)
+        ) {
+            if self.metrics_chart_settings.show_ghost_overlays {
+                for (ghost_idx, ghost) in self.session_ghost_runs.iter().enumerate() {
+                    raw.extend(collect_policy_series(
+                        &ghost.metrics,
+                        option.kind(),
+                        Some(&ghost.label),
+                        true,
+                        ghost_idx,
+                    ));
+                }
+            }
+        }
 
         self.apply_multi_series_smoothing(raw, smoothing, max_points.max(1))
     }
@@ -2637,22 +2642,34 @@ impl App {
         match option.kind() {
             ChartMetricKind::AllPoliciesRewardMean
             | ChartMetricKind::AllPoliciesEpisodeLenMean
-            | ChartMetricKind::AllPoliciesLearnerStat(_) => self
-                .chart_multi_series_data(option, usize::MAX, smoothing)
-                .into_iter()
-                .enumerate()
-                .filter_map(|(idx, (label, points))| {
-                    if points.is_empty() {
-                        None
-                    } else {
-                        Some(ExportSeries {
-                            label,
-                            color: export_palette_color(idx),
-                            points,
-                        })
+            | ChartMetricKind::AllPoliciesLearnerStat(_) => {
+                let ghost_palette = [
+                    RGBColor(64, 64, 64),
+                    RGBColor(96, 96, 96),
+                    RGBColor(128, 128, 128),
+                    RGBColor(196, 196, 196),
+                ];
+                let mut series = Vec::new();
+                let mut primary_idx = 0;
+                for entry in self.chart_multi_series_data(option, usize::MAX, smoothing) {
+                    if entry.points.is_empty() {
+                        continue;
                     }
-                })
-                .collect(),
+                    let color = if entry.is_ghost {
+                        ghost_palette[entry.ghost_index % ghost_palette.len()]
+                    } else {
+                        let c = export_palette_color(primary_idx);
+                        primary_idx += 1;
+                        c
+                    };
+                    series.push(ExportSeries {
+                        label: entry.label,
+                        color,
+                        points: entry.points,
+                    });
+                }
+                series
+            }
             _ => {
                 let mut series = Vec::new();
                 let base_points =
@@ -3660,8 +3677,8 @@ impl App {
             if let Ok(run) = runs::load_saved_run(&path) {
                 run_count += 1;
                 if let Some((lo, hi)) = Self::run_iter_span(&run.metrics) {
-                    let length = hi.saturating_sub(lo);
-                    total_iters = total_iters.max(link.start_iteration.saturating_add(length));
+                    let span = hi.saturating_sub(lo);
+                    total_iters = total_iters.max(link.start_iteration.saturating_add(span));
                 }
                 last_label = Some(run.name.clone());
             }
@@ -3718,6 +3735,9 @@ impl App {
             }
             MetricsSettingField::ChartShowCaption => {
                 format_bool(self.metrics_chart_settings.show_caption)
+            }
+            MetricsSettingField::ChartShowGhostOverlays => {
+                format_bool(self.metrics_chart_settings.show_ghost_overlays)
             }
             MetricsSettingField::ChartXAxisLabel => self.metrics_chart_settings.x_label.clone(),
             MetricsSettingField::ChartYAxisLabel => self.metrics_chart_settings.y_label.clone(),
@@ -3841,6 +3861,7 @@ impl App {
             MetricsSettingField::ChartShowResumeMarker => "Resume marker",
             MetricsSettingField::ChartShowSelectionMarker => "Selection marker",
             MetricsSettingField::ChartShowCaption => "Caption/title",
+            MetricsSettingField::ChartShowGhostOverlays => "Show ghost overlays",
             MetricsSettingField::ChartXAxisLabel => "X axis title",
             MetricsSettingField::ChartYAxisLabel => "Y axis title",
             MetricsSettingField::ChartAlignOverlaysToStart => "Align overlays to start",
@@ -3996,6 +4017,10 @@ impl App {
             MetricsSettingField::ChartShowCaption => {
                 self.metrics_chart_settings.show_caption =
                     !self.metrics_chart_settings.show_caption;
+            }
+            MetricsSettingField::ChartShowGhostOverlays => {
+                self.metrics_chart_settings.show_ghost_overlays =
+                    !self.metrics_chart_settings.show_ghost_overlays;
             }
             MetricsSettingField::ChartAlignOverlaysToStart => {
                 self.metrics_chart_settings.align_overlays_to_start =
@@ -7238,7 +7263,9 @@ impl App {
         let mut next_start = 0;
         if let Some(session) = self.active_session() {
             if let Some(project) = &self.active_project {
-                for link in &session.runs {
+                let mut runs = session.runs.clone();
+                runs.sort_by_key(|r| r.start_iteration);
+                for link in &runs {
                     let path = project.root_path.join(&link.run_path);
                     if let Ok(run) = runs::load_saved_run(&path) {
                         if let Some((lo, hi)) = Self::run_iter_span(&run.metrics) {
@@ -7307,6 +7334,7 @@ impl App {
         self.session_resume_points.clear();
         self.session_ghost_runs.clear();
         self.session_runs_meta.clear();
+        self.log_line("[session] refreshing merged view");
 
         let Some(project_root) = self.active_project.as_ref().map(|p| p.root_path.clone()) else {
             return Ok(());
@@ -7325,14 +7353,37 @@ impl App {
 
         let mut loaded: Vec<LoadedRun> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
-        for link in &session.runs {
+        // Keep runs in chronological order so ghost boundaries are correct even if the
+        // persisted session list was not sorted.
+        let mut session_runs = session.runs.clone();
+        let was_unsorted = session_runs
+            .windows(2)
+            .any(|w| w[0].start_iteration > w[1].start_iteration);
+        if was_unsorted {
+            session_runs.sort_by_key(|r| r.start_iteration);
+            self.set_status(
+                "Session runs reordered by start iteration for merged view",
+                StatusKind::Info,
+            );
+            self.log_line("[session] runs were unsorted; reordered for merge");
+        }
+
+        for link in &session_runs {
             let path = project_root.join(&link.run_path);
             match runs::load_saved_run(&path) {
                 Ok(run) => {
                     if run.metrics.is_empty() {
+                        self.log_line(format!(
+                            "[session] run {} is empty, skipping",
+                            path.display()
+                        ));
                         continue;
                     }
                     let Some((lo, hi)) = Self::run_iter_span(&run.metrics) else {
+                        self.log_line(format!(
+                            "[session] run {} missing iteration info, skipping",
+                            path.display()
+                        ));
                         continue;
                     };
                     let length = hi.saturating_sub(lo);
@@ -7352,6 +7403,13 @@ impl App {
                         } else {
                             (None, None, None, None)
                         };
+                    self.log_line(format!(
+                        "[session] loaded run={} start_iter={} span=({lo},{hi}) len={} end={}",
+                        path.display(),
+                        link.start_iteration,
+                        length,
+                        end
+                    ));
                     let meta = SessionRunMeta {
                         start: link.start_iteration,
                         end,
@@ -7382,6 +7440,7 @@ impl App {
 
         if loaded.is_empty() {
             self.session_merged_metrics = Some(Vec::new());
+            self.log_line("[session] no runs loaded, merged view empty");
             return Ok(());
         }
 
@@ -7424,6 +7483,11 @@ impl App {
                         label: format!("{} (ghost)", run.label),
                         metrics: ghost_samples,
                     });
+                    let last_len = ghost_runs.last().map(|g| g.metrics.len()).unwrap_or(0);
+                    self.log_line(format!(
+                        "[session] ghost segment run={} boundary={} samples={}",
+                        run.label, boundary, last_len
+                    ));
                 } else {
                     // If the run had no samples before the next start, still keep a marker.
                     self.set_status(
@@ -7439,6 +7503,12 @@ impl App {
 
         merged.sort_by_key(|m| m.training_iteration().unwrap_or(0));
         self.session_merged_metrics = Some(merged);
+        self.log_line(format!(
+            "[session] merged runs={} resume_points={} ghosts={}",
+            loaded.len(),
+            resume_points.len(),
+            ghost_runs.len()
+        ));
         self.session_resume_points = resume_points;
         self.session_ghost_runs = ghost_runs;
         self.session_runs_meta = loaded.iter().map(|r| r.meta.clone()).collect();
