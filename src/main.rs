@@ -146,6 +146,9 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
                         app.open_advanced_config();
                     }
                 }
+                KeyCode::Char('u') | KeyCode::Char('U') => {
+                    app.open_session_menu();
+                }
                 KeyCode::Up => app.scroll_training_output_up(1),
                 KeyCode::Down => app.scroll_training_output_down(1),
                 KeyCode::PageUp => app.scroll_training_output_up(10),
@@ -201,6 +204,9 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
                     } else {
                         app.open_advanced_config();
                     }
+                }
+                KeyCode::Char('u') | KeyCode::Char('U') => {
+                    app.open_session_menu();
                 }
                 KeyCode::Up => app.scroll_training_output_up(1),
                 KeyCode::Down => app.scroll_training_output_down(1),

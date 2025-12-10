@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::fs;
+use std::{error, fs};
 use std::io::{BufRead, BufReader, Write};
 use std::ops::Index;
 use std::path::{Component, Path, PathBuf};
@@ -27,6 +27,7 @@ use super::config::{
 };
 use super::file_browser::{FileBrowserEntry, FileBrowserKind, FileBrowserState, FileBrowserTarget};
 use super::metrics::{ChartData, ChartMetricKind, ChartMetricOption, MetricSample};
+use super::sessions::{generate_session_name, SessionRecord, SessionRunLink, SessionStore};
 use super::runs::{self, SavedRun};
 use crate::domain::projects::PROJECT_CONFIG_DIR;
 use crate::domain::{ProjectInfo, ProjectManager};
@@ -53,6 +54,7 @@ const CONTROLLER_ROOT: Option<&str> = option_env!("CARGO_MANIFEST_DIR");
 const PROJECT_LOCATION_MAX_LEN: usize = 4096;
 const MAX_RUN_OVERLAYS: usize = 4;
 const METRICS_SETTINGS_FILENAME: &str = "metrics_settings.json";
+const SESSION_STORE_FILENAME: &str = "sessions.json";
 const OVERLAY_COLORS: [Color; 6] = [
     Color::LightMagenta,
     Color::LightGreen,
@@ -310,6 +312,7 @@ enum ChoiceMenuTarget {
     Config(ConfigField),
     Metrics(MetricsSettingField),
     DiscoveredRun,
+    Session,
 }
 
 #[derive(Debug, Clone)]
@@ -331,6 +334,12 @@ pub struct ChoiceMenuView<'a> {
     pub label: &'a str,
     pub options: &'a [ConfigChoice],
     pub selected: usize,
+}
+
+#[derive(Debug, Clone)]
+struct GhostRunSegment {
+    label: String,
+    metrics: Vec<MetricSample>,
 }
 #[derive(Debug, Clone)]
 pub struct ChartOverlaySeries {
@@ -1344,6 +1353,12 @@ pub struct App {
     metrics_policies_settings: MetricsPoliciesSettings,
     metrics_info_settings: MetricsInfoSettings,
     metrics_color_settings: MetricsColorSettings,
+    sessions: SessionStore,
+    active_session_id: Option<String>,
+    session_merged_metrics: Option<Vec<MetricSample>>,
+    session_resume_points: Vec<ResumePoint>,
+    session_ghost_runs: Vec<GhostRunSegment>,
+    current_run_start_iteration: Option<u64>,
     resume_baseline: Option<Vec<MetricSample>>,
     pending_resume_point: Option<ResumePoint>,
     metrics_resume_points: Vec<ResumePoint>,
@@ -1520,6 +1535,12 @@ impl App {
             metrics_policies_settings: MetricsPoliciesSettings::default(),
             metrics_info_settings: MetricsInfoSettings::default(),
             metrics_color_settings: MetricsColorSettings::default(),
+            sessions: SessionStore::default(),
+            active_session_id: None,
+            session_merged_metrics: None,
+            session_resume_points: Vec::new(),
+            session_ghost_runs: Vec::new(),
+            current_run_start_iteration: None,
             resume_baseline: None,
             pending_resume_point: None,
             metrics_resume_points: Vec::new(),
@@ -2034,6 +2055,8 @@ impl App {
     pub fn training_metrics_history(&self) -> &[MetricSample] {
         if let Some(view) = &self.archived_run_view {
             view.metrics()
+        } else if let Some(metrics) = &self.session_merged_metrics {
+            metrics
         } else {
             &self.metrics_timeline
         }
@@ -2314,11 +2337,24 @@ impl App {
     }
 
     fn visible_resume_points(&self) -> Vec<ResumePoint> {
-        if let Some(pending) = &self.pending_resume_point {
-            vec![pending.clone()]
+        let mut points = if !self.session_resume_points.is_empty() {
+            self.session_resume_points.clone()
         } else {
             self.metrics_resume_points.clone()
+        };
+
+        if let Some(pending) = &self.pending_resume_point {
+            // Replace the last marker if it refers to the same iteration to avoid duplicates.
+            if let Some(last) = points.last_mut() {
+                if last.iteration == pending.iteration {
+                    *last = pending.clone();
+                    return points;
+                }
+            }
+            points.push(pending.clone());
         }
+
+        points
     }
 
     pub fn resume_marker_iteration(&self) -> Option<u64> {
@@ -3401,6 +3437,81 @@ impl App {
         } else {
             self.metrics_settings_selection -= 1;
         }
+    }
+
+    fn session_options(&self) -> Vec<ConfigChoice> {
+        let mut options = Vec::new();
+        options.push(ConfigChoice::new(
+            "No session (live metrics)",
+            "__none__",
+            "Show only the current run",
+        ));
+        options.push(ConfigChoice::new(
+            "Create new session",
+            "__new__",
+            "Start a fresh session",
+        ));
+        if let Some(project) = &self.active_project {
+            for session in &self.sessions.sessions {
+                let desc = self.describe_session(session, project);
+                options.push(ConfigChoice::new(
+                    format!("{} ({})", session.name, session.id),
+                    session.id.clone(),
+                    desc,
+                ));
+            }
+        }
+        options
+    }
+
+    fn describe_session(&self, session: &SessionRecord, project: &ProjectInfo) -> String {
+        let mut total_iters = 0;
+        let mut run_count = 0;
+        let mut last_label: Option<String> = None;
+
+        for link in &session.runs {
+            let path = project.root_path.join(&link.run_path);
+            if let Ok(run) = runs::load_saved_run(&path) {
+                run_count += 1;
+                if let Some((lo, hi)) = Self::run_iter_span(&run.metrics) {
+                    let length = hi.saturating_sub(lo);
+                    total_iters = total_iters.max(link.start_iteration.saturating_add(length));
+                }
+                last_label = Some(run.name.clone());
+            }
+        }
+
+        let desc = session
+            .description
+            .clone()
+            .unwrap_or_else(|| "No description".to_string());
+        let created = DateTime::<Local>::from(std::time::UNIX_EPOCH + Duration::from_secs(session.created_at))
+            .format("%Y-%m-%d %H:%M")
+            .to_string();
+        format!(
+            "{} | runs: {} | span: {} iters | last: {} | created: {}",
+            desc,
+            run_count,
+            total_iters,
+            last_label.unwrap_or_else(|| "n/a".to_string()),
+            created
+        )
+    }
+
+    pub fn open_session_menu(&mut self) {
+        let options = self.session_options();
+        if options.is_empty() {
+            self.set_status("No sessions available", StatusKind::Info);
+            return;
+        }
+        self.choice_menu = Some(ChoiceMenuState {
+            target: ChoiceMenuTarget::Session,
+            label: "Select session".to_string(),
+            options,
+            selected: 0,
+        });
+        self.config_return_mode = Some(self.input_mode);
+        self.input_mode = InputMode::SelectingConfigOption;
     }
 
     pub fn metrics_setting_value(&self, field: MetricsSettingField) -> String {
@@ -4526,6 +4637,27 @@ impl App {
                     self.load_run_overlay_from_rllib_dir(path)?;
                     Ok(())
                 }
+            }
+            ChoiceMenuTarget::Session => {
+                self.exit_choice_menu();
+                match value.as_str() {
+                    "__new__" => {
+                        self.create_and_activate_session()?;
+                    }
+                    "__none__" => {
+                        self.active_session_id = None;
+                        self.session_merged_metrics = None;
+                        self.session_resume_points.clear();
+                        self.session_ghost_runs.clear();
+                        self.metrics_resume_iteration = None;
+                        self.metrics_resume_label = None;
+                        self.set_status("Session view cleared", StatusKind::Info);
+                    }
+                    _ => {
+                        self.set_active_session_by_id(&value)?;
+                    }
+                }
+                Ok(())
             }
         }
     }
@@ -6783,6 +6915,264 @@ impl App {
         had_error
     }
 
+    fn active_session(&self) -> Option<&SessionRecord> {
+        let id = self.active_session_id.as_ref()?;
+        self.sessions.sessions.iter().find(|s| &s.id == id)
+    }
+
+    fn active_session_mut(&mut self) -> Option<&mut SessionRecord> {
+        let id = self.active_session_id.clone()?;
+        self.sessions
+            .sessions
+            .iter_mut()
+            .find(|s| s.id == id)
+    }
+
+    fn run_iter_span(metrics: &[MetricSample]) -> Option<(u64, u64)> {
+        let mut min_iter = None;
+        let mut max_iter = None;
+        for (idx, sample) in metrics.iter().enumerate() {
+            let iter = sample
+                .training_iteration()
+                .unwrap_or_else(|| idx as u64);
+            min_iter = Some(min_iter.map_or(iter, |m: u64| m.min(iter)));
+            max_iter = Some(max_iter.map_or(iter, |m: u64| m.max(iter)));
+        }
+        match (min_iter, max_iter) {
+            (Some(lo), Some(hi)) => Some((lo, hi)),
+            _ => None,
+        }
+    }
+
+    fn session_next_start_iteration(&self) -> u64 {
+        let mut next_start = 0;
+        if let Some(session) = self.active_session() {
+            if let Some(project) = &self.active_project {
+                for link in &session.runs {
+                    let path = project.root_path.join(&link.run_path);
+                    if let Ok(run) = runs::load_saved_run(&path) {
+                        if let Some((lo, hi)) = Self::run_iter_span(&run.metrics) {
+                            let length = hi.saturating_sub(lo);
+                            let end = link.start_iteration.saturating_add(length);
+                            next_start = next_start.max(end.saturating_add(1));
+                        }
+                    }
+                }
+            }
+        }
+        next_start
+    }
+
+    fn refresh_session_view(&mut self) -> Result<()> {
+        self.session_merged_metrics = None;
+        self.session_resume_points.clear();
+        self.session_ghost_runs.clear();
+
+        let Some(project_root) = self.active_project.as_ref().map(|p| p.root_path.clone()) else {
+            return Ok(());
+        };
+        let Some(session) = self.active_session().cloned() else {
+            return Ok(());
+        };
+
+        #[derive(Clone)]
+        struct LoadedRun {
+            start: u64,
+            label: String,
+            metrics: Vec<MetricSample>,
+        }
+
+        let mut loaded: Vec<LoadedRun> = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
+        for link in &session.runs {
+            let path = project_root.join(&link.run_path);
+            match runs::load_saved_run(&path) {
+                Ok(run) => {
+                    if run.metrics.is_empty() {
+                        continue;
+                    }
+                    loaded.push(LoadedRun {
+                        start: link.start_iteration,
+                        label: run.name.clone(),
+                        metrics: run.metrics.clone(),
+                    });
+                }
+                Err(error) => {
+                    warnings.push(format!(
+                        "Could not load run {} for session {}: {}",
+                        path.display(),
+                        session.name,
+                        error
+                    ));
+                }
+            }
+        }
+
+        if loaded.is_empty() {
+            self.session_merged_metrics = Some(Vec::new());
+            return Ok(());
+        }
+
+        let mut merged: Vec<MetricSample> = Vec::new();
+        let mut resume_points: Vec<ResumePoint> = Vec::new();
+        let mut ghost_runs: Vec<GhostRunSegment> = Vec::new();
+
+        for (idx_run, run) in loaded.iter().enumerate() {
+            let next_start = loaded.get(idx_run + 1).map(|r| r.start);
+            if idx_run > 0 {
+                resume_points.push(ResumePoint {
+                    iteration: run.start,
+                    label: format!("{} start", run.label),
+                    color: self.metrics_color_settings.resume_marker_color.clone(),
+                });
+            }
+            let base_iter = Self::run_iter_span(&run.metrics)
+                .map(|(lo, _)| lo)
+                .unwrap_or(0);
+            let mut ghost_samples: Vec<MetricSample> = Vec::new();
+            for (idx, sample) in run.metrics.iter().enumerate() {
+                let local_iter = sample.training_iteration().unwrap_or(idx as u64);
+                let shifted = run.start.saturating_add(local_iter.saturating_sub(base_iter));
+                let mut new_sample = sample.clone();
+                new_sample.set_training_iteration(shifted);
+                new_sample.clear_time_fields();
+                if let Some(boundary) = next_start {
+                    if shifted >= boundary {
+                        ghost_samples.push(new_sample);
+                        continue;
+                    }
+                }
+                merged.push(new_sample);
+            }
+            if let Some(boundary) = next_start {
+                if !ghost_samples.is_empty() {
+                    ghost_runs.push(GhostRunSegment {
+                        label: format!("{} (ghost)", run.label),
+                        metrics: ghost_samples,
+                    });
+                } else {
+                    // If the run had no samples before the next start, still keep a marker.
+                    self.set_status(
+                        format!(
+                            "Run {} has no samples before next resume boundary @{}",
+                            run.label, boundary
+                        ),
+                        StatusKind::Warning,
+                    );
+                }
+            }
+        }
+
+        merged.sort_by_key(|m| m.training_iteration().unwrap_or(0));
+        self.session_merged_metrics = Some(merged);
+        self.session_resume_points = resume_points;
+        self.session_ghost_runs = ghost_runs;
+        self.metrics_resume_iteration = self.session_resume_points.last().map(|p| p.iteration);
+        self.metrics_resume_label = self
+            .session_resume_points
+            .last()
+            .map(|p| p.label.clone());
+        self.metrics_history_index = 0;
+        for warn in warnings {
+            self.set_status(warn, StatusKind::Warning);
+        }
+        Ok(())
+    }
+
+    fn create_and_activate_session(&mut self) -> Result<()> {
+        if self.active_project.is_none() {
+            self.set_status(
+                "Select a project before creating a session",
+                StatusKind::Warning,
+            );
+            return Ok(());
+        }
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let name = generate_session_name(seed);
+        let id = format!("sess-{seed:x}");
+        let record = SessionRecord {
+            id: id.clone(),
+            name: name.clone(),
+            created_at: seed,
+            description: Some(format!("Session {name}")),
+            runs: Vec::new(),
+        };
+        self.sessions.sessions.push(record);
+        self.active_session_id = Some(id.clone());
+        self.persist_sessions().ok();
+        self.refresh_session_view()?;
+        self.set_status(
+            format!("Created new session {}", name),
+            StatusKind::Success,
+        );
+        Ok(())
+    }
+
+    fn set_active_session_by_id(&mut self, id: &str) -> Result<()> {
+        if self
+            .sessions
+            .sessions
+            .iter()
+            .any(|session| session.id == id)
+        {
+            self.active_session_id = Some(id.to_string());
+            self.refresh_session_view()?;
+            self.set_status(
+                format!("Loaded session {}", id),
+                StatusKind::Success,
+            );
+        } else {
+            self.set_status(
+                format!("Session {} not found", id),
+                StatusKind::Warning,
+            );
+        }
+        Ok(())
+    }
+
+    fn append_run_to_active_session(&mut self, run_path: &Path, start_iteration: u64) {
+        let Some(project_root) = self.active_project.as_ref().map(|p| p.root_path.clone()) else {
+            return;
+        };
+
+        let mut start_iteration = start_iteration;
+        if start_iteration == 0 {
+            if let Ok(run) = runs::load_saved_run(run_path) {
+                if let Some((lo, _)) = Self::run_iter_span(&run.metrics) {
+                    start_iteration = lo;
+                }
+            }
+        }
+        let rel_path = match run_path.strip_prefix(&project_root) {
+            Ok(p) => p.to_path_buf(),
+            Err(_) => run_path.to_path_buf(),
+        };
+
+        let Some(session) = self.active_session_mut() else {
+            return;
+        };
+
+        session.runs.push(SessionRunLink {
+            run_path: rel_path.to_string_lossy().to_string(),
+            start_iteration,
+        });
+        if let Err(err) = self.persist_sessions() {
+            self.set_status(
+                format!("Failed to save sessions: {}", err),
+                StatusKind::Warning,
+            );
+        }
+        if let Err(err) = self.refresh_session_view() {
+            self.set_status(
+                format!("Failed to refresh session view: {}", err),
+                StatusKind::Warning,
+            );
+        }
+    }
+
     fn load_mars_config_for_active_project(&mut self) -> bool {
         let mut had_error = false;
         if let Some(path) = self.mars_config_path() {
@@ -6858,6 +7248,73 @@ impl App {
                 .join(PROJECT_CONFIG_DIR)
                 .join(METRICS_SETTINGS_FILENAME)
         })
+    }
+
+    fn sessions_path(&self) -> Option<PathBuf> {
+        self.active_project.as_ref().map(|project| {
+            project
+                .root_path
+                .join(PROJECT_CONFIG_DIR)
+                .join(SESSION_STORE_FILENAME)
+        })
+    }
+
+    fn persist_sessions(&mut self) -> Result<()> {
+        if let Some(path) = self.sessions_path() {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).wrap_err_with(|| {
+                    format!(
+                        "failed to create session directory {}",
+                        parent.display()
+                    )
+                })?;
+            }
+            let json = serde_json::to_string_pretty(&self.sessions).wrap_err_with(|| {
+                format!("failed to serialize session store for {}", path.display())
+            })?;
+            fs::write(&path, json)
+                .wrap_err_with(|| format!("failed to write sessions to {}", path.display()))?;
+        }
+        Ok(())
+    }
+
+    fn load_sessions_for_active_project(&mut self) -> bool {
+        let mut had_error = false;
+        self.sessions = SessionStore::default();
+        self.active_session_id = None;
+        self.session_merged_metrics = None;
+        self.session_resume_points.clear();
+        self.session_ghost_runs.clear();
+
+        if let Some(path) = self.sessions_path() {
+            if path.exists() {
+                match fs::read_to_string(&path) {
+                    Ok(contents) => match serde_json::from_str::<SessionStore>(&contents) {
+                        Ok(store) => {
+                            self.sessions = store;
+                        }
+                        Err(error) => {
+                            self.sessions = SessionStore::default();
+                            self.set_status(
+                                format!("Invalid sessions file, using empty list: {}", error),
+                                StatusKind::Warning,
+                            );
+                            had_error = true;
+                        }
+                    },
+                    Err(error) => {
+                        self.sessions = SessionStore::default();
+                        self.set_status(
+                            format!("Failed to read sessions file, using empty list: {error}"),
+                            StatusKind::Warning,
+                        );
+                        had_error = true;
+                    }
+                }
+            }
+        }
+
+        had_error
     }
 
     fn persist_metrics_settings(&mut self) -> Result<()> {
@@ -8760,6 +9217,37 @@ impl App {
             }
         }
 
+        for ghost in &self.session_ghost_runs {
+            let metrics = &ghost.metrics;
+            let len = metrics.len();
+            let start = len.saturating_sub(max_points);
+            let mut points = Vec::new();
+            for (idx, sample) in metrics.iter().enumerate().skip(start) {
+                if let Some(value) = App::chart_value_for_sample(sample, option) {
+                    let x = sample
+                        .training_iteration()
+                        .map(|iter| iter as f64)
+                        .unwrap_or_else(|| idx as f64);
+                    points.push((x, value));
+                }
+            }
+            if !points.is_empty() {
+                if align_to_start {
+                    if let Some((first_x, _)) = points.first().copied() {
+                        for p in points.iter_mut() {
+                            p.0 -= first_x;
+                        }
+                    }
+                }
+                let points = apply_chart_smoothing(&points, smoothing);
+                overlays.push(ChartOverlaySeries {
+                    label: ghost.label.clone(),
+                    color: Color::DarkGray,
+                    points,
+                });
+            }
+        }
+
         for (idx_overlay, overlay) in self.saved_run_overlays.iter().enumerate() {
             let metrics = overlay.metrics();
             let len = metrics.len();
@@ -8833,8 +9321,9 @@ impl App {
         let training_error = self.load_training_config_for_active_project();
         let export_error = self.load_export_state_for_active_project();
         let metrics_error = self.load_metrics_settings_for_active_project();
+        let sessions_error = self.load_sessions_for_active_project();
         self.refresh_projects(Some(project.logs_path.clone()))?;
-        if !training_error && !export_error && !metrics_error {
+        if !training_error && !export_error && !metrics_error && !sessions_error {
             self.set_status(
                 format!("Active project: {}", project.name),
                 StatusKind::Success,
@@ -8877,6 +9366,9 @@ impl App {
         } else {
             self.resume_baseline = None;
         }
+        self.session_merged_metrics = None;
+        self.session_resume_points.clear();
+        self.session_ghost_runs.clear();
         self.drop_archived_run_view();
         self.training_receiver = None;
         self.training_cancel = None;
@@ -8887,6 +9379,11 @@ impl App {
         }
         self.training_metrics.clear();
         self.current_run_start = Some(SystemTime::now());
+        self.current_run_start_iteration = if self.active_session_id.is_some() {
+            Some(self.session_next_start_iteration())
+        } else {
+            None
+        };
         self.metrics_history_index = 0;
         self.metrics_chart_index = 0;
         let now = Instant::now();
@@ -9055,6 +9552,9 @@ impl App {
                             format!("Resume baseline from {}", display)
                         };
                         self.stage_resume_point(iteration, label);
+                        if self.active_session_id.is_some() {
+                            self.current_run_start_iteration = Some(iteration);
+                        }
                     }
                     self.metrics_resume_label = Some(format!("Resume baseline from {}", display));
                     args.push(format!("--resume={}", path.to_string_lossy()));
@@ -9110,6 +9610,10 @@ impl App {
         self.training_running = true;
         self.metrics_timeline.clear();
         self.clear_resume_markers();
+        self.session_merged_metrics = None;
+        self.session_resume_points.clear();
+        self.session_ghost_runs.clear();
+        self.current_run_start_iteration = None;
         self.training_metrics.clear();
         self.current_run_start = Some(SystemTime::now());
         self.metrics_history_index = 0;
@@ -10459,6 +10963,12 @@ impl App {
                     format!("Saved run metrics to {}", path.display()),
                     StatusKind::Success,
                 );
+                if self.active_session_id.is_some() {
+                    let start_iter = self
+                        .current_run_start_iteration
+                        .unwrap_or_else(|| self.session_next_start_iteration());
+                    self.append_run_to_active_session(&path, start_iter);
+                }
             }
             Err(error) => {
                 self.set_status(format!("Failed to save run: {error}"), StatusKind::Error);
@@ -10466,6 +10976,7 @@ impl App {
         }
 
         self.current_run_start = None;
+        self.current_run_start_iteration = None;
     }
 
     fn append_export_line(&mut self, line: impl Into<String>) {

@@ -1,6 +1,7 @@
 pub mod config;
 pub mod file_browser;
 pub mod metrics;
+pub mod sessions;
 pub mod runs;
 mod state;
 

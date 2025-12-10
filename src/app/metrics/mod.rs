@@ -235,6 +235,16 @@ impl MetricSample {
     pub(crate) fn set_time_this_iter_s(&mut self, value: f64) {
         self.time_this_iter_s = Some(value);
     }
+
+    pub(crate) fn set_training_iteration(&mut self, value: u64) {
+        self.training_iteration = Some(value);
+    }
+
+    /// Clear cumulative timing fields so merged timelines don't show misleading wall times.
+    pub(crate) fn clear_time_fields(&mut self) {
+        self.time_total_s = None;
+        self.time_this_iter_s = None;
+    }
 }
 
 impl Default for MetricSample {

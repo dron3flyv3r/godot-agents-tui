@@ -1707,26 +1707,35 @@ fn render_metrics_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let available_height = area.height.saturating_sub(2) as usize; // Account for borders
 
         // Header with position - always on one line - Selected: <position>  Iter: <iteration>  Checkpoint: <number>
+        let checkpoint_display = sample
+            .checkpoints()
+            .map(|c| {
+            let val = c as i64 - 1;
+            if val < 0 {
+                "-".to_string()
+            } else {
+                val.to_string()
+            }
+            })
+            .unwrap_or_else(|| "-".to_string());
+
         lines.push(Line::from(vec![
             Span::styled("Selected: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                position_text,
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+            position_text,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
             Span::styled("Iter: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format_option_u64(sample.training_iteration()),
-                Style::default().fg(Color::Cyan),
+            format_option_u64(sample.training_iteration()),
+            Style::default().fg(Color::Cyan),
             ),
             Span::raw("  "),
             Span::styled("Checkpoint: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                sample.checkpoints().unwrap_or_default().to_string(),
-                Style::default().fg(Color::Cyan),
-            ),
+            Span::styled(checkpoint_display, Style::default().fg(Color::Cyan)),
         ]));
 
         // Timesteps and Episodes - smart wrap based on width
@@ -2147,43 +2156,49 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         Vec::new()
     };
-    let resume_split = resume_markers.last().map(|(x, _, _, _)| *x);
+    let mut resume_boundaries: Vec<f64> = resume_markers.iter().map(|(x, _, _, _)| *x).collect();
+    resume_boundaries.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut owned_segments: Vec<(String, Vec<(f64, f64)>, Color)> = Vec::new();
     if let Some(chart_data) = &chart_data {
-        if let Some(rx) = resume_split {
-            let (before, after): (Vec<_>, Vec<_>) = chart_data
-                .points
-                .iter()
-                .cloned()
-                .partition(|(x, _)| *x <= rx);
-            if !before.is_empty() {
-                owned_segments.push((
-                    format!("{} (pre)", chart_data.label),
-                    before,
-                    resume_before_color,
-                ));
-            }
-            if !after.is_empty() {
-                owned_segments.push((
-                    format!("{} (post)", chart_data.label),
-                    after,
-                    resume_after_color,
-                ));
-            }
-            if owned_segments.is_empty() {
-                owned_segments.push((
-                    chart_data.label.clone(),
-                    chart_data.points.clone(),
-                    primary_color,
-                ));
-            }
-        } else {
+        if resume_boundaries.is_empty() {
             owned_segments.push((
                 chart_data.label.clone(),
                 chart_data.points.clone(),
                 primary_color,
             ));
+        } else {
+            let mut current_points: Vec<(f64, f64)> = Vec::new();
+            let mut boundary_iter = resume_boundaries.iter().peekable();
+            let mut current_color = resume_before_color;
+            let mut part_idx = 1;
+
+            for (x, y) in &chart_data.points {
+                while let Some(boundary) = boundary_iter.peek() {
+                    if x >= *boundary {
+                        if !current_points.is_empty() {
+                            owned_segments.push((
+                                format!("{} part {}", chart_data.label, part_idx),
+                                std::mem::take(&mut current_points),
+                                current_color,
+                            ));
+                            part_idx += 1;
+                        }
+                        current_color = resume_after_color;
+                        boundary_iter.next();
+                    } else {
+                        break;
+                    }
+                }
+                current_points.push((*x, *y));
+            }
+            if !current_points.is_empty() {
+                owned_segments.push((
+                    format!("{} part {}", chart_data.label, part_idx),
+                    current_points,
+                    current_color,
+                ));
+            }
         }
     }
 
