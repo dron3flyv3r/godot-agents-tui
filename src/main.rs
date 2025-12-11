@@ -52,6 +52,7 @@ fn handle_key_event(app: &mut App, key: KeyCode) -> Result<()> {
         InputMode::EditingChartExportOption => handle_chart_export_option_edit_input(app, key)?,
         InputMode::MetricsSettings => handle_metrics_settings_input(app, key)?,
         InputMode::EditingMetricsSetting => handle_metrics_setting_edit_input(app, key)?,
+        InputMode::EditingProjectArchive => handle_project_archive_edit_input(app, key)?,
         InputMode::Normal => handle_normal_mode_key(app, key)?,
     }
     Ok(())
@@ -95,8 +96,9 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
         KeyCode::Char('3') => app.activate(TabId::Metrics),
         KeyCode::Char('4') => app.activate(TabId::Simulator),
         KeyCode::Char('5') => app.activate(TabId::Interface),
-        KeyCode::Char('6') => app.activate(TabId::Export),
-        KeyCode::Char('7') => app.activate(TabId::Settings),
+        KeyCode::Char('6') => app.activate(TabId::ExportModel),
+        KeyCode::Char('7') => app.activate(TabId::Projects),
+        KeyCode::Char('8') => app.activate(TabId::Settings),
         KeyCode::Home => app.activate(TabId::Home),
         KeyCode::End => app.activate(TabId::Settings),
         _ => {}
@@ -110,6 +112,9 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
             KeyCode::Char('n') => app.start_project_creation(),
             KeyCode::Char('p') | KeyCode::Char('P') => app.refresh_python_environment(),
             KeyCode::Char('r') | KeyCode::Char('R') => app.force_refresh_projects()?,
+            KeyCode::Char('o') | KeyCode::Char('O') => {
+                app.start_project_archive_import_browser_view_only();
+            }
             _ => {}
         }
     } else if app.active_tab().id == TabId::Train {
@@ -379,7 +384,7 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
             KeyCode::PageDown => app.interface_scroll_down(10),
             _ => {}
         }
-    } else if app.active_tab().id == TabId::Export {
+    } else if app.active_tab().id == TabId::ExportModel {
         match key {
             KeyCode::Char('x') => app.start_export()?,
             KeyCode::Char('c') | KeyCode::Char('C') => app.cancel_export(),
@@ -439,6 +444,45 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
             KeyCode::PageDown => app.scroll_export_output_down(10),
             _ => {}
         }
+    } else if app.active_tab().id == TabId::Projects {
+        match key {
+            KeyCode::Char('x') | KeyCode::Char('X') => app.start_project_archive_export()?,
+            KeyCode::Char('i') | KeyCode::Char('I') => app.start_project_archive_import_browser(),
+            KeyCode::Char('r') | KeyCode::Char('R') => app.toggle_project_archive_read_only(),
+            KeyCode::Char('m') | KeyCode::Char('M') => app.toggle_project_archive_models(),
+            KeyCode::Char('d') | KeyCode::Char('D') => app.toggle_project_archive_runs(),
+            KeyCode::Char('l') | KeyCode::Char('L') => app.toggle_project_archive_logs(),
+            KeyCode::Char('s') | KeyCode::Char('S') => app.toggle_project_archive_scope(),
+            KeyCode::Char('p') | KeyCode::Char('P') => app.start_project_archive_output_browser(),
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
+                match app.project_archive_focus() {
+                    app::ProjectArchiveFocus::Options => {
+                        app.select_previous_project_archive_field();
+                    }
+                    app::ProjectArchiveFocus::Sessions => {
+                        app.select_previous_project_archive_session();
+                    }
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+                match app.project_archive_focus() {
+                    app::ProjectArchiveFocus::Options => app.select_next_project_archive_field(),
+                    app::ProjectArchiveFocus::Sessions => app.select_next_project_archive_session(),
+                }
+            }
+            KeyCode::Tab | KeyCode::BackTab => app.toggle_project_archive_focus(),
+            KeyCode::Enter | KeyCode::Char(' ') => match app.project_archive_focus() {
+                app::ProjectArchiveFocus::Options => app.project_archive_toggle_or_edit(),
+                app::ProjectArchiveFocus::Sessions => {
+                    let idx = app.project_archive_session_selection();
+                    let sessions = app.project_archive_sessions();
+                    if let Some(session) = sessions.get(idx) {
+                        app.toggle_project_archive_session(&session.id);
+                    }
+                }
+            },
+            _ => {}
+        }
     } else if app.active_tab().id == TabId::Settings {
         match key {
             KeyCode::Down | KeyCode::Char('j') => app.select_next_setting(),
@@ -459,6 +503,17 @@ fn handle_config_edit_input(app: &mut App, key: KeyCode) -> Result<()> {
         KeyCode::Esc => app.cancel_config_edit(),
         KeyCode::Backspace => app.pop_config_char(),
         KeyCode::Char(ch) => app.push_config_char(ch),
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_project_archive_edit_input(app: &mut App, key: KeyCode) -> Result<()> {
+    match key {
+        KeyCode::Enter => app.confirm_project_archive_edit(),
+        KeyCode::Esc => app.cancel_project_archive_edit(),
+        KeyCode::Backspace => app.pop_project_archive_char(),
+        KeyCode::Char(ch) => app.push_project_archive_char(ch),
         _ => {}
     }
     Ok(())

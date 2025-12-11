@@ -1,6 +1,7 @@
 use ratatui::Frame;
 
 use crate::app::{App, InputMode, TabId};
+use ratatui::widgets::Clear;
 
 use super::components::render_tabs;
 use super::layout::split_layout;
@@ -61,8 +62,23 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         TabId::Metrics => screens::render_metrics(frame, content_area, app),
         TabId::Simulator => screens::render_simulator(frame, content_area, app),
         TabId::Interface => screens::render_interface(frame, content_area, app),
-        TabId::Export => screens::render_export(frame, content_area, app),
+        TabId::ExportModel => screens::render_export(frame, content_area, app),
+        TabId::Projects => screens::render_projects(frame, content_area, app),
         TabId::Settings => screens::render_settings(frame, content_area, app),
         tab => screens::render_placeholder(frame, content_area, tab, app),
+    }
+
+    // Loading overlay when long tasks run
+    if app.is_export_running() {
+        let area = frame.area();
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .title("Working...")
+            .style(ratatui::style::Style::default().fg(ratatui::style::Color::Yellow));
+        let message = ratatui::widgets::Paragraph::new("Please wait, export in progress...")
+            .block(block)
+            .alignment(ratatui::layout::Alignment::Center);
+        frame.render_widget(Clear, area);
+        frame.render_widget(message, area);
     }
 }

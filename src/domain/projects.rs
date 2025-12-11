@@ -19,6 +19,8 @@ pub struct ProjectInfo {
     pub root_path: PathBuf,
     pub logs_path: PathBuf,
     pub last_used: SystemTime,
+    pub read_only: bool,
+    pub source_archive: Option<PathBuf>,
 }
 
 impl ProjectInfo {
@@ -40,6 +42,10 @@ struct ProjectRecord {
     #[serde(default)]
     logs_path: Option<PathBuf>,
     last_used: u64,
+    #[serde(default)]
+    read_only: bool,
+    #[serde(default)]
+    source_archive: Option<PathBuf>,
 }
 
 impl From<&ProjectInfo> for ProjectRecord {
@@ -49,6 +55,8 @@ impl From<&ProjectInfo> for ProjectRecord {
             path: info.root_path.clone(),
             logs_path: Some(info.logs_path.clone()),
             last_used: system_time_to_unix(info.last_used),
+            read_only: info.read_only,
+            source_archive: info.source_archive.clone(),
         }
     }
 }
@@ -62,6 +70,8 @@ impl From<ProjectRecord> for ProjectInfo {
             root_path,
             logs_path,
             last_used: unix_to_system_time(record.last_used),
+            read_only: record.read_only,
+            source_archive: record.source_archive,
         }
     }
 }
@@ -79,6 +89,10 @@ impl ProjectManager {
         })?;
         let index_path = root.join(INDEX_FILENAME);
         Ok(Self { root, index_path })
+    }
+
+    pub fn root(&self) -> PathBuf {
+        self.root.clone()
     }
 
     pub fn default_project_dir_for(&self, name: &str) -> PathBuf {
@@ -149,6 +163,57 @@ impl ProjectManager {
             root_path: root.clone(),
             logs_path: logs_path.clone(),
             last_used: SystemTime::now(),
+            read_only: false,
+            source_archive: None,
+        };
+
+        self.write_metadata(&info)?;
+
+        let mut projects = self.list_projects()?;
+        projects.push(info.clone());
+        projects.sort_by(|a: &ProjectInfo, b: &ProjectInfo| {
+            system_time_to_unix(b.last_used).cmp(&system_time_to_unix(a.last_used))
+        });
+        if projects.len() > RECENT_LIMIT {
+            projects.truncate(RECENT_LIMIT);
+        }
+        self.save_index_from_projects(&projects)?;
+
+        Ok(info)
+    }
+
+    pub fn register_imported_project(
+        &self,
+        name: &str,
+        root_path: PathBuf,
+        read_only: bool,
+        source_archive: Option<PathBuf>,
+    ) -> Result<ProjectInfo> {
+        let cleaned = name.trim();
+        if cleaned.is_empty() {
+            bail!("Project name cannot be empty");
+        }
+
+        let mut root = root_path;
+        if !root.is_absolute() {
+            root = std::env::current_dir()
+                .wrap_err("failed to determine current directory")?
+                .join(root);
+        }
+
+        fs::create_dir_all(&root)
+            .wrap_err_with(|| format!("failed to create project directory {}", root.display()))?;
+        let logs_path = root.join("logs");
+        fs::create_dir_all(&logs_path)
+            .wrap_err_with(|| format!("failed to create logs directory {}", logs_path.display()))?;
+
+        let info = ProjectInfo {
+            name: cleaned.to_string(),
+            root_path: root.clone(),
+            logs_path: logs_path.clone(),
+            last_used: SystemTime::now(),
+            read_only,
+            source_archive,
         };
 
         self.write_metadata(&info)?;
@@ -184,6 +249,8 @@ impl ProjectManager {
                 root_path: project.root_path.clone(),
                 logs_path: project.logs_path.clone(),
                 last_used: SystemTime::now(),
+                read_only: project.read_only,
+                source_archive: project.source_archive.clone(),
             });
         }
 

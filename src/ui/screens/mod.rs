@@ -18,6 +18,7 @@ use crate::app::{
     SimulatorFocus, StatusKind, SummaryVerbosity, TabId,
 };
 use ratatui::widgets::LegendPosition;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::utils::alphanumeric_sort_key;
 
@@ -104,28 +105,68 @@ fn build_axis_labels(
     labels
 }
 
-pub fn render_home(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let constraints = if area.height >= 16 {
-        [
-            Constraint::Length(4),
-            Constraint::Length(4),
-            Constraint::Min(5),
-            Constraint::Length(3),
-        ]
-    } else if area.height >= 12 {
-        [
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Min(3),
-            Constraint::Length(2),
-        ]
+fn format_duration_short(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3_600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3_600)
     } else {
-        [
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Min(2),
-            Constraint::Length(2),
-        ]
+        format!("{:.1}d ago", secs as f64 / 86_400.0)
+    }
+}
+
+fn format_system_time_relative(time: SystemTime) -> String {
+    match SystemTime::now().duration_since(time) {
+        Ok(delta) => format_duration_short(delta),
+        Err(_) => "just now".to_string(),
+    }
+}
+
+fn format_unix_relative(timestamp: u64) -> String {
+    let time = UNIX_EPOCH + Duration::from_secs(timestamp);
+    format_system_time_relative(time)
+}
+
+pub fn render_home(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(8), Constraint::Length(3)])
+        .split(area);
+
+    let main = vertical[0];
+    let status = vertical[1];
+
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(main);
+
+    render_project_list(frame, columns[0], app);
+    render_project_overview(frame, columns[1], app);
+    render_home_status(frame, status, app);
+}
+
+fn render_project_overview(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if app.projects().is_empty() {
+        let placeholder = Paragraph::new("No projects yet. Press 'n' to create one.")
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Project Details"),
+            )
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(placeholder, area);
+        return;
+    }
+
+    let constraints: Vec<Constraint> = if area.height >= 12 {
+        vec![Constraint::Min(7), Constraint::Length(5)]
+    } else {
+        vec![Constraint::Min(5)]
     };
 
     let chunks = Layout::default()
@@ -133,27 +174,54 @@ pub fn render_home(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .constraints(constraints)
         .split(area);
 
-    render_active_project(frame, chunks[0], app);
-    render_python_environment(frame, chunks[1], app);
-    render_project_list(frame, chunks[2], app);
-    render_home_status(frame, chunks[3], app);
-}
+    let project = app
+        .selected_project()
+        .or_else(|| app.active_project())
+        .or_else(|| app.projects().first());
 
-fn render_active_project(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let (title, detail) = if let Some(project) = app.active_project() {
-        (
-            "Active Project",
-            format!(
-                "{}\nRoot: {}\nLogs: {}",
-                project.name,
-                project.root_path.display(),
-                project.logs_path.display()
-            ),
-        )
+    let mut lines = Vec::new();
+    let title = "Project Details";
+
+    if let Some(project) = project {
+        let mut header = project.name.clone();
+        if project.read_only {
+            header.push_str(" [RO]");
+        }
+        if project.source_archive.is_some() {
+            header.push_str(" [Linked]");
+        }
+        lines.push(header);
+        lines.push(format!("Root: {}", project.root_path.display()));
+        lines.push(format!("Logs: {}", project.logs_path.display()));
+        lines.push(format!(
+            "Last used: {}",
+            format_system_time_relative(project.last_used)
+        ));
+        let session_count = app.session_count_for_project(project);
+        let agent_label = app
+            .training_mode_label_for(project)
+            .or_else(|| app.training_mode_label())
+            .unwrap_or_else(|| "Unknown".to_string());
+        lines.push(format!(
+            "Sessions: {} • Agent: {}",
+            session_count, agent_label
+        ));
+        if let Some((name, ts, runs)) = app.project_last_session_info(project) {
+            lines.push(format!(
+                "Latest session: {} • {} • runs: {}",
+                name,
+                format_unix_relative(ts),
+                runs
+            ));
+        } else {
+            lines.push("Latest session: None yet".to_string());
+        }
+        lines.push("Stats are cached on project scan.".to_string());
     } else {
-        ("Active Project", "No project selected".to_string())
-    };
+        lines.push("No project selected".to_string());
+    }
 
+    let detail = lines.join("\n");
     let block = Block::default().borders(Borders::ALL).title(title);
     let paragraph = Paragraph::new(detail)
         .block(block)
@@ -161,7 +229,11 @@ fn render_active_project(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .wrap(Wrap { trim: true })
         .style(Style::default().fg(Color::White));
 
-    frame.render_widget(paragraph, area);
+    frame.render_widget(paragraph, chunks[0]);
+
+    if chunks.len() > 1 {
+        render_python_environment(frame, chunks[1], app);
+    }
 }
 
 fn render_python_environment(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -237,14 +309,36 @@ fn render_project_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .iter()
         .map(|project| {
             let mut spans = Vec::new();
-            if active_path.map_or(false, |path| path == &project.logs_path) {
-                spans.push(Span::styled("● ", Style::default().fg(Color::LightGreen)));
+            let is_active = active_path.map_or(false, |path| path == &project.logs_path);
+            let session_count = app.session_count_for_project(project);
+            let agent_label = app
+                .training_mode_label_for(project)
+                .unwrap_or_else(|| "Unknown".to_string());
+            spans.push(if is_active {
+                Span::styled("● ", Style::default().fg(Color::LightGreen))
             } else {
-                spans.push(Span::raw("  "));
-            }
+                Span::raw("  ")
+            });
             spans.push(Span::styled(
                 project.name.clone(),
                 Style::default().fg(Color::White),
+            ));
+            if project.read_only {
+                spans.push(Span::styled(" [RO]", Style::default().fg(Color::LightRed)));
+            }
+            if project.source_archive.is_some() {
+                spans.push(Span::styled(" [Linked]", Style::default().fg(Color::Cyan)));
+            }
+            spans.push(Span::styled(
+                format!(
+                    "  • used {}",
+                    format_system_time_relative(project.last_used)
+                ),
+                Style::default().fg(Color::DarkGray),
+            ));
+            spans.push(Span::styled(
+                format!("  • sessions: {} • agent: {}", session_count, agent_label),
+                Style::default().fg(Color::DarkGray),
             ));
             ListItem::new(Line::from(spans))
         })
@@ -368,6 +462,7 @@ fn render_home_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         | InputMode::EditingMetricsSetting => {
             // These modes have their own full-screen renders
         }
+        InputMode::EditingProjectArchive => todo!(),
     }
 
     let paragraph = Paragraph::new(lines)
@@ -3784,6 +3879,152 @@ pub fn render_export(frame: &mut Frame<'_>, area: Rect, app: &App) {
     render_export_status(frame, chunks[2], app);
 }
 
+pub fn render_projects(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(8),
+            Constraint::Length(5),
+        ])
+        .split(area);
+
+    // Header with active project info
+    let project_line = if let Some(project) = app.active_project() {
+        let mut line = format!("Active project: {}", project.name);
+        if project.read_only {
+            line.push_str(" [read-only]");
+        }
+        line
+    } else {
+        "No active project selected".to_string()
+    };
+    let header = Paragraph::new(Line::from(project_line))
+        .block(Block::default().borders(Borders::ALL).title("Project"))
+        .alignment(Alignment::Left);
+    frame.render_widget(header, chunks[0]);
+
+    // Options + sessions columns
+    let body_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[1]);
+
+    // Settings list
+    let fields = app.project_archive_fields();
+    let mut items = Vec::new();
+    for field in fields {
+        let label = App::project_archive_field_label(*field);
+        let value = app.project_archive_field_value(*field);
+        let content = Line::from(vec![
+            Span::styled(label, Style::default().fg(Color::Yellow)),
+            Span::raw(": "),
+            Span::styled(value, Style::default().fg(Color::Cyan)),
+        ]);
+        items.push(ListItem::new(content));
+    }
+    let mut state = ListState::default();
+    if !items.is_empty() {
+        state.select(Some(app.project_archive_selection().min(items.len() - 1)));
+    }
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Archive options (Enter to toggle/edit)"),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol(
+            if matches!(
+                app.project_archive_focus(),
+                crate::app::ProjectArchiveFocus::Options
+            ) {
+                "> "
+            } else {
+                "  "
+            },
+        );
+    frame.render_stateful_widget(list, body_cols[0], &mut state);
+
+    // Session picker
+    let mut session_items = Vec::new();
+    let sessions = app.project_archive_sessions();
+    for session in sessions.iter() {
+        let selected = app
+            .project_archive_selected_sessions()
+            .iter()
+            .any(|id| id == &session.id);
+        let marker = if selected { "[x]" } else { "[ ]" };
+        let label = format!("{} {}", marker, session.name);
+        session_items.push(ListItem::new(Line::from(label)));
+    }
+    let mut session_state = ListState::default();
+    if !session_items.is_empty() {
+        session_state.select(Some(
+            app.project_archive_session_selection()
+                .min(session_items.len().saturating_sub(1)),
+        ));
+    }
+    let session_block = Block::default()
+        .borders(Borders::ALL)
+        .title("Sessions (Tab to focus, Enter to toggle)");
+    let session_list = List::new(session_items)
+        .block(session_block)
+        .highlight_style(
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol(
+            if matches!(
+                app.project_archive_focus(),
+                crate::app::ProjectArchiveFocus::Sessions
+            ) {
+                "> "
+            } else {
+                "  "
+            },
+        );
+    frame.render_stateful_widget(session_list, body_cols[1], &mut session_state);
+
+    // Instructions / status
+    let mut instructions = Vec::new();
+    instructions.push(Line::from(
+        "Up/Down: select • Enter/Space: toggle/edit • Tab: switch panel • x: export • i: import",
+    ));
+    instructions.push(Line::from(
+        "m/d/l/c/s: toggle models/runs/logs/configs/scripts • r: read-only • p: pick output path",
+    ));
+    instructions.push(Line::from(
+        "Hint: Import archives from Projects tab (i). You can also start import from Home by choosing the project after extraction.",
+    ));
+    if app.input_mode() == InputMode::EditingProjectArchive {
+        instructions.push(Line::from(Span::styled(
+            format!("Editing name: {}", app.project_archive_edit_buffer()),
+            Style::default().fg(Color::LightGreen),
+        )));
+        instructions.push(Line::from("Enter to save • Esc to cancel"));
+    }
+    let status_line = app
+        .status()
+        .map(|s| s.text.clone())
+        .unwrap_or_else(|| "Ready".to_string());
+    instructions.push(Line::from(Span::styled(
+        format!("Status: {}", status_line),
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let footer = Paragraph::new(instructions)
+        .block(Block::default().borders(Borders::ALL).title("Controls"))
+        .alignment(Alignment::Left)
+        .wrap(Wrap { trim: true });
+    frame.render_widget(footer, chunks[2]);
+}
+
 fn render_export_config(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let export_mode = app.export_mode();
     let focus = app.export_focus();
@@ -4115,7 +4356,8 @@ pub fn render_placeholder(frame: &mut Frame<'_>, area: Rect, tab: TabId, app: &A
         TabId::Metrics => "Metrics view pending",
         TabId::Simulator => "Simulator view pending",
         TabId::Interface => "Interface view pending",
-        TabId::Export => unreachable!(),
+        TabId::ExportModel => unreachable!(),
+        TabId::Projects => "Projects view pending",
         TabId::Settings => "Settings pending",
     };
 
@@ -4199,7 +4441,7 @@ fn build_help_sections(app: &App) -> Vec<(String, Vec<String>)> {
         vec![
             "h / F1   Toggle this help overlay".to_string(),
             "q / Esc  Quit (when idle) or back out of dialogs".to_string(),
-            "1-7      Jump to Home, Train, Metrics, Simulator, Interface, Export, Settings"
+            "1-8      Jump to Home, Train, Metrics, Simulator, Interface, Export Model, Projects, Settings"
                 .to_string(),
             "Home/End Jump to Home or Settings tab".to_string(),
         ],
@@ -4211,7 +4453,8 @@ fn build_help_sections(app: &App) -> Vec<(String, Vec<String>)> {
         TabId::Metrics => ("Metrics tab".to_string(), metrics_help_lines(app)),
         TabId::Simulator => ("Simulator tab".to_string(), simulator_help_lines()),
         TabId::Interface => ("Interface tab".to_string(), interface_help_lines()),
-        TabId::Export => ("Export tab".to_string(), export_help_lines()),
+        TabId::ExportModel => ("Export Model tab".to_string(), export_help_lines()),
+        TabId::Projects => ("Projects tab".to_string(), projects_help_lines()),
         TabId::Settings => ("Settings tab".to_string(), settings_help_lines()),
     };
     sections.push(tab_section);
@@ -4318,6 +4561,14 @@ fn export_help_lines() -> Vec<String> {
         "Up/Down / j/k  Navigate options or scroll output".to_string(),
         "PgUp/PgDn      Fast-scroll the export log".to_string(),
         "Backspace      Clear the selected option (when options are focused)".to_string(),
+    ]
+}
+
+fn projects_help_lines() -> Vec<String> {
+    vec![
+        "x              Export project or session (future)".to_string(),
+        "i              Import project/session archive (future)".to_string(),
+        "Enter          Confirm selections when prompted".to_string(),
     ]
 }
 

@@ -7,6 +7,8 @@ pub enum FileBrowserTarget {
     Config(ConfigField),
     Export(ExportField),
     ProjectLocation,
+    ProjectImportArchive,
+    ProjectExportPath,
     SavedRun,
     SimulatorEnvPath,
     InterfaceAgentPath,

@@ -2,7 +2,7 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::ops::Index;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Local};
 use color_eyre::{
-    eyre::{bail, WrapErr},
+    eyre::{bail, eyre, WrapErr},
     Result,
 };
 use plotters::prelude::{
@@ -29,7 +29,9 @@ use super::config::{
 use super::file_browser::{FileBrowserEntry, FileBrowserKind, FileBrowserState, FileBrowserTarget};
 use super::metrics::{ChartData, ChartMetricKind, ChartMetricOption, MetricSample};
 use super::runs::{self, RllibRunInfo, SavedRun};
-use super::sessions::{generate_session_name, SessionRecord, SessionRunLink, SessionStore};
+use super::sessions::{
+    generate_session_name, SessionRecord, SessionRunLink, SessionStore, SESSION_STORE_VERSION,
+};
 use crate::domain::projects::PROJECT_CONFIG_DIR;
 use crate::domain::{ProjectInfo, ProjectManager};
 use ratatui::style::Color;
@@ -185,7 +187,8 @@ pub enum TabId {
     Metrics,
     Simulator,
     Interface,
-    Export,
+    ExportModel,
+    Projects,
     Settings,
 }
 
@@ -193,6 +196,62 @@ pub enum TabId {
 pub enum AppMode {
     Standard,
     Experimental,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum ProjectArchiveScope {
+    Project,
+    Session,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProjectArchiveField {
+    Name,
+    Scope,
+    ReadOnly,
+    OutputPath,
+    IncludeModels,
+    IncludeRuns,
+    IncludeLogs,
+    IncludeConfigs,
+    IncludeScripts,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectArchiveFocus {
+    Options,
+    Sessions,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ProjectArchiveOptions {
+    name: String,
+    scope: ProjectArchiveScope,
+    read_only: bool,
+    output_path: Option<String>,
+    selected_sessions: Vec<String>,
+    include_models: bool,
+    include_runs: bool,
+    include_logs: bool,
+    include_configs: bool,
+    include_scripts: bool,
+}
+
+impl Default for ProjectArchiveOptions {
+    fn default() -> Self {
+        Self {
+            name: "exported-project".to_string(),
+            scope: ProjectArchiveScope::Project,
+            read_only: false,
+            output_path: None,
+            selected_sessions: Vec::new(),
+            include_models: true,
+            include_runs: true,
+            include_logs: true,
+            include_configs: true,
+            include_scripts: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -361,6 +420,7 @@ enum ChoiceMenuTarget {
     Metrics(MetricsSettingField),
     DiscoveredRun,
     Session,
+    ProjectArchive(ProjectArchiveField),
 }
 
 #[derive(Debug, Clone)]
@@ -397,6 +457,41 @@ pub struct MultiSeriesEntry {
     pub points: Vec<(f64, f64)>,
     pub is_ghost: bool,
     pub ghost_index: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProjectArchiveManifest {
+    version: u32,
+    name: String,
+    scope: String,
+    read_only: bool,
+    selected_sessions: Vec<String>,
+    include_models: bool,
+    include_runs: bool,
+    include_logs: bool,
+    include_configs: bool,
+    include_scripts: bool,
+    created_at: u64,
+}
+
+impl ProjectArchiveManifest {
+    const VERSION: u32 = 1;
+
+    fn scope_label(scope: ProjectArchiveScope) -> &'static str {
+        match scope {
+            ProjectArchiveScope::Project => "project",
+            ProjectArchiveScope::Session => "session",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProjectSummary {
+    session_count: usize,
+    training_mode: Option<TrainingMode>,
+    last_session_name: Option<String>,
+    last_session_used: Option<u64>,
+    last_session_run_count: Option<usize>,
 }
 #[derive(Debug, Clone)]
 pub struct ChartOverlaySeries {
@@ -925,6 +1020,7 @@ pub enum InputMode {
     EditingChartExportOption,
     MetricsSettings,
     EditingMetricsSetting,
+    EditingProjectArchive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1492,6 +1588,15 @@ pub struct App {
     settings_selection: usize,
     ui_animation_anchor: Instant,
 
+    project_archive_options: ProjectArchiveOptions,
+    project_archive_selection: usize,
+    project_archive_edit_buffer: String,
+    active_project_archive_field: Option<ProjectArchiveField>,
+    project_archive_focus: ProjectArchiveFocus,
+    project_archive_session_selection: usize,
+    project_import_force_read_only: bool,
+    project_summaries: HashMap<PathBuf, ProjectSummary>,
+
     session_start_time: DateTime<Local>,
     training_log_session_written: bool,
     log_path: Option<PathBuf>,
@@ -1525,8 +1630,12 @@ impl App {
                 id: TabId::Interface,
             },
             Tab {
-                title: "Export",
-                id: TabId::Export,
+                title: "Export Model",
+                id: TabId::ExportModel,
+            },
+            Tab {
+                title: "Projects",
+                id: TabId::Projects,
             },
             Tab {
                 title: "Settings",
@@ -1673,6 +1782,15 @@ impl App {
             controller_settings: ControllerSettings::default(),
             settings_selection: 0,
             ui_animation_anchor: Instant::now(),
+
+            project_archive_options: ProjectArchiveOptions::default(),
+            project_archive_selection: 0,
+            project_archive_edit_buffer: String::new(),
+            active_project_archive_field: None,
+            project_archive_focus: ProjectArchiveFocus::Options,
+            project_archive_session_selection: 0,
+            project_import_force_read_only: false,
+            project_summaries: HashMap::new(),
             session_start_time: Local::now(),
             training_log_session_written: false,
             log_path,
@@ -1681,6 +1799,7 @@ impl App {
         if app.log_path.is_some() {
             app.log_line("logging enabled");
         }
+        app.refresh_project_summaries();
         app.ensure_selection_valid();
         app.rebuild_export_fields();
         app.check_python_environment();
@@ -1745,6 +1864,70 @@ impl App {
 
     pub fn status(&self) -> Option<&StatusMessage> {
         self.status.as_ref()
+    }
+
+    pub fn project_archive_selection(&self) -> usize {
+        self.project_archive_selection
+    }
+
+    pub fn project_archive_edit_buffer(&self) -> &str {
+        &self.project_archive_edit_buffer
+    }
+
+    pub fn project_archive_session_selection(&self) -> usize {
+        self.project_archive_session_selection
+    }
+
+    pub fn project_archive_options(&self) -> &ProjectArchiveOptions {
+        &self.project_archive_options
+    }
+
+    pub fn project_archive_selected_sessions(&self) -> &[String] {
+        &self.project_archive_options.selected_sessions
+    }
+
+    pub fn project_import_force_read_only(&self) -> bool {
+        self.project_import_force_read_only
+    }
+
+    fn project_summary(&self, project: &ProjectInfo) -> Option<&ProjectSummary> {
+        self.project_summaries.get(&project.root_path)
+    }
+
+    pub fn project_last_session_info(&self, project: &ProjectInfo) -> Option<(String, u64, usize)> {
+        let summary = self.project_summary(project)?;
+        let name = summary.last_session_name.as_ref()?.clone();
+        let timestamp = summary.last_session_used?;
+        let runs = summary.last_session_run_count.unwrap_or(0);
+        Some((name, timestamp, runs))
+    }
+
+    pub fn training_mode_label_for(&self, project: &ProjectInfo) -> Option<String> {
+        self.project_summary(project)
+            .and_then(|summary| summary.training_mode)
+            .map(|mode| match mode {
+                TrainingMode::SingleAgent => "Single-Agent".to_string(),
+                TrainingMode::MultiAgent => "Multi-Agent".to_string(),
+            })
+    }
+
+    pub fn training_mode_label(&self) -> Option<String> {
+        Some(match self.training_config.mode {
+            TrainingMode::SingleAgent => "Single-Agent".to_string(),
+            TrainingMode::MultiAgent => "Multi-Agent".to_string(),
+        })
+    }
+
+    pub fn session_count_for_project(&self, project: &ProjectInfo) -> usize {
+        if let Some(summary) = self.project_summary(project) {
+            return summary.session_count;
+        }
+        if let Some(active) = &self.active_project {
+            if active.root_path == project.root_path {
+                return self.sessions.sessions.len();
+            }
+        }
+        0
     }
 
     pub fn python_sb3_available(&self) -> Option<bool> {
@@ -4936,6 +5119,11 @@ impl App {
                 }
                 Ok(())
             }
+            ChoiceMenuTarget::ProjectArchive(field) => {
+                self.apply_project_archive_choice(field, &value);
+                self.exit_choice_menu();
+                Ok(())
+            }
         }
     }
 
@@ -5687,8 +5875,19 @@ impl App {
         self.export_edit_buffer.push(ch);
     }
 
+    pub fn push_project_archive_char(&mut self, ch: char) {
+        if self.project_archive_edit_buffer.len() >= 256 {
+            return;
+        }
+        self.project_archive_edit_buffer.push(ch);
+    }
+
     pub fn pop_export_char(&mut self) {
         self.export_edit_buffer.pop();
+    }
+
+    pub fn pop_project_archive_char(&mut self) {
+        self.project_archive_edit_buffer.pop();
     }
 
     pub fn confirm_export_edit(&mut self) {
@@ -5710,6 +5909,16 @@ impl App {
                 );
             }
         }
+    }
+
+    pub fn confirm_project_archive_edit(&mut self) {
+        self.apply_project_archive_name();
+    }
+
+    pub fn cancel_project_archive_edit(&mut self) {
+        self.project_archive_edit_buffer.clear();
+        self.active_project_archive_field = None;
+        self.input_mode = InputMode::Normal;
     }
 
     fn set_export_field_value(&mut self, field: ExportField, value: &str) -> Result<()> {
@@ -7544,6 +7753,7 @@ impl App {
         self.active_session_id = Some(id.clone());
         self.persist_sessions().ok();
         self.refresh_session_view()?;
+        self.refresh_active_project_summary();
         self.set_status(format!("Created new session {}", name), StatusKind::Success);
         Ok(())
     }
@@ -7554,6 +7764,7 @@ impl App {
             self.persist_sessions().ok();
             self.active_session_id = Some(id.to_string());
             self.refresh_session_view()?;
+            self.refresh_active_project_summary();
             self.set_status(format!("Loaded session {}", id), StatusKind::Success);
         } else {
             self.set_status(format!("Session {} not found", id), StatusKind::Warning);
@@ -7600,6 +7811,7 @@ impl App {
                 StatusKind::Warning,
             );
         }
+        self.refresh_active_project_summary();
     }
 
     fn load_mars_config_for_active_project(&mut self) -> bool {
@@ -7756,6 +7968,7 @@ impl App {
             self.set_status("Session store upgraded to latest format.", StatusKind::Info);
         }
 
+        self.refresh_active_project_summary();
         had_error
     }
 
@@ -8402,6 +8615,10 @@ impl App {
                 .resolve_existing_path(&self.export_config.rllib_output_dir)
                 .unwrap_or_else(|| project_root.join("onnx_exports")),
             FileBrowserTarget::Export(_) => project_root.clone(),
+            FileBrowserTarget::ProjectImportArchive => project_root.clone(),
+            FileBrowserTarget::ProjectExportPath => {
+                project_root.join(PROJECT_CONFIG_DIR).join("exports")
+            }
             FileBrowserTarget::SimulatorEnvPath => self
                 .resolve_existing_path(&self.simulator_config.env_path)
                 .unwrap_or_else(|| project_root.clone()),
@@ -8807,6 +9024,28 @@ impl App {
                 self.set_status("Export option updated", StatusKind::Success);
                 self.rebuild_export_fields();
             }
+            Some(FileBrowserTarget::ProjectImportArchive) => {
+                self.cancel_file_browser();
+                if let Err(error) =
+                    self.import_project_archive(&path, self.project_import_force_read_only)
+                {
+                    self.set_status(format!("Import failed: {error}"), StatusKind::Error);
+                }
+                return;
+            }
+            Some(FileBrowserTarget::ProjectExportPath) => {
+                self.cancel_file_browser();
+                let stored = self.stringify_for_storage(&path);
+                self.project_archive_options.output_path = Some(stored.clone());
+                self.set_status(
+                    format!(
+                        "Archive output set to {}",
+                        self.project_relative_display(&path)
+                    ),
+                    StatusKind::Success,
+                );
+                return;
+            }
             Some(FileBrowserTarget::ChartExport) => {
                 self.cancel_file_browser();
                 self.start_chart_export_options(path);
@@ -9206,10 +9445,9 @@ impl App {
     }
 
     pub fn set_status<S: Into<String>>(&mut self, text: S, kind: StatusKind) {
-        self.status = Some(StatusMessage {
-            text: text.into(),
-            kind,
-        });
+        let text = text.into();
+        self.log_line(format!("[{:?}] {}", kind, text));
+        self.status = Some(StatusMessage { text, kind });
     }
 
     pub fn clear_status(&mut self) {
@@ -9348,7 +9586,7 @@ impl App {
 
     pub fn set_active_project(&mut self) -> Result<()> {
         if let Some(project) = self.selected_project().cloned() {
-            self.set_active_project_inner(project)?;
+            self.set_active_project_inner(project, true)?;
         }
         Ok(())
     }
@@ -9816,13 +10054,41 @@ impl App {
             .find(|info| &info.logs_path == path)
             .cloned()
         {
-            self.set_active_project_inner(project)?;
+            self.set_active_project_inner(project, true)?;
         }
         Ok(())
     }
 
-    fn set_active_project_inner(&mut self, project: ProjectInfo) -> Result<()> {
-        self.project_manager.mark_as_used(&project)?;
+    fn refresh_project_archive_defaults(&mut self, project: &ProjectInfo) {
+        self.project_archive_options.name = project.name.clone();
+        if self.active_session_id.is_some() {
+            self.project_archive_options.scope = ProjectArchiveScope::Session;
+        } else {
+            self.project_archive_options.scope = ProjectArchiveScope::Project;
+        }
+        if self.project_archive_options.selected_sessions.is_empty() {
+            if let Some(active) = self.active_session_id.clone() {
+                self.project_archive_options.selected_sessions.push(active);
+            }
+        }
+        self.project_archive_focus = ProjectArchiveFocus::Options;
+        self.project_archive_session_selection = 0;
+    }
+
+    fn set_active_project_inner(
+        &mut self,
+        project: ProjectInfo,
+        persist_usage: bool,
+    ) -> Result<()> {
+        self.log_line(format!(
+            "[projects] switching to {} (ro={} linked={})",
+            project.name,
+            project.read_only,
+            project.source_archive.is_some()
+        ));
+        if persist_usage {
+            self.project_manager.mark_as_used(&project)?;
+        }
         if let Err(err) = std::env::set_current_dir(&project.root_path) {
             self.set_status(
                 format!(
@@ -9832,6 +10098,7 @@ impl App {
                 StatusKind::Warning,
             );
         }
+        self.refresh_project_archive_defaults(&project);
         self.saved_run_overlays.clear();
         self.selected_overlay_index = None;
         self.overlay_color_cursor = 0;
@@ -9843,13 +10110,25 @@ impl App {
         let export_error = self.load_export_state_for_active_project();
         let metrics_error = self.load_metrics_settings_for_active_project();
         let sessions_error = self.load_sessions_for_active_project();
-        self.refresh_projects(Some(project.logs_path.clone()))?;
-        if !training_error && !export_error && !metrics_error && !sessions_error {
+        if persist_usage {
+            self.refresh_projects(Some(project.logs_path.clone()))?;
+            if !training_error && !export_error && !metrics_error && !sessions_error {
+                self.set_status(
+                    format!("Active project: {}", project.name),
+                    StatusKind::Success,
+                );
+            }
+        } else {
             self.set_status(
-                format!("Active project: {}", project.name),
+                format!("Active project (preview): {}", project.name),
                 StatusKind::Success,
             );
         }
+        self.log_line(format!(
+            "[projects] active project ready sessions={} training_mode={:?}",
+            self.sessions.sessions.len(),
+            self.training_config.mode
+        ));
         Ok(())
     }
 
@@ -9860,6 +10139,15 @@ impl App {
     pub fn start_training(&mut self) -> Result<()> {
         if self.is_experimental() {
             return self.start_mars_training();
+        }
+        if let Some(project) = &self.active_project {
+            if project.read_only {
+                self.set_status(
+                    "Project is read-only; cannot start training",
+                    StatusKind::Warning,
+                );
+                return Ok(());
+            }
         }
         if self.training_running {
             self.set_status(
@@ -11121,6 +11409,741 @@ impl App {
         Ok(())
     }
 
+    pub fn start_project_archive_export(&mut self) -> Result<()> {
+        let Some(project) = &self.active_project else {
+            self.set_status("Select a project before exporting", StatusKind::Warning);
+            return Ok(());
+        };
+        if project.read_only {
+            self.set_status(
+                "Cannot export from a read-only linked project",
+                StatusKind::Warning,
+            );
+            return Ok(());
+        }
+        match self.export_project_archive() {
+            Ok(path) => {
+                self.set_status(
+                    format!(
+                        "Exported archive to {}",
+                        self.project_relative_display(&path)
+                    ),
+                    StatusKind::Success,
+                );
+            }
+            Err(err) => {
+                self.set_status(format!("Export failed: {err}"), StatusKind::Error);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn start_project_archive_import_browser(&mut self) {
+        let kind = FileBrowserKind::ExistingFile {
+            extensions: vec!["car".to_string(), "tar.gz".to_string()],
+        };
+        self.project_import_force_read_only = false;
+        self.start_file_browser(FileBrowserTarget::ProjectImportArchive, kind, None);
+    }
+
+    pub fn start_project_archive_import_browser_view_only(&mut self) {
+        let kind = FileBrowserKind::ExistingFile {
+            extensions: vec!["car".to_string(), "tar.gz".to_string()],
+        };
+        self.project_import_force_read_only = true;
+        self.start_file_browser(FileBrowserTarget::ProjectImportArchive, kind, None);
+    }
+
+    pub fn start_project_archive_output_browser(&mut self) {
+        let kind = FileBrowserKind::Directory {
+            allow_create: true,
+            require_checkpoints: false,
+        };
+        self.start_file_browser(FileBrowserTarget::ProjectExportPath, kind, None);
+    }
+
+    pub fn toggle_project_archive_read_only(&mut self) {
+        self.project_archive_options.read_only = !self.project_archive_options.read_only;
+        self.set_status(
+            format!(
+                "Archive read-only: {}",
+                if self.project_archive_options.read_only {
+                    "yes"
+                } else {
+                    "no"
+                }
+            ),
+            StatusKind::Info,
+        );
+    }
+
+    fn archive_manifest_path(project_root: &Path) -> PathBuf {
+        project_root
+            .join(PROJECT_CONFIG_DIR)
+            .join("archive_manifest.json")
+    }
+
+    fn export_project_archive(&mut self) -> Result<PathBuf> {
+        use std::process::Command;
+
+        let project = self
+            .active_project
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| eyre!("No active project"))?;
+
+        let name = self.project_archive_options.name.trim();
+        if name.is_empty() {
+            bail!("Export name cannot be empty");
+        }
+
+        let scope = self.project_archive_options.scope;
+        let read_only = self.project_archive_options.read_only;
+        if scope == ProjectArchiveScope::Session
+            && self.project_archive_options.selected_sessions.is_empty()
+        {
+            bail!("Select at least one session to export");
+        }
+
+        let manifest = ProjectArchiveManifest {
+            version: ProjectArchiveManifest::VERSION,
+            name: name.to_string(),
+            scope: ProjectArchiveManifest::scope_label(scope).to_string(),
+            read_only,
+            selected_sessions: self.project_archive_options.selected_sessions.clone(),
+            include_models: self.project_archive_options.include_models,
+            include_runs: self.project_archive_options.include_runs,
+            include_logs: self.project_archive_options.include_logs,
+            include_configs: self.project_archive_options.include_configs,
+            include_scripts: self.project_archive_options.include_scripts,
+            created_at: Self::now_timestamp(),
+        };
+
+        let exports_dir = self
+            .project_archive_options
+            .output_path
+            .as_ref()
+            .and_then(|p| self.resolve_saved_path(p))
+            .unwrap_or_else(|| project.root_path.join(PROJECT_CONFIG_DIR).join("exports"));
+        fs::create_dir_all(&exports_dir)
+            .wrap_err_with(|| format!("failed to create exports dir {}", exports_dir.display()))?;
+        let slug = Self::slugify_label(name);
+        let archive_path = exports_dir.join(format!("{slug}.car"));
+
+        // If exporting only selected sessions, temporarily write a filtered sessions file.
+        let mut sessions_backup: Option<(PathBuf, Option<String>)> = None;
+        if scope == ProjectArchiveScope::Session {
+            if let Some(path) = self.sessions_path() {
+                let filtered: Vec<_> = self
+                    .sessions
+                    .sessions
+                    .iter()
+                    .cloned()
+                    .filter(|s| {
+                        self.project_archive_options
+                            .selected_sessions
+                            .contains(&s.id)
+                    })
+                    .collect();
+                let filtered_store = SessionStore {
+                    version: SESSION_STORE_VERSION,
+                    sessions: filtered,
+                };
+                let serialized = serde_json::to_string_pretty(&filtered_store)
+                    .wrap_err("failed to serialize filtered sessions for export")?;
+                let original = fs::read_to_string(&path).ok();
+                fs::write(&path, serialized).wrap_err_with(|| {
+                    format!("failed to write filtered sessions to {}", path.display())
+                })?;
+                sessions_backup = Some((path, original));
+                self.log_line(format!(
+                    "[projects] filtered sessions for export: {:?}",
+                    self.project_archive_options.selected_sessions
+                ));
+            }
+        }
+
+        // Write manifest into project temporarily
+        let manifest_path = Self::archive_manifest_path(&project.root_path);
+        let manifest_json = serde_json::to_string_pretty(&manifest)
+            .wrap_err("failed to serialize archive manifest")?;
+        fs::write(&manifest_path, manifest_json)
+            .wrap_err_with(|| format!("failed to write manifest to {}", manifest_path.display()))?;
+        self.log_line(format!(
+            "[projects] exporting archive name={} scope={} read_only={} sessions={:?} dest={}",
+            name,
+            manifest.scope,
+            manifest.read_only,
+            manifest.selected_sessions,
+            archive_path.display()
+        ));
+
+        let mut cmd = Command::new("tar");
+        cmd.arg("-czf")
+            .arg(&archive_path)
+            .arg("-C")
+            .arg(&project.root_path)
+            .arg("--warning=no-file-changed")
+            .arg("--ignore-failed-read");
+
+        // Include everything from project root
+        cmd.arg(".");
+
+        // Exclude heavy bits based on options
+        if !self.project_archive_options.include_models {
+            cmd.arg("--exclude=logs/sb3")
+                .arg("--exclude=logs/rllib")
+                .arg("--exclude=exported_agents")
+                .arg("--exclude=*.onnx");
+        }
+        if !self.project_archive_options.include_runs {
+            cmd.arg(format!("--exclude={}/runs", PROJECT_CONFIG_DIR));
+        }
+        if !self.project_archive_options.include_logs {
+            cmd.arg("--exclude=logs");
+        }
+        if !self.project_archive_options.include_configs {
+            cmd.arg(format!(
+                "--exclude={}/{}",
+                PROJECT_CONFIG_DIR, TRAINING_CONFIG_FILENAME
+            ))
+            .arg(format!(
+                "--exclude={}/{}",
+                PROJECT_CONFIG_DIR, MARS_TRAINING_CONFIG_FILENAME
+            ))
+            .arg(format!(
+                "--exclude={}/{}",
+                PROJECT_CONFIG_DIR, METRICS_SETTINGS_FILENAME
+            ))
+            .arg(format!(
+                "--exclude={}/{}",
+                PROJECT_CONFIG_DIR, SESSION_STORE_FILENAME
+            ))
+            .arg(format!(
+                "--exclude={}/{}",
+                PROJECT_CONFIG_DIR, EXPORT_CONFIG_FILENAME
+            ));
+        }
+        if !self.project_archive_options.include_scripts {
+            cmd.arg("--exclude=*.py").arg("--exclude=scripts");
+        }
+
+        let output = cmd.output().wrap_err("failed to run tar for export")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let _ = fs::remove_file(&manifest_path);
+            if let Some((path, original)) = sessions_backup {
+                if let Some(orig) = original {
+                    let _ = fs::write(&path, orig);
+                }
+            }
+            bail!("tar failed: {}", stderr.trim());
+        }
+
+        // Clean up manifest from live project
+        let _ = fs::remove_file(&manifest_path);
+        if let Some((path, original)) = sessions_backup {
+            if let Some(orig) = original {
+                let _ = fs::write(&path, orig);
+            }
+        }
+
+        Ok(archive_path)
+    }
+
+    fn read_archive_manifest(&self, archive_path: &Path) -> Result<ProjectArchiveManifest> {
+        use std::process::Command;
+
+        fn try_read_member(archive: &Path, member: &str) -> Result<Option<String>> {
+            let output = Command::new("tar")
+                .arg("-xOf")
+                .arg(archive)
+                .arg(member)
+                .output()
+                .wrap_err("failed to read manifest from archive")?;
+            if output.status.success() {
+                let manifest_json = String::from_utf8_lossy(&output.stdout).to_string();
+                return Ok(Some(manifest_json));
+            }
+            Ok(None)
+        }
+
+        let candidates = [
+            format!("{}/archive_manifest.json", PROJECT_CONFIG_DIR),
+            format!("./{}/archive_manifest.json", PROJECT_CONFIG_DIR),
+        ];
+
+        let mut manifest_json: Option<String> = None;
+        for candidate in &candidates {
+            if let Some(data) = try_read_member(archive_path, candidate)? {
+                manifest_json = Some(data);
+                break;
+            }
+        }
+
+        let manifest_json = match manifest_json {
+            Some(json) => json,
+            None => {
+                // Capture a listing to aid debugging.
+                let listing = Command::new("tar")
+                    .arg("-tzf")
+                    .arg(archive_path)
+                    .output()
+                    .ok()
+                    .and_then(|o| String::from_utf8(o.stdout).ok())
+                    .unwrap_or_else(|| "<listing unavailable>".to_string());
+                self.log_line(format!(
+                    "[projects] manifest not found in {}. Contents:\n{}",
+                    archive_path.display(),
+                    listing
+                ));
+                bail!("tar could not read manifest");
+            }
+        };
+
+        let manifest: ProjectArchiveManifest =
+            serde_json::from_str(&manifest_json).wrap_err("failed to parse manifest json")?;
+        self.log_line(format!(
+            "[projects] read manifest from {} name={} scope={} read_only={} sessions={:?}",
+            archive_path.display(),
+            manifest.name,
+            manifest.scope,
+            manifest.read_only,
+            manifest.selected_sessions
+        ));
+        Ok(manifest)
+    }
+
+    fn import_project_archive(&mut self, archive_path: &Path, force_read_only: bool) -> Result<()> {
+        use std::process::Command;
+
+        if !archive_path.exists() {
+            bail!("Archive does not exist");
+        }
+
+        let manifest = self.read_archive_manifest(archive_path)?;
+        let projects_root = self.project_manager.root();
+        let target_dir = if force_read_only {
+            let ts = Self::now_timestamp();
+            std::env::temp_dir().join(format!("controller_preview_{}", ts))
+        } else {
+            let mut dir = projects_root.join(Self::slugify_label(&manifest.name));
+            if manifest.read_only {
+                dir = projects_root.join(format!("{}-ro", Self::slugify_label(&manifest.name)));
+            }
+            if dir.exists() {
+                dir = self.project_manager.default_project_dir_for(&manifest.name);
+            }
+            dir
+        };
+
+        fs::create_dir_all(&target_dir)
+            .wrap_err_with(|| format!("failed to create import dir {}", target_dir.display()))?;
+
+        let status = Command::new("tar")
+            .arg("-xzf")
+            .arg(archive_path)
+            .arg("-C")
+            .arg(&target_dir)
+            .status()
+            .wrap_err("failed to run tar for import")?;
+        if !status.success() {
+            bail!("tar extraction failed");
+        }
+        self.log_line(format!(
+            "[projects] imported archive {} into {} (read_only={})",
+            archive_path.display(),
+            target_dir.display(),
+            manifest.read_only
+        ));
+
+        let read_only = manifest.read_only || force_read_only;
+        if force_read_only {
+            let info = ProjectInfo {
+                name: manifest.name.clone(),
+                root_path: target_dir.clone(),
+                logs_path: target_dir.join("logs"),
+                last_used: SystemTime::now(),
+                read_only: true,
+                source_archive: Some(archive_path.to_path_buf()),
+            };
+            self.set_active_project_inner(info, false)?;
+            self.set_status(
+                format!(
+                    "Previewing archive '{}' from {} (read-only)",
+                    manifest.name,
+                    archive_path.display()
+                ),
+                StatusKind::Success,
+            );
+            return Ok(());
+        }
+
+        let registered = self.project_manager.register_imported_project(
+            &manifest.name,
+            target_dir.clone(),
+            read_only,
+            Some(archive_path.to_path_buf()),
+        )?;
+        self.projects = self.project_manager.list_projects()?;
+        self.set_active_project_inner(registered, true)?;
+        self.set_status(
+            format!(
+                "Imported archive '{}' as {} (read-only: {})",
+                archive_path.display(),
+                target_dir.display(),
+                read_only
+            ),
+            StatusKind::Success,
+        );
+        Ok(())
+    }
+
+    pub fn toggle_project_archive_models(&mut self) {
+        self.project_archive_options.include_models = !self.project_archive_options.include_models;
+        self.set_status(
+            format!(
+                "Include models: {}",
+                if self.project_archive_options.include_models {
+                    "yes"
+                } else {
+                    "no"
+                }
+            ),
+            StatusKind::Info,
+        );
+    }
+
+    pub fn toggle_project_archive_runs(&mut self) {
+        self.project_archive_options.include_runs = !self.project_archive_options.include_runs;
+        self.set_status(
+            format!(
+                "Include run data: {}",
+                if self.project_archive_options.include_runs {
+                    "yes"
+                } else {
+                    "no"
+                }
+            ),
+            StatusKind::Info,
+        );
+    }
+
+    pub fn toggle_project_archive_logs(&mut self) {
+        self.project_archive_options.include_logs = !self.project_archive_options.include_logs;
+        self.set_status(
+            format!(
+                "Include logs: {}",
+                if self.project_archive_options.include_logs {
+                    "yes"
+                } else {
+                    "no"
+                }
+            ),
+            StatusKind::Info,
+        );
+    }
+
+    pub fn toggle_project_archive_scope(&mut self) {
+        self.project_archive_options.scope = match self.project_archive_options.scope {
+            ProjectArchiveScope::Project => ProjectArchiveScope::Session,
+            ProjectArchiveScope::Session => ProjectArchiveScope::Project,
+        };
+        if self.project_archive_options.scope == ProjectArchiveScope::Session
+            && self.project_archive_options.selected_sessions.is_empty()
+        {
+            if let Some(active) = self.active_session_id.clone() {
+                self.project_archive_options.selected_sessions.push(active);
+            }
+        }
+        self.project_archive_focus = ProjectArchiveFocus::Options;
+        self.set_status(
+            format!(
+                "Archive scope: {}",
+                match self.project_archive_options.scope {
+                    ProjectArchiveScope::Project => "Project",
+                    ProjectArchiveScope::Session => "Session (active)",
+                }
+            ),
+            StatusKind::Info,
+        );
+    }
+
+    pub(crate) fn project_archive_fields(&self) -> &'static [ProjectArchiveField] {
+        &[
+            ProjectArchiveField::Name,
+            ProjectArchiveField::Scope,
+            ProjectArchiveField::ReadOnly,
+            ProjectArchiveField::OutputPath,
+            ProjectArchiveField::IncludeModels,
+            ProjectArchiveField::IncludeRuns,
+            ProjectArchiveField::IncludeLogs,
+            ProjectArchiveField::IncludeConfigs,
+            ProjectArchiveField::IncludeScripts,
+        ]
+    }
+
+    fn project_archive_selected_field(&self) -> Option<ProjectArchiveField> {
+        self.project_archive_fields()
+            .get(self.project_archive_selection)
+            .copied()
+    }
+
+    pub fn select_next_project_archive_field(&mut self) {
+        let fields = self.project_archive_fields();
+        if fields.is_empty() {
+            return;
+        }
+        self.project_archive_selection = (self.project_archive_selection + 1) % fields.len();
+    }
+
+    pub fn select_previous_project_archive_field(&mut self) {
+        let fields = self.project_archive_fields();
+        if fields.is_empty() {
+            return;
+        }
+        if self.project_archive_selection == 0 {
+            self.project_archive_selection = fields.len() - 1;
+        } else {
+            self.project_archive_selection -= 1;
+        }
+    }
+
+    pub fn project_archive_field_label(field: ProjectArchiveField) -> &'static str {
+        match field {
+            ProjectArchiveField::Name => "Archive name",
+            ProjectArchiveField::Scope => "Scope",
+            ProjectArchiveField::ReadOnly => "Read-only",
+            ProjectArchiveField::OutputPath => "Output path",
+            ProjectArchiveField::IncludeModels => "Include models",
+            ProjectArchiveField::IncludeRuns => "Include run data",
+            ProjectArchiveField::IncludeLogs => "Include logs",
+            ProjectArchiveField::IncludeConfigs => "Include configs",
+            ProjectArchiveField::IncludeScripts => "Include scripts",
+        }
+    }
+
+    pub fn project_archive_field_value(&self, field: ProjectArchiveField) -> String {
+        match field {
+            ProjectArchiveField::Name => self.project_archive_options.name.clone(),
+            ProjectArchiveField::Scope => match self.project_archive_options.scope {
+                ProjectArchiveScope::Project => "Project".to_string(),
+                ProjectArchiveScope::Session => "Session (active)".to_string(),
+            },
+            ProjectArchiveField::ReadOnly => format_bool(self.project_archive_options.read_only),
+            ProjectArchiveField::OutputPath => self
+                .project_archive_options
+                .output_path
+                .clone()
+                .unwrap_or_else(|| "Default (.rlcontroller/exports)".to_string()),
+            ProjectArchiveField::IncludeModels => {
+                format_bool(self.project_archive_options.include_models)
+            }
+            ProjectArchiveField::IncludeRuns => {
+                format_bool(self.project_archive_options.include_runs)
+            }
+            ProjectArchiveField::IncludeLogs => {
+                format_bool(self.project_archive_options.include_logs)
+            }
+            ProjectArchiveField::IncludeConfigs => {
+                format_bool(self.project_archive_options.include_configs)
+            }
+            ProjectArchiveField::IncludeScripts => {
+                format_bool(self.project_archive_options.include_scripts)
+            }
+        }
+    }
+
+    fn project_archive_requires_choice(field: ProjectArchiveField) -> bool {
+        matches!(field, ProjectArchiveField::Scope)
+    }
+
+    pub fn project_archive_sessions(&self) -> Vec<SessionRecord> {
+        let mut sessions = self.sessions.sessions.clone();
+        sessions.sort_by_key(|s| Reverse(s.last_used.max(s.created_at)));
+        self.log_line(format!(
+            "[projects] session list prepared ({} entries, sorted newest)",
+            sessions.len()
+        ));
+        sessions
+    }
+
+    pub fn toggle_project_archive_session(&mut self, id: &str) {
+        if let Some(pos) = self
+            .project_archive_options
+            .selected_sessions
+            .iter()
+            .position(|s| s == id)
+        {
+            self.project_archive_options.selected_sessions.remove(pos);
+            self.set_status(
+                format!("Session {} removed from export", id),
+                StatusKind::Info,
+            );
+        } else {
+            self.project_archive_options
+                .selected_sessions
+                .push(id.to_string());
+            self.set_status(
+                format!("Session {} added to export", id),
+                StatusKind::Success,
+            );
+        }
+    }
+
+    pub fn select_next_project_archive_session(&mut self) {
+        let len = self.project_archive_sessions().len();
+        if len == 0 {
+            return;
+        }
+        self.project_archive_session_selection = (self.project_archive_session_selection + 1) % len;
+    }
+
+    pub fn select_previous_project_archive_session(&mut self) {
+        let len = self.project_archive_sessions().len();
+        if len == 0 {
+            return;
+        }
+        if self.project_archive_session_selection == 0 {
+            self.project_archive_session_selection = len - 1;
+        } else {
+            self.project_archive_session_selection -= 1;
+        }
+    }
+
+    pub fn project_archive_focus(&self) -> ProjectArchiveFocus {
+        self.project_archive_focus
+    }
+
+    pub fn toggle_project_archive_focus(&mut self) {
+        self.project_archive_focus = match self.project_archive_focus {
+            ProjectArchiveFocus::Options => ProjectArchiveFocus::Sessions,
+            ProjectArchiveFocus::Sessions => ProjectArchiveFocus::Options,
+        };
+    }
+
+    pub fn project_archive_toggle_or_edit(&mut self) {
+        let Some(field) = self.project_archive_selected_field() else {
+            return;
+        };
+        if Self::project_archive_requires_choice(field) {
+            self.start_project_archive_choice(field);
+            return;
+        }
+        match field {
+            ProjectArchiveField::Name => self.start_project_archive_name_edit(),
+            ProjectArchiveField::ReadOnly => self.toggle_project_archive_read_only(),
+            ProjectArchiveField::OutputPath => {
+                self.start_project_archive_output_browser();
+            }
+            ProjectArchiveField::IncludeModels => self.toggle_project_archive_models(),
+            ProjectArchiveField::IncludeRuns => self.toggle_project_archive_runs(),
+            ProjectArchiveField::IncludeLogs => self.toggle_project_archive_logs(),
+            ProjectArchiveField::IncludeConfigs => {
+                self.project_archive_options.include_configs =
+                    !self.project_archive_options.include_configs;
+                self.set_status(
+                    format!(
+                        "Include configs: {}",
+                        format_bool(self.project_archive_options.include_configs)
+                    ),
+                    StatusKind::Info,
+                );
+            }
+            ProjectArchiveField::IncludeScripts => {
+                self.project_archive_options.include_scripts =
+                    !self.project_archive_options.include_scripts;
+                self.set_status(
+                    format!(
+                        "Include scripts: {}",
+                        format_bool(self.project_archive_options.include_scripts)
+                    ),
+                    StatusKind::Info,
+                );
+            }
+            ProjectArchiveField::Scope => {}
+        }
+    }
+
+    fn start_project_archive_choice(&mut self, field: ProjectArchiveField) {
+        let options = match field {
+            ProjectArchiveField::Scope => vec![
+                ConfigChoice::new("Project", "project", "Export the whole project"),
+                ConfigChoice::new(
+                    "Session (active)",
+                    "session",
+                    "Export one or more sessions as a project archive",
+                ),
+            ],
+            _ => return,
+        };
+        self.choice_menu = Some(ChoiceMenuState {
+            target: ChoiceMenuTarget::ProjectArchive(field),
+            label: "Choose archive scope".to_string(),
+            options,
+            selected: 0,
+        });
+        self.config_return_mode = Some(self.input_mode);
+        self.input_mode = InputMode::SelectingConfigOption;
+    }
+
+    fn apply_project_archive_choice(&mut self, field: ProjectArchiveField, value: &str) {
+        match field {
+            ProjectArchiveField::Scope => {
+                self.project_archive_options.scope = match value {
+                    "session" => ProjectArchiveScope::Session,
+                    _ => ProjectArchiveScope::Project,
+                };
+                self.set_status(
+                    format!(
+                        "Archive scope set to {}",
+                        self.project_archive_field_value(field)
+                    ),
+                    StatusKind::Info,
+                );
+            }
+            ProjectArchiveField::OutputPath => {
+                self.project_archive_options.output_path = if value.trim().is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                };
+                self.set_status(
+                    format!(
+                        "Archive output set to {}",
+                        self.project_archive_field_value(field)
+                    ),
+                    StatusKind::Info,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn start_project_archive_name_edit(&mut self) {
+        self.active_project_archive_field = Some(ProjectArchiveField::Name);
+        self.project_archive_edit_buffer = self.project_archive_options.name.clone();
+        self.input_mode = InputMode::EditingProjectArchive;
+    }
+
+    fn apply_project_archive_name(&mut self) {
+        if let Some(ProjectArchiveField::Name) = self.active_project_archive_field {
+            let trimmed = self.project_archive_edit_buffer.trim();
+            if trimmed.is_empty() {
+                self.set_status("Name cannot be empty", StatusKind::Warning);
+            } else {
+                self.project_archive_options.name = trimmed.to_string();
+                self.set_status(
+                    format!("Archive name set to {}", self.project_archive_options.name),
+                    StatusKind::Success,
+                );
+            }
+        }
+        self.project_archive_edit_buffer.clear();
+        self.active_project_archive_field = None;
+        self.input_mode = InputMode::Normal;
+    }
+
     pub fn cancel_export(&mut self) {
         if let Some(cancel) = self.export_cancel.take() {
             let _ = cancel.send(());
@@ -11791,6 +12814,84 @@ impl App {
         }
     }
 
+    fn refresh_project_summaries(&mut self) {
+        self.project_summaries.clear();
+        for project in &self.projects {
+            let summary = self.compute_project_summary(project);
+            self.project_summaries
+                .insert(project.root_path.clone(), summary);
+        }
+    }
+
+    fn refresh_summary_for_project(&mut self, project: &ProjectInfo) {
+        let summary = self.compute_project_summary(project);
+        self.project_summaries
+            .insert(project.root_path.clone(), summary);
+    }
+
+    fn refresh_active_project_summary(&mut self) {
+        if let Some(project) = self.active_project.clone() {
+            self.refresh_summary_for_project(&project);
+        }
+    }
+
+    fn compute_project_summary(&self, project: &ProjectInfo) -> ProjectSummary {
+        let config_dir = project.root_path.join(PROJECT_CONFIG_DIR);
+        let mut summary = ProjectSummary::default();
+
+        let sessions_path = config_dir.join(SESSION_STORE_FILENAME);
+        match fs::read_to_string(&sessions_path) {
+            Ok(contents) => match serde_json::from_str::<SessionStore>(&contents) {
+                Ok(store) => {
+                    summary.session_count = store.sessions.len();
+                    if let Some(latest) = store
+                        .sessions
+                        .iter()
+                        .max_by_key(|s| std::cmp::max(s.last_used, s.created_at))
+                    {
+                        summary.last_session_name = Some(latest.name.clone());
+                        summary.last_session_used =
+                            Some(std::cmp::max(latest.last_used, latest.created_at));
+                        summary.last_session_run_count = Some(latest.runs.len());
+                    }
+                }
+                Err(error) => self.log_line(format!(
+                    "[projects] failed to parse sessions for {}: {}",
+                    project.name, error
+                )),
+            },
+            Err(error) => {
+                if error.kind() != ErrorKind::NotFound {
+                    self.log_line(format!(
+                        "[projects] failed to read sessions for {}: {}",
+                        project.name, error
+                    ));
+                }
+            }
+        }
+
+        let training_config_path = config_dir.join(TRAINING_CONFIG_FILENAME);
+        match fs::read_to_string(&training_config_path) {
+            Ok(contents) => match serde_json::from_str::<TrainingConfig>(&contents) {
+                Ok(config) => summary.training_mode = Some(config.mode),
+                Err(error) => self.log_line(format!(
+                    "[projects] failed to parse training config for {}: {}",
+                    project.name, error
+                )),
+            },
+            Err(error) => {
+                if error.kind() != ErrorKind::NotFound {
+                    self.log_line(format!(
+                        "[projects] failed to read training config for {}: {}",
+                        project.name, error
+                    ));
+                }
+            }
+        }
+
+        summary
+    }
+
     fn refresh_projects(&mut self, prefer_path: Option<PathBuf>) -> Result<()> {
         self.projects = self.project_manager.list_projects()?;
         if let Some(path) = prefer_path {
@@ -11798,6 +12899,7 @@ impl App {
                 self.selected_project = index;
             }
         }
+        self.refresh_project_summaries();
         self.ensure_selection_valid();
         Ok(())
     }
