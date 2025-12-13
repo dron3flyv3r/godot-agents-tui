@@ -18,6 +18,11 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         return;
     }
 
+    if app.input_mode() == InputMode::ConfirmProjectImport {
+        screens::render_project_import_prompt(frame, app);
+        return;
+    }
+
     if matches!(
         app.input_mode(),
         InputMode::ChartExportOptions | InputMode::EditingChartExportOption

@@ -53,6 +53,7 @@ fn handle_key_event(app: &mut App, key: KeyCode) -> Result<()> {
         InputMode::MetricsSettings => handle_metrics_settings_input(app, key)?,
         InputMode::EditingMetricsSetting => handle_metrics_setting_edit_input(app, key)?,
         InputMode::EditingProjectArchive => handle_project_archive_edit_input(app, key)?,
+        InputMode::ConfirmProjectImport => handle_project_import_prompt_input(app, key)?,
         InputMode::Normal => handle_normal_mode_key(app, key)?,
     }
     Ok(())
@@ -79,6 +80,17 @@ fn handle_choice_menu_input(app: &mut App, key: KeyCode) -> Result<()> {
             app.confirm_choice_selection()?;
         }
         KeyCode::Esc => app.cancel_choice_selection(),
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_project_import_prompt_input(app: &mut App, key: KeyCode) -> Result<()> {
+    match key {
+        KeyCode::Enter => app.confirm_project_import_default(),
+        KeyCode::Char('i') | KeyCode::Char('I') => app.confirm_project_import_import(),
+        KeyCode::Char('p') | KeyCode::Char('P') => app.confirm_project_import_preview(),
+        KeyCode::Esc | KeyCode::Char('q') => app.cancel_project_import_prompt(),
         _ => {}
     }
     Ok(())
@@ -444,20 +456,24 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
             KeyCode::PageDown => app.scroll_export_output_down(10),
             _ => {}
         }
-    } else if app.active_tab().id == TabId::Projects {
-        match key {
-            KeyCode::Char('x') | KeyCode::Char('X') => app.start_project_archive_export()?,
-            KeyCode::Char('i') | KeyCode::Char('I') => app.start_project_archive_import_browser(),
-            KeyCode::Char('r') | KeyCode::Char('R') => app.toggle_project_archive_read_only(),
-            KeyCode::Char('m') | KeyCode::Char('M') => app.toggle_project_archive_models(),
-            KeyCode::Char('d') | KeyCode::Char('D') => app.toggle_project_archive_runs(),
-            KeyCode::Char('l') | KeyCode::Char('L') => app.toggle_project_archive_logs(),
-            KeyCode::Char('s') | KeyCode::Char('S') => app.toggle_project_archive_scope(),
-            KeyCode::Char('p') | KeyCode::Char('P') => app.start_project_archive_output_browser(),
-            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
-                match app.project_archive_focus() {
-                    app::ProjectArchiveFocus::Options => {
-                        app.select_previous_project_archive_field();
+	    } else if app.active_tab().id == TabId::Projects {
+	        match key {
+	            KeyCode::Char('x') | KeyCode::Char('X') => app.start_project_archive_export()?,
+	            KeyCode::Char('i') => app.start_project_archive_import_browser(),
+	            KeyCode::Char('I') => app.start_project_archive_preview_browser(),
+	            KeyCode::Char('r') | KeyCode::Char('R') => app.toggle_project_archive_read_only(),
+	            KeyCode::Char('m') | KeyCode::Char('M') => app.toggle_project_archive_models(),
+	            KeyCode::Char('d') | KeyCode::Char('D') => app.toggle_project_archive_runs(),
+	            KeyCode::Char('l') | KeyCode::Char('L') => app.toggle_project_archive_logs(),
+	            KeyCode::Char('s') | KeyCode::Char('S') => app.toggle_project_archive_scope(),
+	            KeyCode::Char('p') | KeyCode::Char('P') => app.start_project_archive_output_browser(),
+	            KeyCode::Char('c') | KeyCode::Char('C') => app.cancel_project_archive_task(),
+	            KeyCode::PageUp => app.scroll_project_archive_output_up(10),
+	            KeyCode::PageDown => app.scroll_project_archive_output_down(10),
+	            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
+	                match app.project_archive_focus() {
+	                    app::ProjectArchiveFocus::Options => {
+	                        app.select_previous_project_archive_field();
                     }
                     app::ProjectArchiveFocus::Sessions => {
                         app.select_previous_project_archive_session();

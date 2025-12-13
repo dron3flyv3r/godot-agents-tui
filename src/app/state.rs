@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Local};
 use color_eyre::{
-    eyre::{bail, eyre, WrapErr},
+    eyre::{bail, WrapErr},
     Result,
 };
 use plotters::prelude::{
@@ -40,6 +40,7 @@ use serde_json::{self, Value};
 
 const TRAINING_BUFFER_LIMIT: usize = 512;
 const EXPORT_BUFFER_LIMIT: usize = 512;
+const PROJECT_ARCHIVE_BUFFER_LIMIT: usize = 256;
 const METRIC_PREFIX: &str = "@METRIC ";
 const SIM_EVENT_PREFIX: &str = "@SIM_EVENT ";
 const SIM_ACTION_PREFIX: &str = "@SIM_ACTION ";
@@ -483,6 +484,34 @@ impl ProjectArchiveManifest {
             ProjectArchiveScope::Session => "session",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectImportAction {
+    Import,
+    Preview,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectImportPending {
+    archive_path: PathBuf,
+    manifest: ProjectArchiveManifest,
+    default_action: ProjectImportAction,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectImportPromptView {
+    pub archive_path: PathBuf,
+    pub name: String,
+    pub scope: String,
+    pub read_only: bool,
+    pub selected_sessions: usize,
+    pub include_models: bool,
+    pub include_runs: bool,
+    pub include_logs: bool,
+    pub include_configs: bool,
+    pub include_scripts: bool,
+    pub default_action_is_preview: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1021,6 +1050,7 @@ pub enum InputMode {
     MetricsSettings,
     EditingMetricsSetting,
     EditingProjectArchive,
+    ConfirmProjectImport,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1445,6 +1475,37 @@ enum InterfaceEvent {
     Finished(Option<i32>),
 }
 
+#[derive(Debug)]
+enum ProjectArchiveEvent {
+    Line(String),
+    Error(String),
+    Finished(ProjectArchiveFinished),
+}
+
+#[derive(Debug, Clone)]
+enum ProjectArchiveFinished {
+    Exported(PathBuf),
+    Imported(ProjectInfo),
+    Previewed(ProjectInfo),
+    Cancelled,
+}
+
+#[derive(Debug, Clone)]
+enum ProjectArchiveTask {
+    Export {
+        project: ProjectInfo,
+        sessions: SessionStore,
+        options: ProjectArchiveOptions,
+        exports_dir: PathBuf,
+    },
+    Import {
+        archive_path: PathBuf,
+        manifest: ProjectArchiveManifest,
+        projects_root: PathBuf,
+        action: ProjectImportAction,
+    },
+}
+
 pub struct App {
     mode: AppMode,
     tabs: Vec<Tab>,
@@ -1594,7 +1655,13 @@ pub struct App {
     active_project_archive_field: Option<ProjectArchiveField>,
     project_archive_focus: ProjectArchiveFocus,
     project_archive_session_selection: usize,
-    project_import_force_read_only: bool,
+    project_archive_output: Vec<String>,
+    project_archive_output_scroll: usize,
+    project_archive_receiver: Option<Receiver<ProjectArchiveEvent>>,
+    project_archive_cancel: Option<Sender<()>>,
+    project_archive_running: bool,
+    project_import_pending: Option<ProjectImportPending>,
+    project_import_default_preview: bool,
     project_summaries: HashMap<PathBuf, ProjectSummary>,
 
     session_start_time: DateTime<Local>,
@@ -1789,7 +1856,13 @@ impl App {
             active_project_archive_field: None,
             project_archive_focus: ProjectArchiveFocus::Options,
             project_archive_session_selection: 0,
-            project_import_force_read_only: false,
+            project_archive_output: Vec::new(),
+            project_archive_output_scroll: 0,
+            project_archive_receiver: None,
+            project_archive_cancel: None,
+            project_archive_running: false,
+            project_import_pending: None,
+            project_import_default_preview: false,
             project_summaries: HashMap::new(),
             session_start_time: Local::now(),
             training_log_session_written: false,
@@ -1886,8 +1959,33 @@ impl App {
         &self.project_archive_options.selected_sessions
     }
 
-    pub fn project_import_force_read_only(&self) -> bool {
-        self.project_import_force_read_only
+    pub fn is_project_archive_running(&self) -> bool {
+        self.project_archive_running
+    }
+
+    pub fn project_archive_output(&self) -> &[String] {
+        &self.project_archive_output
+    }
+
+    pub fn project_archive_output_scroll(&self) -> usize {
+        self.project_archive_output_scroll
+    }
+
+    pub fn project_import_prompt_view(&self) -> Option<ProjectImportPromptView> {
+        let pending = self.project_import_pending.as_ref()?;
+        Some(ProjectImportPromptView {
+            archive_path: pending.archive_path.clone(),
+            name: pending.manifest.name.clone(),
+            scope: pending.manifest.scope.clone(),
+            read_only: pending.manifest.read_only,
+            selected_sessions: pending.manifest.selected_sessions.len(),
+            include_models: pending.manifest.include_models,
+            include_runs: pending.manifest.include_runs,
+            include_logs: pending.manifest.include_logs,
+            include_configs: pending.manifest.include_configs,
+            include_scripts: pending.manifest.include_scripts,
+            default_action_is_preview: pending.default_action == ProjectImportAction::Preview,
+        })
     }
 
     fn project_summary(&self, project: &ProjectInfo) -> Option<&ProjectSummary> {
@@ -2439,8 +2537,10 @@ impl App {
                     ChartMetricKind::AllPoliciesEpisodeLenMean,
                 ));
 
-                // Collect all unique learner stat keys
-                let mut learner_stat_keys = std::collections::HashSet::new();
+                // Collect all unique learner stat keys in a stable order.
+                // Using a HashSet caused the "All Policies - <stat>" options to reshuffle every draw,
+                // which looked like auto-scrolling through metrics.
+                let mut learner_stat_keys = std::collections::BTreeSet::new();
                 for (_, metrics) in latest.policies() {
                     for key in metrics.learner_stats().keys() {
                         learner_stat_keys.insert(key.clone());
@@ -9026,10 +9126,10 @@ impl App {
             }
             Some(FileBrowserTarget::ProjectImportArchive) => {
                 self.cancel_file_browser();
-                if let Err(error) =
-                    self.import_project_archive(&path, self.project_import_force_read_only)
-                {
+                if let Err(error) = self.start_project_archive_import_prompt(path) {
                     self.set_status(format!("Import failed: {error}"), StatusKind::Error);
+                    self.project_import_pending = None;
+                    self.input_mode = InputMode::Normal;
                 }
                 return;
             }
@@ -10080,6 +10180,21 @@ impl App {
         project: ProjectInfo,
         persist_usage: bool,
     ) -> Result<()> {
+        if let Some(previous) = self.active_project.as_ref() {
+            if previous.read_only
+                && previous.source_archive.is_some()
+                && previous.root_path.starts_with(std::env::temp_dir())
+                && previous
+                    .root_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("controller_preview_"))
+                    .unwrap_or(false)
+                && previous.root_path != project.root_path
+            {
+                let _ = fs::remove_dir_all(&previous.root_path);
+            }
+        }
         self.log_line(format!(
             "[projects] switching to {} (ro={} linked={})",
             project.name,
@@ -11410,9 +11525,19 @@ impl App {
     }
 
     pub fn start_project_archive_export(&mut self) -> Result<()> {
-        let Some(project) = &self.active_project else {
-            self.set_status("Select a project before exporting", StatusKind::Warning);
+        if self.project_archive_running {
+            self.set_status(
+                "Archive task already running",
+                StatusKind::Warning,
+            );
             return Ok(());
+        }
+        let project = match self.active_project.clone() {
+            Some(project) => project,
+            None => {
+                self.set_status("Select a project before exporting", StatusKind::Warning);
+                return Ok(());
+            }
         };
         if project.read_only {
             self.set_status(
@@ -11421,20 +11546,47 @@ impl App {
             );
             return Ok(());
         }
-        match self.export_project_archive() {
-            Ok(path) => {
-                self.set_status(
-                    format!(
-                        "Exported archive to {}",
-                        self.project_relative_display(&path)
-                    ),
-                    StatusKind::Success,
-                );
-            }
-            Err(err) => {
-                self.set_status(format!("Export failed: {err}"), StatusKind::Error);
-            }
+        let name = self.project_archive_options.name.trim();
+        if name.is_empty() {
+            self.set_status("Export name cannot be empty", StatusKind::Warning);
+            return Ok(());
         }
+        if self.project_archive_options.scope == ProjectArchiveScope::Session
+            && self.project_archive_options.selected_sessions.is_empty()
+        {
+            self.set_status(
+                "Select at least one session to export",
+                StatusKind::Warning,
+            );
+            return Ok(());
+        }
+
+        let exports_dir = self
+            .project_archive_options
+            .output_path
+            .as_ref()
+            .and_then(|p| self.resolve_saved_path(p))
+            .unwrap_or_else(|| project.root_path.join(PROJECT_CONFIG_DIR).join("exports"));
+
+        self.project_archive_receiver = None;
+        self.project_archive_cancel = None;
+        self.project_archive_running = true;
+        self.reset_project_archive_output_scroll();
+        self.project_archive_output.clear();
+
+        let (tx, rx) = mpsc::channel();
+        self.project_archive_receiver = Some(rx);
+        let (cancel_tx, cancel_rx) = mpsc::channel();
+        self.project_archive_cancel = Some(cancel_tx);
+
+        let task = ProjectArchiveTask::Export {
+            project,
+            sessions: self.sessions.clone(),
+            options: self.project_archive_options.clone(),
+            exports_dir,
+        };
+        spawn_project_archive_task(tx, task, cancel_rx);
+        self.set_status("Archive export started...", StatusKind::Info);
         Ok(())
     }
 
@@ -11442,7 +11594,7 @@ impl App {
         let kind = FileBrowserKind::ExistingFile {
             extensions: vec!["car".to_string(), "tar.gz".to_string()],
         };
-        self.project_import_force_read_only = false;
+        self.project_import_default_preview = false;
         self.start_file_browser(FileBrowserTarget::ProjectImportArchive, kind, None);
     }
 
@@ -11450,8 +11602,100 @@ impl App {
         let kind = FileBrowserKind::ExistingFile {
             extensions: vec!["car".to_string(), "tar.gz".to_string()],
         };
-        self.project_import_force_read_only = true;
+        self.project_import_default_preview = true;
         self.start_file_browser(FileBrowserTarget::ProjectImportArchive, kind, None);
+    }
+
+    pub fn start_project_archive_preview_browser(&mut self) {
+        self.start_project_archive_import_browser_view_only();
+    }
+
+    fn start_project_archive_import_prompt(&mut self, archive_path: PathBuf) -> Result<()> {
+        if self.project_archive_running {
+            bail!("Archive task already running");
+        }
+        let manifest = self.read_archive_manifest(&archive_path)?;
+        let default_action = if self.project_import_default_preview {
+            ProjectImportAction::Preview
+        } else {
+            ProjectImportAction::Import
+        };
+        self.project_import_pending = Some(ProjectImportPending {
+            archive_path,
+            manifest,
+            default_action,
+        });
+        self.input_mode = InputMode::ConfirmProjectImport;
+        Ok(())
+    }
+
+    fn start_project_import_task(
+        &mut self,
+        pending: ProjectImportPending,
+        action: ProjectImportAction,
+    ) {
+        if self.project_archive_running {
+            self.set_status(
+                "Archive task already running",
+                StatusKind::Warning,
+            );
+            self.project_import_pending = Some(pending);
+            self.input_mode = InputMode::ConfirmProjectImport;
+            return;
+        }
+
+        self.project_archive_receiver = None;
+        self.project_archive_cancel = None;
+        self.project_archive_running = true;
+        self.reset_project_archive_output_scroll();
+        self.project_archive_output.clear();
+
+        let (tx, rx) = mpsc::channel();
+        self.project_archive_receiver = Some(rx);
+        let (cancel_tx, cancel_rx) = mpsc::channel();
+        self.project_archive_cancel = Some(cancel_tx);
+
+        let task = ProjectArchiveTask::Import {
+            archive_path: pending.archive_path,
+            manifest: pending.manifest,
+            projects_root: self.project_manager.root(),
+            action,
+        };
+        spawn_project_archive_task(tx, task, cancel_rx);
+
+        self.input_mode = InputMode::Normal;
+        let label = match action {
+            ProjectImportAction::Import => "Archive import started...",
+            ProjectImportAction::Preview => "Archive preview started...",
+        };
+        self.set_status(label, StatusKind::Info);
+    }
+
+    pub fn confirm_project_import_default(&mut self) {
+        if let Some(pending) = self.project_import_pending.take() {
+            let action = pending.default_action;
+            self.start_project_import_task(pending, action);
+        } else {
+            self.input_mode = InputMode::Normal;
+        }
+    }
+
+    pub fn confirm_project_import_preview(&mut self) {
+        if let Some(pending) = self.project_import_pending.take() {
+            self.start_project_import_task(pending, ProjectImportAction::Preview);
+        }
+    }
+
+    pub fn confirm_project_import_import(&mut self) {
+        if let Some(pending) = self.project_import_pending.take() {
+            self.start_project_import_task(pending, ProjectImportAction::Import);
+        }
+    }
+
+    pub fn cancel_project_import_prompt(&mut self) {
+        self.project_import_pending = None;
+        self.input_mode = InputMode::Normal;
+        self.set_status("Import cancelled.", StatusKind::Info);
     }
 
     pub fn start_project_archive_output_browser(&mut self) {
@@ -11477,31 +11721,21 @@ impl App {
         );
     }
 
-    fn archive_manifest_path(project_root: &Path) -> PathBuf {
-        project_root
-            .join(PROJECT_CONFIG_DIR)
-            .join("archive_manifest.json")
-    }
-
-    fn export_project_archive(&mut self) -> Result<PathBuf> {
-        use std::process::Command;
-
-        let project = self
-            .active_project
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| eyre!("No active project"))?;
-
-        let name = self.project_archive_options.name.trim();
+    fn export_project_archive_inner(
+        project: ProjectInfo,
+        sessions: SessionStore,
+        options: ProjectArchiveOptions,
+        exports_dir: PathBuf,
+        tx: Sender<ProjectArchiveEvent>,
+        cancel_rx: Receiver<()>,
+    ) -> Result<PathBuf> {
+        let name = options.name.trim();
         if name.is_empty() {
             bail!("Export name cannot be empty");
         }
 
-        let scope = self.project_archive_options.scope;
-        let read_only = self.project_archive_options.read_only;
-        if scope == ProjectArchiveScope::Session
-            && self.project_archive_options.selected_sessions.is_empty()
-        {
+        let scope = options.scope;
+        if scope == ProjectArchiveScope::Session && options.selected_sessions.is_empty() {
             bail!("Select at least one session to export");
         }
 
@@ -11509,74 +11743,58 @@ impl App {
             version: ProjectArchiveManifest::VERSION,
             name: name.to_string(),
             scope: ProjectArchiveManifest::scope_label(scope).to_string(),
-            read_only,
-            selected_sessions: self.project_archive_options.selected_sessions.clone(),
-            include_models: self.project_archive_options.include_models,
-            include_runs: self.project_archive_options.include_runs,
-            include_logs: self.project_archive_options.include_logs,
-            include_configs: self.project_archive_options.include_configs,
-            include_scripts: self.project_archive_options.include_scripts,
+            read_only: options.read_only,
+            selected_sessions: options.selected_sessions.clone(),
+            include_models: options.include_models,
+            include_runs: options.include_runs,
+            include_logs: options.include_logs,
+            include_configs: options.include_configs,
+            include_scripts: options.include_scripts,
             created_at: Self::now_timestamp(),
         };
 
-        let exports_dir = self
-            .project_archive_options
-            .output_path
-            .as_ref()
-            .and_then(|p| self.resolve_saved_path(p))
-            .unwrap_or_else(|| project.root_path.join(PROJECT_CONFIG_DIR).join("exports"));
         fs::create_dir_all(&exports_dir)
             .wrap_err_with(|| format!("failed to create exports dir {}", exports_dir.display()))?;
         let slug = Self::slugify_label(name);
         let archive_path = exports_dir.join(format!("{slug}.car"));
 
-        // If exporting only selected sessions, temporarily write a filtered sessions file.
-        let mut sessions_backup: Option<(PathBuf, Option<String>)> = None;
-        if scope == ProjectArchiveScope::Session {
-            if let Some(path) = self.sessions_path() {
-                let filtered: Vec<_> = self
-                    .sessions
-                    .sessions
-                    .iter()
-                    .cloned()
-                    .filter(|s| {
-                        self.project_archive_options
-                            .selected_sessions
-                            .contains(&s.id)
-                    })
-                    .collect();
-                let filtered_store = SessionStore {
-                    version: SESSION_STORE_VERSION,
-                    sessions: filtered,
-                };
-                let serialized = serde_json::to_string_pretty(&filtered_store)
-                    .wrap_err("failed to serialize filtered sessions for export")?;
-                let original = fs::read_to_string(&path).ok();
-                fs::write(&path, serialized).wrap_err_with(|| {
-                    format!("failed to write filtered sessions to {}", path.display())
-                })?;
-                sessions_backup = Some((path, original));
-                self.log_line(format!(
-                    "[projects] filtered sessions for export: {:?}",
-                    self.project_archive_options.selected_sessions
-                ));
-            }
-        }
+        let temp_root = std::env::temp_dir()
+            .join(format!("controller_archive_export_{:x}", Self::now_timestamp()));
+        let temp_config_dir = temp_root.join(PROJECT_CONFIG_DIR);
+        fs::create_dir_all(&temp_config_dir)
+            .wrap_err_with(|| format!("failed to create temp dir {}", temp_config_dir.display()))?;
 
-        // Write manifest into project temporarily
-        let manifest_path = Self::archive_manifest_path(&project.root_path);
+        let manifest_member = PathBuf::from(PROJECT_CONFIG_DIR).join("archive_manifest.json");
+        let manifest_path = temp_root.join(&manifest_member);
         let manifest_json = serde_json::to_string_pretty(&manifest)
             .wrap_err("failed to serialize archive manifest")?;
         fs::write(&manifest_path, manifest_json)
             .wrap_err_with(|| format!("failed to write manifest to {}", manifest_path.display()))?;
-        self.log_line(format!(
-            "[projects] exporting archive name={} scope={} read_only={} sessions={:?} dest={}",
-            name,
-            manifest.scope,
-            manifest.read_only,
-            manifest.selected_sessions,
-            archive_path.display()
-        ));
+
+        let mut extra_members = vec![manifest_member.clone()];
+
+        if scope == ProjectArchiveScope::Session {
+            let filtered: Vec<_> = sessions
+                .sessions
+                .into_iter()
+                .filter(|s| options.selected_sessions.contains(&s.id))
+                .collect();
+            let filtered_store = SessionStore {
+                version: SESSION_STORE_VERSION,
+                sessions: filtered,
+            };
+            let sessions_member = PathBuf::from(PROJECT_CONFIG_DIR).join(SESSION_STORE_FILENAME);
+            let sessions_path = temp_root.join(&sessions_member);
+            let serialized = serde_json::to_string_pretty(&filtered_store)
+                .wrap_err("failed to serialize filtered sessions for export")?;
+            fs::write(&sessions_path, serialized).wrap_err_with(|| {
+                format!(
+                    "failed to write filtered sessions to {}",
+                    sessions_path.display()
+                )
+            })?;
+            extra_members.push(sessions_member);
+        }
 
         let mut cmd = Command::new("tar");
         cmd.arg("-czf")
@@ -11586,23 +11804,19 @@ impl App {
             .arg("--warning=no-file-changed")
             .arg("--ignore-failed-read");
 
-        // Include everything from project root
-        cmd.arg(".");
-
-        // Exclude heavy bits based on options
-        if !self.project_archive_options.include_models {
+        if !options.include_models {
             cmd.arg("--exclude=logs/sb3")
                 .arg("--exclude=logs/rllib")
                 .arg("--exclude=exported_agents")
                 .arg("--exclude=*.onnx");
         }
-        if !self.project_archive_options.include_runs {
+        if !options.include_runs {
             cmd.arg(format!("--exclude={}/runs", PROJECT_CONFIG_DIR));
         }
-        if !self.project_archive_options.include_logs {
+        if !options.include_logs {
             cmd.arg("--exclude=logs");
         }
-        if !self.project_archive_options.include_configs {
+        if !options.include_configs {
             cmd.arg(format!(
                 "--exclude={}/{}",
                 PROJECT_CONFIG_DIR, TRAINING_CONFIG_FILENAME
@@ -11617,36 +11831,44 @@ impl App {
             ))
             .arg(format!(
                 "--exclude={}/{}",
-                PROJECT_CONFIG_DIR, SESSION_STORE_FILENAME
-            ))
-            .arg(format!(
-                "--exclude={}/{}",
                 PROJECT_CONFIG_DIR, EXPORT_CONFIG_FILENAME
             ));
+            // For session-scoped exports, we always include a filtered `sessions.json` even if
+            // configs are excluded (otherwise the imported archive has no sessions to select).
+            if scope != ProjectArchiveScope::Session {
+                cmd.arg(format!(
+                    "--exclude={}/{}",
+                    PROJECT_CONFIG_DIR, SESSION_STORE_FILENAME
+                ));
+            }
         }
-        if !self.project_archive_options.include_scripts {
+        if !options.include_scripts {
             cmd.arg("--exclude=*.py").arg("--exclude=scripts");
         }
 
-        let output = cmd.output().wrap_err("failed to run tar for export")?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let _ = fs::remove_file(&manifest_path);
-            if let Some((path, original)) = sessions_backup {
-                if let Some(orig) = original {
-                    let _ = fs::write(&path, orig);
-                }
-            }
-            bail!("tar failed: {}", stderr.trim());
+        cmd.arg(".");
+        cmd.arg("-C").arg(&temp_root);
+        for member in &extra_members {
+            cmd.arg(member);
         }
 
-        // Clean up manifest from live project
-        let _ = fs::remove_file(&manifest_path);
-        if let Some((path, original)) = sessions_backup {
-            if let Some(orig) = original {
-                let _ = fs::write(&path, orig);
-            }
+        tx.send(ProjectArchiveEvent::Line(format!(
+            "$ tar -czf {} (scope: {})",
+            archive_path.display(),
+            manifest.scope
+        )))
+        .ok();
+
+        let (status, cancelled) =
+            run_tar_command_with_cancel(cmd, tx.clone(), cancel_rx, "Export")?;
+        if cancelled {
+            bail!("export cancelled");
         }
+        if status != Some(0) {
+            bail!("tar failed during export");
+        }
+
+        let _ = fs::remove_dir_all(&temp_root);
 
         Ok(archive_path)
     }
@@ -11655,8 +11877,10 @@ impl App {
         use std::process::Command;
 
         fn try_read_member(archive: &Path, member: &str) -> Result<Option<String>> {
+            // Archives are gzipped (`tar -czf`), but use `.car` extension, so
+            // tar may not auto-detect compression. Always pass `-z`.
             let output = Command::new("tar")
-                .arg("-xOf")
+                .arg("-xOzf")
                 .arg(archive)
                 .arg(member)
                 .output()
@@ -11714,89 +11938,120 @@ impl App {
         Ok(manifest)
     }
 
-    fn import_project_archive(&mut self, archive_path: &Path, force_read_only: bool) -> Result<()> {
-        use std::process::Command;
-
+    fn import_project_archive_inner(
+        archive_path: PathBuf,
+        manifest: ProjectArchiveManifest,
+        projects_root: PathBuf,
+        action: ProjectImportAction,
+        tx: Sender<ProjectArchiveEvent>,
+        cancel_rx: Receiver<()>,
+    ) -> Result<ProjectArchiveFinished> {
         if !archive_path.exists() {
             bail!("Archive does not exist");
         }
 
-        let manifest = self.read_archive_manifest(archive_path)?;
-        let projects_root = self.project_manager.root();
-        let target_dir = if force_read_only {
-            let ts = Self::now_timestamp();
-            std::env::temp_dir().join(format!("controller_preview_{}", ts))
-        } else {
-            let mut dir = projects_root.join(Self::slugify_label(&manifest.name));
-            if manifest.read_only {
-                dir = projects_root.join(format!("{}-ro", Self::slugify_label(&manifest.name)));
+        preflight_archive_safe(&archive_path)?;
+
+        let target_dir = match action {
+            ProjectImportAction::Preview => {
+                let ts = Self::now_timestamp();
+                std::env::temp_dir().join(format!("controller_preview_{}", ts))
             }
-            if dir.exists() {
-                dir = self.project_manager.default_project_dir_for(&manifest.name);
+            ProjectImportAction::Import => {
+                let mut dir = projects_root.join(Self::slugify_label(&manifest.name));
+                if manifest.read_only {
+                    dir = projects_root
+                        .join(format!("{}-ro", Self::slugify_label(&manifest.name)));
+                }
+                if dir.exists() {
+                    // Ensure uniqueness without touching the live app state.
+                    let base = dir.clone();
+                    let base_name = base
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("project")
+                        .to_string();
+                    let mut counter = 1;
+                    while dir.exists() {
+                        dir = base.with_file_name(format!("{base_name}-{counter}"));
+                        counter += 1;
+                    }
+                }
+                dir
             }
-            dir
         };
 
         fs::create_dir_all(&target_dir)
             .wrap_err_with(|| format!("failed to create import dir {}", target_dir.display()))?;
 
-        let status = Command::new("tar")
-            .arg("-xzf")
-            .arg(archive_path)
+        let extract_root = target_dir.join(".tmp_extract");
+        fs::create_dir_all(&extract_root)
+            .wrap_err_with(|| format!("failed to create temp extract dir {}", extract_root.display()))?;
+
+        let mut cmd = Command::new("tar");
+        cmd.arg("-xzf")
+            .arg(&archive_path)
             .arg("-C")
-            .arg(&target_dir)
-            .status()
-            .wrap_err("failed to run tar for import")?;
-        if !status.success() {
+            .arg(&extract_root)
+            .arg("--no-same-owner")
+            .arg("--no-same-permissions");
+
+        tx.send(ProjectArchiveEvent::Line(format!(
+            "$ tar -xzf {}",
+            archive_path.display()
+        )))
+        .ok();
+
+        let (status, cancelled) =
+            run_tar_command_with_cancel(cmd, tx.clone(), cancel_rx, "Import")?;
+        if cancelled {
+            bail!("import cancelled");
+        }
+        if status != Some(0) {
             bail!("tar extraction failed");
         }
-        self.log_line(format!(
-            "[projects] imported archive {} into {} (read_only={})",
-            archive_path.display(),
-            target_dir.display(),
-            manifest.read_only
-        ));
 
-        let read_only = manifest.read_only || force_read_only;
-        if force_read_only {
-            let info = ProjectInfo {
-                name: manifest.name.clone(),
-                root_path: target_dir.clone(),
-                logs_path: target_dir.join("logs"),
-                last_used: SystemTime::now(),
-                read_only: true,
-                source_archive: Some(archive_path.to_path_buf()),
-            };
-            self.set_active_project_inner(info, false)?;
-            self.set_status(
-                format!(
-                    "Previewing archive '{}' from {} (read-only)",
-                    manifest.name,
-                    archive_path.display()
-                ),
-                StatusKind::Success,
-            );
-            return Ok(());
+        ensure_extracted_tree_safe(&extract_root)?;
+
+        for entry in fs::read_dir(&extract_root)
+            .wrap_err("failed to read extracted archive contents")?
+        {
+            let entry = entry?;
+            let name = entry.file_name();
+            let from = entry.path();
+            let to = target_dir.join(name);
+            if fs::rename(&from, &to).is_err() {
+                // Fallback to copy for cross-device moves.
+                if from.is_dir() {
+                    fs::create_dir_all(&to)?;
+                    copy_dir_recursive(&from, &to)?;
+                    fs::remove_dir_all(&from)?;
+                } else {
+                    fs::copy(&from, &to)?;
+                    fs::remove_file(&from)?;
+                }
+            }
         }
+        let _ = fs::remove_dir_all(&extract_root);
 
-        let registered = self.project_manager.register_imported_project(
-            &manifest.name,
-            target_dir.clone(),
+        let read_only = match action {
+            ProjectImportAction::Preview => true,
+            ProjectImportAction::Import => manifest.read_only,
+        };
+
+        let info = ProjectInfo {
+            name: manifest.name.clone(),
+            root_path: target_dir.clone(),
+            logs_path: target_dir.join("logs"),
+            last_used: SystemTime::now(),
             read_only,
-            Some(archive_path.to_path_buf()),
-        )?;
-        self.projects = self.project_manager.list_projects()?;
-        self.set_active_project_inner(registered, true)?;
-        self.set_status(
-            format!(
-                "Imported archive '{}' as {} (read-only: {})",
-                archive_path.display(),
-                target_dir.display(),
-                read_only
-            ),
-            StatusKind::Success,
-        );
-        Ok(())
+            source_archive: Some(archive_path.clone()),
+        };
+
+        Ok(match action {
+            ProjectImportAction::Preview => ProjectArchiveFinished::Previewed(info),
+            ProjectImportAction::Import => ProjectArchiveFinished::Imported(info),
+        })
     }
 
     pub fn toggle_project_archive_models(&mut self) {
@@ -11961,10 +12216,10 @@ impl App {
     pub fn project_archive_sessions(&self) -> Vec<SessionRecord> {
         let mut sessions = self.sessions.sessions.clone();
         sessions.sort_by_key(|s| Reverse(s.last_used.max(s.created_at)));
-        self.log_line(format!(
-            "[projects] session list prepared ({} entries, sorted newest)",
-            sessions.len()
-        ));
+        // self.log_line(format!(
+        //     "[projects] session list prepared ({} entries, sorted newest)",
+        //     sessions.len()
+        // ));
         sessions
     }
 
@@ -12149,6 +12404,14 @@ impl App {
             let _ = cancel.send(());
             self.append_export_line("! Cancellation requested by user");
             self.set_status("Stopping export...", StatusKind::Info);
+        }
+    }
+
+    pub fn cancel_project_archive_task(&mut self) {
+        if let Some(cancel) = self.project_archive_cancel.take() {
+            let _ = cancel.send(());
+            self.append_project_archive_line("! Cancellation requested by user");
+            self.set_status("Stopping archive task...", StatusKind::Info);
         }
     }
 
@@ -12566,6 +12829,51 @@ impl App {
         }
     }
 
+    fn append_project_archive_line(&mut self, line: impl Into<String>) {
+        self.project_archive_output.push(line.into());
+        if self.project_archive_output.len() > PROJECT_ARCHIVE_BUFFER_LIMIT {
+            let overflow =
+                self.project_archive_output.len() - PROJECT_ARCHIVE_BUFFER_LIMIT;
+            self.project_archive_output.drain(0..overflow);
+        }
+        self.clamp_project_archive_output_scroll();
+    }
+
+    fn clamp_project_archive_output_scroll(&mut self) {
+        if self.project_archive_output.is_empty() {
+            self.project_archive_output_scroll = 0;
+            return;
+        }
+        let max_offset = self.project_archive_output.len().saturating_sub(1);
+        if self.project_archive_output_scroll > max_offset {
+            self.project_archive_output_scroll = max_offset;
+        }
+    }
+
+    pub fn scroll_project_archive_output_up(&mut self, lines: usize) {
+        if self.project_archive_output.is_empty() {
+            self.project_archive_output_scroll = 0;
+            return;
+        }
+        let max_offset = self.project_archive_output.len().saturating_sub(1);
+        self.project_archive_output_scroll = self
+            .project_archive_output_scroll
+            .saturating_add(lines)
+            .min(max_offset);
+    }
+
+    pub fn scroll_project_archive_output_down(&mut self, lines: usize) {
+        if lines >= self.project_archive_output_scroll {
+            self.project_archive_output_scroll = 0;
+        } else {
+            self.project_archive_output_scroll -= lines;
+        }
+    }
+
+    pub fn reset_project_archive_output_scroll(&mut self) {
+        self.project_archive_output_scroll = 0;
+    }
+
     pub fn process_background_tasks(&mut self) {
         let mut events = Vec::new();
         let mut disconnected = false;
@@ -12575,6 +12883,8 @@ impl App {
         let mut interface_disconnected = false;
         let mut export_events = Vec::new();
         let mut export_disconnected = false;
+        let mut project_archive_events = Vec::new();
+        let mut project_archive_disconnected = false;
 
         if let Some(rx) = self.training_receiver.as_ref() {
             loop {
@@ -12638,6 +12948,24 @@ impl App {
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         export_disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(rx) = self.project_archive_receiver.as_ref() {
+            loop {
+                match rx.try_recv() {
+                    Ok(ProjectArchiveEvent::Finished(finished)) => {
+                        project_archive_events
+                            .push(ProjectArchiveEvent::Finished(finished));
+                        break;
+                    }
+                    Ok(event) => project_archive_events.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        project_archive_disconnected = true;
                         break;
                     }
                 }
@@ -12808,6 +13136,91 @@ impl App {
             if export_disconnected {
                 self.set_status(
                     "Export task disconnected unexpectedly.",
+                    StatusKind::Warning,
+                );
+            }
+        }
+
+        let mut archive_finished: Option<ProjectArchiveFinished> = None;
+        for event in project_archive_events {
+            match event {
+                ProjectArchiveEvent::Line(line) => self.append_project_archive_line(line),
+                ProjectArchiveEvent::Error(message) => {
+                    self.append_project_archive_line(format!("! {message}"));
+                    self.set_status(message, StatusKind::Error);
+                }
+                ProjectArchiveEvent::Finished(finished) => {
+                    archive_finished = Some(finished);
+                }
+            }
+        }
+
+        let had_archive_finished = archive_finished.is_some();
+        if let Some(finished) = archive_finished {
+            match finished {
+                ProjectArchiveFinished::Exported(path) => {
+                    let display = self.project_relative_display(&path);
+                    self.append_project_archive_line(format!("Exported archive to {display}"));
+                    self.set_status(
+                        format!("Exported archive to {display}"),
+                        StatusKind::Success,
+                    );
+                }
+                ProjectArchiveFinished::Imported(info) => {
+                    match self.project_manager.register_imported_project(
+                        &info.name,
+                        info.root_path.clone(),
+                        info.read_only,
+                        info.source_archive.clone(),
+                    ) {
+                        Ok(registered) => {
+                            if let Ok(projects) = self.project_manager.list_projects() {
+                                self.projects = projects;
+                            }
+                            if let Err(err) =
+                                self.set_active_project_inner(registered, true)
+                            {
+                                self.set_status(
+                                    format!("Failed to activate imported project: {err}"),
+                                    StatusKind::Error,
+                                );
+                            }
+                            self.set_status(
+                                format!("Imported archive '{}' successfully", info.name),
+                                StatusKind::Success,
+                            );
+                        }
+                        Err(err) => {
+                            self.set_status(
+                                format!("Import registration failed: {err}"),
+                                StatusKind::Error,
+                            );
+                        }
+                    }
+                }
+                ProjectArchiveFinished::Previewed(info) => {
+                    if let Err(err) = self.set_active_project_inner(info, false) {
+                        self.set_status(
+                            format!("Failed to activate preview project: {err}"),
+                            StatusKind::Error,
+                        );
+                    }
+                }
+                ProjectArchiveFinished::Cancelled => {
+                    self.append_project_archive_line("Archive task cancelled.");
+                    self.set_status("Archive task cancelled.", StatusKind::Info);
+                }
+            }
+        }
+
+        if had_archive_finished || project_archive_disconnected {
+            self.project_archive_running = false;
+            self.project_archive_receiver = None;
+            self.project_archive_cancel = None;
+            if project_archive_disconnected {
+                self.append_project_archive_line("! Archive task disconnected unexpectedly.");
+                self.set_status(
+                    "Archive task disconnected unexpectedly.",
                     StatusKind::Warning,
                 );
             }
@@ -13781,6 +14194,228 @@ fn find_script(base_dir: &Path, script_name: &str) -> Result<PathBuf> {
     bail!("Training script '{}' not found", script_name)
 }
 
+fn preflight_archive_safe(archive_path: &Path) -> Result<()> {
+    let list_output = Command::new("tar")
+        .arg("-tzf")
+        .arg(archive_path)
+        .output()
+        .wrap_err("failed to list archive contents")?;
+    if !list_output.status.success() {
+        bail!("tar failed to list archive contents");
+    }
+    let listing = String::from_utf8_lossy(&list_output.stdout);
+    for raw in listing.lines() {
+        let trimmed = raw.trim().trim_start_matches("./");
+        if trimmed.is_empty() {
+            continue;
+        }
+        let path = Path::new(trimmed);
+        for comp in path.components() {
+            match comp {
+                Component::ParentDir => bail!("Archive contains path traversal entry: {trimmed}"),
+                Component::RootDir | Component::Prefix(_) => {
+                    bail!("Archive contains absolute path entry: {trimmed}")
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let verbose_output = Command::new("tar")
+        .arg("-tvzf")
+        .arg(archive_path)
+        .output()
+        .wrap_err("failed to inspect archive contents")?;
+    if !verbose_output.status.success() {
+        bail!("tar failed to inspect archive contents");
+    }
+    let verbose = String::from_utf8_lossy(&verbose_output.stdout);
+    for line in verbose.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('l') || trimmed.contains(" -> ") {
+            bail!("Archive contains symlinks; refusing to import for safety");
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_extracted_tree_safe(root: &Path) -> Result<()> {
+    let canonical_root = root
+        .canonicalize()
+        .wrap_err("failed to resolve extracted root")?;
+
+    fn walk(dir: &Path, canonical_root: &Path) -> Result<()> {
+        for entry in fs::read_dir(dir).wrap_err("failed to read extracted directory")? {
+            let entry = entry?;
+            let path = entry.path();
+            let meta = fs::symlink_metadata(&path)
+                .wrap_err_with(|| format!("failed to stat extracted path {}", path.display()))?;
+            if meta.file_type().is_symlink() {
+                bail!("Archive contains symlink after extraction: {}", path.display());
+            }
+            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+            if !canonical.starts_with(canonical_root) {
+                bail!("Extracted path escapes target dir: {}", path.display());
+            }
+            if meta.is_dir() {
+                walk(&path, canonical_root)?;
+            }
+        }
+        Ok(())
+    }
+
+    walk(root, &canonical_root)
+}
+
+fn copy_dir_recursive(from: &Path, to: &Path) -> Result<()> {
+    for entry in fs::read_dir(from)
+        .wrap_err_with(|| format!("failed to read dir {}", from.display()))?
+    {
+        let entry = entry?;
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            fs::create_dir_all(&dst)?;
+            copy_dir_recursive(&src, &dst)?;
+        } else {
+            fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
+}
+
+fn run_tar_command_with_cancel(
+    mut cmd: Command,
+    tx: Sender<ProjectArchiveEvent>,
+    cancel_rx: Receiver<()>,
+    label: &'static str,
+) -> Result<(Option<i32>, bool)> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .wrap_err_with(|| format!("failed to start tar for {label}"))?;
+    let pid = child.id();
+
+    if let Some(stdout) = child.stdout.take() {
+        let tx_stdout = tx.clone();
+        thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().flatten() {
+                if tx_stdout.send(ProjectArchiveEvent::Line(line)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    if let Some(stderr) = child.stderr.take() {
+        let tx_stderr = tx.clone();
+        thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines().flatten() {
+                let formatted = format!("! {line}");
+                if tx_stderr.send(ProjectArchiveEvent::Line(formatted)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    let mut cancel_requested = false;
+    let mut kill_deadline: Option<Instant> = None;
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok((status.code(), cancel_requested)),
+            Ok(None) => {}
+            Err(error) => bail!("Failed to wait for tar during {label}: {error}"),
+        }
+
+        if !cancel_requested {
+            match cancel_rx.try_recv() {
+                Ok(_) => {
+                    cancel_requested = true;
+                    kill_deadline = Some(Instant::now() + Duration::from_secs(5));
+                    let _ = tx.send(ProjectArchiveEvent::Line(format!(
+                        "{label} cancellation requested (sending Ctrl+C)..."
+                    )));
+                    #[cfg(unix)]
+                    {
+                        use nix::sys::signal::{kill, Signal};
+                        use nix::unistd::Pid;
+                        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGINT);
+                    }
+                }
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => {}
+            }
+        } else if let Some(deadline) = kill_deadline {
+            if Instant::now() >= deadline {
+                let _ = tx.send(ProjectArchiveEvent::Line(format!(
+                    "{label} unresponsive; forcing termination..."
+                )));
+                let _ = child.kill();
+                let status = child.wait().ok();
+                return Ok((status.and_then(|s| s.code()), true));
+            }
+        }
+
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn spawn_project_archive_task(
+    tx: Sender<ProjectArchiveEvent>,
+    task: ProjectArchiveTask,
+    cancel_rx: Receiver<()>,
+) {
+    thread::spawn(move || {
+        let finished_result: Result<ProjectArchiveFinished> = match task {
+            ProjectArchiveTask::Export {
+                project,
+                sessions,
+                options,
+                exports_dir,
+            } => App::export_project_archive_inner(
+                project,
+                sessions,
+                options,
+                exports_dir,
+                tx.clone(),
+                cancel_rx,
+            )
+            .map(ProjectArchiveFinished::Exported),
+            ProjectArchiveTask::Import {
+                archive_path,
+                manifest,
+                projects_root,
+                action,
+            } => App::import_project_archive_inner(
+                archive_path,
+                manifest,
+                projects_root,
+                action,
+                tx.clone(),
+                cancel_rx,
+            ),
+        };
+
+        match finished_result {
+            Ok(finished) => {
+                let _ = tx.send(ProjectArchiveEvent::Finished(finished));
+            }
+            Err(err) => {
+                let msg = err.to_string();
+                let cancelled = msg.to_lowercase().contains("cancel");
+                if !cancelled {
+                    let _ = tx.send(ProjectArchiveEvent::Error(msg));
+                }
+                let _ = tx.send(ProjectArchiveEvent::Finished(ProjectArchiveFinished::Cancelled));
+            }
+        }
+    });
+}
+
 fn spawn_export_task(
     tx: Sender<ExportEvent>,
     command: String,
@@ -14495,5 +15130,131 @@ fn format_delta(delta: f64) -> String {
         format!("+{delta:.3}")
     } else {
         format!("{delta:.3}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::sessions::{SessionRecord, SessionRunLink, SessionStore, SESSION_STORE_VERSION};
+    use crate::domain::projects::ProjectInfo;
+    use std::process::Command;
+    use std::time::SystemTime;
+
+    fn try_extract_member(archive: &Path, member: &str) -> Option<String> {
+        let output = Command::new("tar")
+            .arg("-xOzf")
+            .arg(archive)
+            .arg(member)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    #[test]
+    fn session_scoped_export_includes_filtered_sessions_json_even_when_configs_excluded() -> Result<()> {
+        let seed = App::now_timestamp();
+        let project_root = std::env::temp_dir().join(format!("controller_test_project_{seed:x}"));
+        let _ = fs::remove_dir_all(&project_root);
+        fs::create_dir_all(project_root.join("logs"))?;
+
+        let project = ProjectInfo {
+            name: "test-project".to_string(),
+            root_path: project_root.clone(),
+            logs_path: project_root.join("logs"),
+            last_used: SystemTime::now(),
+            read_only: false,
+            source_archive: None,
+        };
+
+        let s1 = SessionRecord {
+            id: "sess-a".to_string(),
+            name: "alpha".to_string(),
+            created_at: seed,
+            last_used: seed,
+            description: None,
+            runs: vec![SessionRunLink {
+                run_path: ".rlcontroller/runs/a.json".to_string(),
+                start_iteration: 1,
+            }],
+        };
+        let s2 = SessionRecord {
+            id: "sess-b".to_string(),
+            name: "beta".to_string(),
+            created_at: seed + 1,
+            last_used: seed + 1,
+            description: None,
+            runs: vec![SessionRunLink {
+                run_path: ".rlcontroller/runs/b.json".to_string(),
+                start_iteration: 1,
+            }],
+        };
+        let s3 = SessionRecord {
+            id: "sess-c".to_string(),
+            name: "gamma".to_string(),
+            created_at: seed + 2,
+            last_used: seed + 2,
+            description: None,
+            runs: vec![SessionRunLink {
+                run_path: ".rlcontroller/runs/c.json".to_string(),
+                start_iteration: 1,
+            }],
+        };
+        let sessions = SessionStore {
+            version: SESSION_STORE_VERSION,
+            sessions: vec![s1, s2, s3],
+        };
+
+        let options = ProjectArchiveOptions {
+            name: "test-export".to_string(),
+            scope: ProjectArchiveScope::Session,
+            read_only: false,
+            output_path: None,
+            selected_sessions: vec!["sess-a".to_string(), "sess-c".to_string()],
+            include_models: false,
+            include_runs: false,
+            include_logs: false,
+            include_configs: false,
+            include_scripts: false,
+        };
+
+        let exports_dir = project_root.join(PROJECT_CONFIG_DIR).join("exports");
+        let (tx, _rx) = std::sync::mpsc::channel::<ProjectArchiveEvent>();
+        let (_cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
+
+        let archive_path =
+            App::export_project_archive_inner(project, sessions, options, exports_dir, tx, cancel_rx)?;
+        assert!(archive_path.exists());
+
+        let listing = Command::new("tar")
+            .arg("-tzf")
+            .arg(&archive_path)
+            .output()?;
+        assert!(listing.status.success());
+        let listing = String::from_utf8_lossy(&listing.stdout);
+
+        assert!(
+            listing
+                .lines()
+                .any(|line| line.trim().trim_start_matches("./") == ".rlcontroller/sessions.json"),
+            "archive missing sessions.json"
+        );
+
+        let sessions_json = try_extract_member(&archive_path, ".rlcontroller/sessions.json")
+            .or_else(|| try_extract_member(&archive_path, "./.rlcontroller/sessions.json"))
+            .expect("failed to extract sessions.json from archive");
+        let exported_store: SessionStore = serde_json::from_str(&sessions_json)?;
+        let exported_ids: Vec<_> = exported_store
+            .sessions
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect();
+        assert_eq!(exported_ids, vec!["sess-a", "sess-c"]);
+
+        let _ = fs::remove_dir_all(&project_root);
+        Ok(())
     }
 }

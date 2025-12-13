@@ -434,7 +434,10 @@ fn render_home_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             if let Some(status) = app.status() {
                 let style = status_style(status.kind);
                 let mut text = status.text.clone();
-                if app.is_training_running() || app.is_export_running() {
+                if app.is_training_running()
+                    || app.is_export_running()
+                    || app.is_project_archive_running()
+                {
                     if let Some(spinner) = app.spinner_char() {
                         text = format!("{spinner} {text}");
                     }
@@ -459,7 +462,8 @@ fn render_home_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         | InputMode::ChartExportOptions
         | InputMode::EditingChartExportOption
         | InputMode::MetricsSettings
-        | InputMode::EditingMetricsSetting => {
+        | InputMode::EditingMetricsSetting
+        | InputMode::ConfirmProjectImport => {
             // These modes have their own full-screen renders
         }
         InputMode::EditingProjectArchive => todo!(),
@@ -644,31 +648,180 @@ fn render_training_config(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
+fn wrap_plain_line(line: &str, width: usize, trim: bool) -> Vec<String> {
+    use std::collections::VecDeque;
+
+    if width == 0 {
+        return vec![String::new()];
+    }
+    let max_width = width as u16;
+
+    let mut wrapped_lines: Vec<String> = Vec::new();
+    let mut pending_line = String::new();
+    let mut pending_word = String::new();
+    let mut pending_whitespace: VecDeque<char> = VecDeque::new();
+
+    let mut line_width: u16 = 0;
+    let mut word_width: u16 = 0;
+    let mut whitespace_width: u16 = 0;
+    let mut non_whitespace_previous = false;
+
+    for ch in line.chars() {
+        let is_whitespace = ch.is_whitespace();
+        let symbol_width = UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
+
+        if symbol_width > max_width {
+            continue;
+        }
+
+        let word_found = non_whitespace_previous && is_whitespace;
+        let trimmed_overflow =
+            pending_line.is_empty() && trim && word_width + symbol_width > max_width;
+        let whitespace_overflow =
+            pending_line.is_empty() && trim && whitespace_width + symbol_width > max_width;
+        let untrimmed_overflow = pending_line.is_empty()
+            && !trim
+            && word_width + whitespace_width + symbol_width > max_width;
+
+        if word_found || trimmed_overflow || whitespace_overflow || untrimmed_overflow {
+            if !pending_line.is_empty() || !trim {
+                while let Some(ws_ch) = pending_whitespace.pop_front() {
+                    pending_line.push(ws_ch);
+                }
+                line_width += whitespace_width;
+            }
+
+            pending_line.push_str(&pending_word);
+            line_width += word_width;
+
+            pending_word.clear();
+            word_width = 0;
+            pending_whitespace.clear();
+            whitespace_width = 0;
+        }
+
+        let line_full = line_width >= max_width;
+        let pending_word_overflow = symbol_width > 0
+            && line_width + whitespace_width + word_width >= max_width;
+
+        if line_full || pending_word_overflow {
+            let mut remaining_width = max_width.saturating_sub(line_width);
+            wrapped_lines.push(std::mem::take(&mut pending_line));
+            line_width = 0;
+
+            while let Some(&ws_ch) = pending_whitespace.front() {
+                let ws_w = UnicodeWidthChar::width(ws_ch).unwrap_or(0) as u16;
+                if ws_w > remaining_width {
+                    break;
+                }
+                whitespace_width = whitespace_width.saturating_sub(ws_w);
+                remaining_width = remaining_width.saturating_sub(ws_w);
+                pending_whitespace.pop_front();
+            }
+
+            if is_whitespace && pending_whitespace.is_empty() {
+                non_whitespace_previous = false;
+                continue;
+            }
+        }
+
+        if is_whitespace {
+            whitespace_width += symbol_width;
+            pending_whitespace.push_back(ch);
+        } else {
+            word_width += symbol_width;
+            pending_word.push(ch);
+        }
+
+        non_whitespace_previous = !is_whitespace;
+    }
+
+    if pending_line.is_empty() && pending_word.is_empty() && !pending_whitespace.is_empty() {
+        wrapped_lines.push(String::new());
+    }
+    if !pending_line.is_empty() || !trim {
+        while let Some(ws_ch) = pending_whitespace.pop_front() {
+            pending_line.push(ws_ch);
+        }
+    }
+    pending_line.push_str(&pending_word);
+
+    if !pending_line.is_empty() {
+        wrapped_lines.push(pending_line);
+    }
+    if wrapped_lines.is_empty() {
+        wrapped_lines.push(String::new());
+    }
+    wrapped_lines
+}
+
+fn wrap_output_lines(
+    raw_lines: &[String],
+    inner_width: u16,
+    trim: bool,
+) -> (Vec<Line<'static>>, Vec<usize>) {
+    let width = inner_width.max(1) as usize;
+    let mut wrapped: Vec<Line<'static>> = Vec::new();
+    let mut heights: Vec<usize> = Vec::with_capacity(raw_lines.len());
+
+    for raw in raw_lines {
+        let parts = wrap_plain_line(raw, width, trim);
+        heights.push(parts.len());
+        for part in parts {
+            wrapped.push(Line::raw(part));
+        }
+    }
+
+    if wrapped.is_empty() {
+        wrapped.push(Line::raw(String::new()));
+    }
+
+    (wrapped, heights)
+}
+
 fn render_training_output(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Clear, area);
     let output_block = Block::default()
         .borders(Borders::ALL)
         .title("Training Output");
-    let output_text = if app.training_output().is_empty() {
-        "No output yet. Configure training and press 't' to start.".to_string()
-    } else {
-        app.training_output().join("\n")
-    };
 
-    let mut paragraph = Paragraph::new(output_text)
+    if app.training_output().is_empty() {
+        let output_text =
+            "No output yet. Configure training and press 't' to start.".to_string();
+        let paragraph = Paragraph::new(output_text)
+            .block(output_block)
+            .alignment(Alignment::Left)
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(Color::White));
+        frame.render_widget(paragraph, area);
+        return;
+    }
+
+    let raw_lines = app.training_output();
+    let inner_width = area.width.saturating_sub(2);
+    let (wrapped_lines, per_raw_heights) = wrap_output_lines(raw_lines, inner_width, true);
+
+    let mut paragraph = Paragraph::new(wrapped_lines)
         .block(output_block)
         .alignment(Alignment::Left)
-        .wrap(Wrap { trim: true })
         .style(Style::default().fg(Color::White));
 
-    if !app.training_output().is_empty() {
-        let total_lines = app.training_output().len();
-        let visible_height = area.height.saturating_sub(2).max(1) as usize;
-        let max_offset = total_lines.saturating_sub(visible_height);
-        let offset_from_bottom = app.training_output_scroll().min(max_offset);
-        let first_line = total_lines.saturating_sub(visible_height + offset_from_bottom) as u16;
-        paragraph = paragraph.scroll((first_line, 0));
+    let visible_height = area.height.saturating_sub(2).max(1) as usize;
+    let offset_from_bottom_raw = app
+        .training_output_scroll()
+        .min(raw_lines.len().saturating_sub(1));
+    let bottom_raw_idx = raw_lines.len() - 1 - offset_from_bottom_raw;
+
+    let mut prefix_visual = Vec::with_capacity(per_raw_heights.len() + 1);
+    prefix_visual.push(0usize);
+    for height in per_raw_heights {
+        let next = prefix_visual.last().copied().unwrap_or(0).saturating_add(height);
+        prefix_visual.push(next);
     }
+    let end_visual_exclusive = prefix_visual[bottom_raw_idx + 1];
+    let start_visual = end_visual_exclusive.saturating_sub(visible_height);
+    let scroll_y = start_visual.min(u16::MAX as usize) as u16;
+    paragraph = paragraph.scroll((scroll_y, 0));
 
     frame.render_widget(paragraph, area);
 }
@@ -3884,7 +4037,8 @@ pub fn render_projects(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Min(8),
+            Constraint::Min(6),
+            Constraint::Min(4),
             Constraint::Length(5),
         ])
         .split(area);
@@ -3915,11 +4069,22 @@ pub fn render_projects(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut items = Vec::new();
     for field in fields {
         let label = App::project_archive_field_label(*field);
-        let value = app.project_archive_field_value(*field);
+        let editing_name =
+            app.input_mode() == InputMode::EditingProjectArchive && *field == crate::app::ProjectArchiveField::Name;
+        let value = if editing_name {
+            app.project_archive_edit_buffer().to_string()
+        } else {
+            app.project_archive_field_value(*field)
+        };
+        let value_style = if editing_name {
+            Style::default().fg(Color::LightGreen)
+        } else {
+            Style::default().fg(Color::Cyan)
+        };
         let content = Line::from(vec![
             Span::styled(label, Style::default().fg(Color::Yellow)),
             Span::raw(": "),
-            Span::styled(value, Style::default().fg(Color::Cyan)),
+            Span::styled(value, value_style),
         ]);
         items.push(ListItem::new(content));
     }
@@ -3953,13 +4118,19 @@ pub fn render_projects(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Session picker
     let mut session_items = Vec::new();
     let sessions = app.project_archive_sessions();
+    let mut selected_sessions_count = 0usize;
     for session in sessions.iter() {
         let selected = app
             .project_archive_selected_sessions()
             .iter()
             .any(|id| id == &session.id);
+        if selected {
+            selected_sessions_count += 1;
+        }
         let marker = if selected { "[x]" } else { "[ ]" };
-        let label = format!("{} {}", marker, session.name);
+        let created = format_unix_relative(session.created_at);
+        let runs = session.runs.len();
+        let label = format!("{marker} {} • {created} • runs: {runs}", session.name);
         session_items.push(ListItem::new(Line::from(label)));
     }
     let mut session_state = ListState::default();
@@ -3971,7 +4142,11 @@ pub fn render_projects(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
     let session_block = Block::default()
         .borders(Borders::ALL)
-        .title("Sessions (Tab to focus, Enter to toggle)");
+        .title(format!(
+            "Sessions ({}/{}) (Tab to focus, Enter to toggle)",
+            selected_sessions_count,
+            sessions.len()
+        ));
     let session_list = List::new(session_items)
         .block(session_block)
         .highlight_style(
@@ -3991,23 +4166,22 @@ pub fn render_projects(frame: &mut Frame<'_>, area: Rect, app: &App) {
         );
     frame.render_stateful_widget(session_list, body_cols[1], &mut session_state);
 
+    render_project_archive_output(frame, chunks[2], app);
+
     // Instructions / status
     let mut instructions = Vec::new();
     instructions.push(Line::from(
-        "Up/Down: select • Enter/Space: toggle/edit • Tab: switch panel • x: export • i: import",
+        "Up/Down: select • Enter/Space: toggle/edit • Tab: switch panel • x: export • i: import • I: preview",
     ));
     instructions.push(Line::from(
-        "m/d/l/c/s: toggle models/runs/logs/configs/scripts • r: read-only • p: pick output path",
+        "m/d/l: toggle include models/runs/logs • s: toggle scope • r: archive read-only • p: pick output path",
     ));
-    instructions.push(Line::from(
-        "Hint: Import archives from Projects tab (i). You can also start import from Home by choosing the project after extraction.",
-    ));
+    instructions.push(Line::from("PgUp/PgDn: scroll archive log • c: cancel running archive task"));
     if app.input_mode() == InputMode::EditingProjectArchive {
         instructions.push(Line::from(Span::styled(
-            format!("Editing name: {}", app.project_archive_edit_buffer()),
+            "Editing archive name • Enter to save • Esc to cancel",
             Style::default().fg(Color::LightGreen),
         )));
-        instructions.push(Line::from("Enter to save • Esc to cancel"));
     }
     let status_line = app
         .status()
@@ -4022,7 +4196,58 @@ pub fn render_projects(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .block(Block::default().borders(Borders::ALL).title("Controls"))
         .alignment(Alignment::Left)
         .wrap(Wrap { trim: true });
-    frame.render_widget(footer, chunks[2]);
+    frame.render_widget(footer, chunks[3]);
+}
+
+fn render_project_archive_output(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let title = if app.is_project_archive_running() {
+        "Archive Log (running)"
+    } else {
+        "Archive Log"
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+
+    if app.project_archive_output().is_empty() {
+        let placeholder = Paragraph::new(if app.is_project_archive_running() {
+            "Working…"
+        } else {
+            "No archive activity yet."
+        })
+        .block(block)
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(Color::DarkGray))
+        .wrap(Wrap { trim: true });
+        frame.render_widget(placeholder, area);
+        return;
+    }
+
+    let raw_lines = app.project_archive_output();
+    let inner_width = area.width.saturating_sub(2);
+    let (wrapped_lines, per_raw_heights) = wrap_output_lines(raw_lines, inner_width, false);
+
+    let mut paragraph = Paragraph::new(wrapped_lines)
+        .block(block)
+        .alignment(Alignment::Left)
+        .style(Style::default().fg(Color::White));
+
+    let visible_height = area.height.saturating_sub(2).max(1) as usize;
+    let offset_from_bottom_raw = app
+        .project_archive_output_scroll()
+        .min(raw_lines.len().saturating_sub(1));
+    let bottom_raw_idx = raw_lines.len() - 1 - offset_from_bottom_raw;
+
+    let mut prefix_visual = Vec::with_capacity(per_raw_heights.len() + 1);
+    prefix_visual.push(0usize);
+    for height in per_raw_heights {
+        let next = prefix_visual.last().copied().unwrap_or(0).saturating_add(height);
+        prefix_visual.push(next);
+    }
+    let end_visual_exclusive = prefix_visual[bottom_raw_idx + 1];
+    let start_visual = end_visual_exclusive.saturating_sub(visible_height);
+    let scroll_y = start_visual.min(u16::MAX as usize) as u16;
+    paragraph = paragraph.scroll((scroll_y, 0));
+
+    frame.render_widget(paragraph, area);
 }
 
 fn render_export_config(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -4216,26 +4441,43 @@ fn render_export_output(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(Color::DarkGray)
         });
 
-    let output_text = if app.export_output().is_empty() {
-        "No export activity yet. Configure options and press 'x' to export.".to_string()
-    } else {
-        app.export_output().join("\n")
-    };
+    if app.export_output().is_empty() {
+        let output_text =
+            "No export activity yet. Configure options and press 'x' to export.".to_string();
+        let paragraph = Paragraph::new(output_text)
+            .block(block)
+            .alignment(Alignment::Left)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(Color::White));
+        frame.render_widget(paragraph, area);
+        return;
+    }
 
-    let mut paragraph = Paragraph::new(output_text)
+    let raw_lines = app.export_output();
+    let inner_width = area.width.saturating_sub(2);
+    let (wrapped_lines, per_raw_heights) = wrap_output_lines(raw_lines, inner_width, false);
+
+    let mut paragraph = Paragraph::new(wrapped_lines)
         .block(block)
         .alignment(Alignment::Left)
-        .wrap(Wrap { trim: false })
         .style(Style::default().fg(Color::White));
 
-    if !app.export_output().is_empty() {
-        let total_lines = app.export_output().len();
-        let visible_height = area.height.saturating_sub(2).max(1) as usize;
-        let max_offset = total_lines.saturating_sub(visible_height);
-        let offset_from_bottom = app.export_output_scroll().min(max_offset);
-        let first_line = total_lines.saturating_sub(visible_height + offset_from_bottom) as u16;
-        paragraph = paragraph.scroll((first_line, 0));
+    let visible_height = area.height.saturating_sub(2).max(1) as usize;
+    let offset_from_bottom_raw = app
+        .export_output_scroll()
+        .min(raw_lines.len().saturating_sub(1));
+    let bottom_raw_idx = raw_lines.len() - 1 - offset_from_bottom_raw;
+
+    let mut prefix_visual = Vec::with_capacity(per_raw_heights.len() + 1);
+    prefix_visual.push(0usize);
+    for height in per_raw_heights {
+        let next = prefix_visual.last().copied().unwrap_or(0).saturating_add(height);
+        prefix_visual.push(next);
     }
+    let end_visual_exclusive = prefix_visual[bottom_raw_idx + 1];
+    let start_visual = end_visual_exclusive.saturating_sub(visible_height);
+    let scroll_y = start_visual.min(u16::MAX as usize) as u16;
+    paragraph = paragraph.scroll((scroll_y, 0));
 
     frame.render_widget(paragraph, area);
 }
@@ -4566,9 +4808,17 @@ fn export_help_lines() -> Vec<String> {
 
 fn projects_help_lines() -> Vec<String> {
     vec![
-        "x              Export project or session (future)".to_string(),
-        "i              Import project/session archive (future)".to_string(),
-        "Enter          Confirm selections when prompted".to_string(),
+        "x              Export project/session archive".to_string(),
+        "i              Import archive".to_string(),
+        "I              Preview archive".to_string(),
+        "m/d/l          Toggle include models/runs/logs".to_string(),
+        "s              Toggle export scope".to_string(),
+        "Enter / Space  Toggle selected option or session".to_string(),
+        "r              Toggle archive read-only flag".to_string(),
+        "p              Pick export output directory".to_string(),
+        "Tab            Switch focus between options/sessions".to_string(),
+        "PgUp/PgDn      Scroll archive log".to_string(),
+        "c              Cancel running archive task".to_string(),
     ]
 }
 
@@ -4589,6 +4839,93 @@ fn file_browser_help_lines() -> Vec<String> {
         "n              Create a new folder (when allowed)".to_string(),
         "Esc            Cancel file selection".to_string(),
     ]
+}
+
+pub fn render_project_import_prompt(frame: &mut Frame<'_>, app: &App) {
+    let area = frame.area();
+
+    let vertical_margin = area.height / 6;
+    let horizontal_margin = area.width / 8;
+    let dialog_area = Rect {
+        x: horizontal_margin,
+        y: vertical_margin,
+        width: area.width.saturating_sub(horizontal_margin * 2),
+        height: area.height.saturating_sub(vertical_margin * 2),
+    };
+
+    let Some(view) = app.project_import_prompt_view() else {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title("Project Import");
+        let placeholder = Paragraph::new("No archive selected.")
+            .block(block)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(Clear, dialog_area);
+        frame.render_widget(placeholder, dialog_area);
+        return;
+    };
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "PROJECT ARCHIVE",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!(
+        "Archive: {}",
+        view.archive_path.display()
+    )));
+    lines.push(Line::from(format!("Name: {}", view.name)));
+    lines.push(Line::from(format!("Scope: {}", view.scope)));
+    lines.push(Line::from(format!(
+        "Read-only in manifest: {}",
+        if view.read_only { "yes" } else { "no" }
+    )));
+    lines.push(Line::from(format!(
+        "Sessions in archive: {}",
+        view.selected_sessions
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!(
+        "Includes: models={} runs={} logs={} configs={} scripts={}",
+        if view.include_models { "yes" } else { "no" },
+        if view.include_runs { "yes" } else { "no" },
+        if view.include_logs { "yes" } else { "no" },
+        if view.include_configs { "yes" } else { "no" },
+        if view.include_scripts { "yes" } else { "no" },
+    )));
+    lines.push(Line::from(""));
+    let default_action = if view.default_action_is_preview {
+        "Preview"
+    } else {
+        "Import"
+    };
+    lines.push(Line::from(Span::styled(
+        format!("Default action: {default_action}"),
+        Style::default().fg(Color::Yellow),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Enter: run default • i: import • p: preview • Esc: cancel",
+        Style::default().fg(Color::LightGreen),
+    )));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Project Import ")
+        .title_alignment(Alignment::Center);
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .alignment(Alignment::Left)
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
 }
 
 pub fn render_confirm_quit(frame: &mut Frame<'_>, _app: &App) {

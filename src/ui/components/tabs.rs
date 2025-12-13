@@ -15,7 +15,8 @@ pub fn render_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
             let mut label = format!(" {} ", tab.title);
             let show_spinner = (tab.id == TabId::Train && app.is_training_running())
                 || (tab.id == TabId::ExportModel && app.is_export_running())
-                || (tab.id == TabId::Simulator && app.is_simulator_running());
+                || (tab.id == TabId::Simulator && app.is_simulator_running())
+                || (tab.id == TabId::Projects && app.is_project_archive_running());
             if show_spinner {
                 if let Some(spinner) = app.spinner_char() {
                     label = format!("{} {}", spinner, label.trim_start());
