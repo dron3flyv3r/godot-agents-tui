@@ -3770,6 +3770,7 @@ fn metrics_setting_label(field: MetricsSettingField) -> &'static str {
         MetricsSettingField::ChartShowSelectionMarker => "Selection marker",
         MetricsSettingField::ChartShowCaption => "Caption/title",
         MetricsSettingField::ChartShowGhostOverlays => "Show ghost overlays",
+        MetricsSettingField::ChartGhostSpillLimit => "Ghost spill limit (Auto)",
         MetricsSettingField::ChartXAxisLabel => "X axis title",
         MetricsSettingField::ChartYAxisLabel => "Y axis title",
         MetricsSettingField::ChartAlignOverlaysToStart => "Align overlays to start",

@@ -741,13 +741,14 @@ pub enum ChartLegendPosition {
     None,
 }
 
-const METRIC_CHART_SETTING_FIELDS: [MetricsSettingField; 17] = [
+const METRIC_CHART_SETTING_FIELDS: [MetricsSettingField; 18] = [
     MetricsSettingField::ChartShowLegend,
     MetricsSettingField::ChartLegendPosition,
     MetricsSettingField::ChartShowResumeMarker,
     MetricsSettingField::ChartShowSelectionMarker,
     MetricsSettingField::ChartShowCaption,
     MetricsSettingField::ChartShowGhostOverlays,
+    MetricsSettingField::ChartGhostSpillLimit,
     MetricsSettingField::ChartXAxisLabel,
     MetricsSettingField::ChartYAxisLabel,
     MetricsSettingField::ChartAlignOverlaysToStart,
@@ -810,6 +811,7 @@ pub enum MetricsSettingField {
     ChartShowSelectionMarker,
     ChartShowCaption,
     ChartShowGhostOverlays,
+    ChartGhostSpillLimit,
     ChartXAxisLabel,
     ChartYAxisLabel,
     ChartAlignOverlaysToStart,
@@ -876,6 +878,7 @@ pub struct MetricsChartSettings {
     pub show_selection: bool,
     pub show_caption: bool,
     pub show_ghost_overlays: bool,
+    pub ghost_spill_limit: Option<usize>,
     pub x_label: String,
     pub y_label: String,
     pub align_overlays_to_start: bool,
@@ -892,6 +895,7 @@ impl Default for MetricsChartSettings {
             show_selection: true,
             show_caption: true,
             show_ghost_overlays: true,
+            ghost_spill_limit: None,
             x_label: "Training iteration".to_string(),
             y_label: String::new(),
             align_overlays_to_start: false,
@@ -4022,6 +4026,11 @@ impl App {
             MetricsSettingField::ChartShowGhostOverlays => {
                 format_bool(self.metrics_chart_settings.show_ghost_overlays)
             }
+            MetricsSettingField::ChartGhostSpillLimit => self
+                .metrics_chart_settings
+                .ghost_spill_limit
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "Auto".to_string()),
             MetricsSettingField::ChartXAxisLabel => self.metrics_chart_settings.x_label.clone(),
             MetricsSettingField::ChartYAxisLabel => self.metrics_chart_settings.y_label.clone(),
             MetricsSettingField::ChartAlignOverlaysToStart => {
@@ -4145,6 +4154,7 @@ impl App {
             MetricsSettingField::ChartShowSelectionMarker => "Selection marker",
             MetricsSettingField::ChartShowCaption => "Caption/title",
             MetricsSettingField::ChartShowGhostOverlays => "Show ghost overlays",
+            MetricsSettingField::ChartGhostSpillLimit => "Ghost spill limit (Auto)",
             MetricsSettingField::ChartXAxisLabel => "X axis title",
             MetricsSettingField::ChartYAxisLabel => "Y axis title",
             MetricsSettingField::ChartAlignOverlaysToStart => "Align overlays to start",
@@ -4386,6 +4396,7 @@ impl App {
             MetricsSettingField::ChartXAxisLabel
             | MetricsSettingField::ChartYAxisLabel
             | MetricsSettingField::ChartMaxPoints
+            | MetricsSettingField::ChartGhostSpillLimit
             | MetricsSettingField::HistoryPageStep
             | MetricsSettingField::SummaryMaxCustom
             | MetricsSettingField::PoliciesMaxLearnerStats => {
@@ -4459,6 +4470,13 @@ impl App {
                     } else {
                         self.metrics_chart_settings.max_points = Some(value.min(10_000));
                     }
+                }
+            }
+            MetricsSettingField::ChartGhostSpillLimit => {
+                if text.is_empty() || text.eq_ignore_ascii_case("auto") {
+                    self.metrics_chart_settings.ghost_spill_limit = None;
+                } else if let Ok(value) = text.parse::<usize>() {
+                    self.metrics_chart_settings.ghost_spill_limit = Some(value.min(100_000));
                 }
             }
             MetricsSettingField::HistoryPageStep => {
@@ -7758,7 +7776,14 @@ impl App {
         let mut ghost_runs: Vec<GhostRunSegment> = Vec::new();
 
         for (idx_run, run) in loaded.iter().enumerate() {
-            let next_start = loaded.get(idx_run + 1).map(|r| r.start);
+            let next_run = loaded.get(idx_run + 1);
+            let next_start = next_run.map(|r| r.start);
+            let ghost_max_iter = next_run.map(|next| {
+                let boundary = next.start;
+                let next_len = next.meta.end.saturating_sub(boundary);
+                let spill_cap = self.ghost_spill_cap_iters(next_len, false);
+                boundary.saturating_add(spill_cap)
+            });
             if idx_run > 0 {
                 resume_points.push(ResumePoint {
                     iteration: run.start,
@@ -7780,7 +7805,9 @@ impl App {
                 new_sample.clear_time_fields();
                 if let Some(boundary) = next_start {
                     if shifted >= boundary {
-                        ghost_samples.push(new_sample);
+                        if ghost_max_iter.map(|max| shifted <= max).unwrap_or(true) {
+                            ghost_samples.push(new_sample);
+                        }
                         continue;
                     }
                 }
@@ -10044,18 +10071,21 @@ impl App {
         let mut overlays = Vec::new();
 
         if let Some(baseline) = &self.resume_baseline {
-            let len = baseline.len();
-            let start = len.saturating_sub(max_points);
-            let mut points = Vec::new();
-            for (idx, sample) in baseline.iter().enumerate().skip(start) {
+            let max_iter = self.resume_baseline_max_iteration();
+            let mut raw_points = Vec::new();
+            for (idx, sample) in baseline.iter().enumerate() {
+                let iter_u64 = sample.training_iteration().unwrap_or(idx as u64);
+                if let Some(max_iter) = max_iter {
+                    if iter_u64 > max_iter {
+                        continue;
+                    }
+                }
                 if let Some(value) = App::chart_value_for_sample(sample, option) {
-                    let x = sample
-                        .training_iteration()
-                        .map(|iter| iter as f64)
-                        .unwrap_or_else(|| idx as f64);
-                    points.push((x, value));
+                    raw_points.push((iter_u64 as f64, value));
                 }
             }
+            let start = raw_points.len().saturating_sub(max_points);
+            let mut points: Vec<(f64, f64)> = raw_points.into_iter().skip(start).collect();
             if !points.is_empty() {
                 if align_to_start {
                     if let Some((first_x, _)) = points.first().copied() {
@@ -10138,6 +10168,32 @@ impl App {
             }
         }
         overlays
+    }
+
+    fn ghost_spill_cap_iters(&self, next_run_len: u64, next_is_live: bool) -> u64 {
+        if let Some(value) = self.metrics_chart_settings.ghost_spill_limit {
+            return value as u64;
+        }
+        if next_is_live {
+            return 35;
+        }
+        if next_run_len == 0 {
+            0
+        } else {
+            (next_run_len + 3) / 4
+        }
+    }
+
+    fn resume_baseline_max_iteration(&self) -> Option<u64> {
+        let resume_iter = self.metrics_resume_iteration?;
+        let last_iter = self
+            .metrics_timeline
+            .last()
+            .and_then(|s| s.training_iteration())
+            .unwrap_or(resume_iter);
+        let next_run_len = last_iter.saturating_sub(resume_iter);
+        let spill_cap = self.ghost_spill_cap_iters(next_run_len, self.training_running);
+        Some(resume_iter.saturating_add(spill_cap))
     }
 
     fn next_overlay_color(&mut self) -> Color {
