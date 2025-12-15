@@ -47,6 +47,7 @@ const SIM_ACTION_PREFIX: &str = "@SIM_ACTION ";
 const INTERFACE_EVENT_PREFIX: &str = "@INTERFACE_EVENT ";
 const INTERFACE_ACTION_PREFIX: &str = "@INTERFACE_ACTION ";
 const TRAINING_METRIC_HISTORY_LIMIT: usize = 2048;
+const TRAINING_METRICS_LOG_FILENAME: &str = "training_metrics.jsonl";
 const SIM_EVENT_BUFFER_LIMIT: usize = 512;
 const SIM_ACTION_AUTO_COMPACT_THRESHOLD: usize = 20;
 const SIM_ACTION_VALUE_MAX_LEN: usize = 48;
@@ -123,7 +124,12 @@ const COLOR_PALETTES: &[(&str, &[&str])] = &[
     ),
 ];
 
-const RLLIB_STOP_MODE_CHOICES: [(&str, &str, &str); 2] = [
+const RLLIB_STOP_MODE_CHOICES: [(&str, &str, &str); 3] = [
+    (
+        "none",
+        "Manual (infinite)",
+        "Runs indefinitely until you cancel (press 'c') or create the configured stop file.",
+    ),
     (
         "time_seconds",
         "Time (seconds)",
@@ -288,7 +294,6 @@ struct RunOverlay {
 pub(crate) struct DiscoveredRun {
     path: PathBuf,
     label: String,
-    created_ts: u64,
     latest_checkpoint: Option<PathBuf>,
 }
 
@@ -324,8 +329,6 @@ struct RunManifestInfo {
 struct SessionRunMeta {
     start: u64,
     end: u64,
-    run_path: PathBuf,
-    is_rllib: bool,
     rllib_trial_dir: Option<PathBuf>,
     rllib_resume_from: Option<PathBuf>,
     checkpoint_frequency: Option<u64>,
@@ -356,21 +359,39 @@ impl RunOverlay {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct ArchivedRunView {
     run: SavedRun,
     path: PathBuf,
     label: String,
+    metrics_stream: Option<runs::RunMetricsStream>,
 }
 
 impl ArchivedRunView {
     fn new(run: SavedRun, path: PathBuf) -> Self {
         let label = format!("{} [{}]", run.experiment_name, run.training_mode);
-        Self { run, path, label }
+        let metrics_stream = runs::RunMetricsStream::open(&path, &run).ok().flatten();
+        Self {
+            run,
+            path,
+            label,
+            metrics_stream,
+        }
     }
 
-    fn metrics(&self) -> &[MetricSample] {
-        &self.run.metrics
+    fn metrics_len(&self) -> usize {
+        if let Some(stream) = &self.metrics_stream {
+            let len = stream.len();
+            if len > 0 {
+                return len;
+            }
+        }
+        if let Some(summary) = self.run.metrics_summary.as_ref() {
+            if summary.total_samples > 0 {
+                return summary.total_samples as usize;
+            }
+        }
+        self.run.metrics.len()
     }
 
     fn logs(&self) -> &[String] {
@@ -380,6 +401,27 @@ impl ArchivedRunView {
     fn id(&self) -> &str {
         &self.run.id
     }
+
+    fn metrics_get(&self, index_from_oldest: usize) -> Option<MetricSample> {
+        if let Some(stream) = &self.metrics_stream {
+            if let Ok(sample) = stream.get(index_from_oldest) {
+                return sample;
+            }
+        }
+        self.run.metrics.get(index_from_oldest).cloned()
+    }
+
+    fn metrics_range(&self, start: usize, end: usize) -> Vec<MetricSample> {
+        if let Some(stream) = &self.metrics_stream {
+            if let Ok(samples) = stream.range(start, end) {
+                return samples;
+            }
+        }
+        let start = start.min(self.run.metrics.len());
+        let end = end.min(self.run.metrics.len());
+        self.run.metrics[start..end].to_vec()
+    }
+
 }
 
 #[derive(Debug, Clone)]
@@ -1048,6 +1090,7 @@ pub enum InputMode {
     BrowsingFiles,
     Help,
     ConfirmQuit,
+    ConfirmAction,
     EditingExport,
     ChartExportOptions,
     EditingChartExportOption,
@@ -1061,6 +1104,13 @@ pub enum InputMode {
 enum RunLoadMode {
     Overlay,
     ViewOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfirmAction {
+    CancelTraining,
+    ClearTrainingOutput,
+    ClearRunOverlays,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1522,6 +1572,8 @@ pub struct App {
     selected_project: usize,
 
     input_mode: InputMode,
+    confirm_action: Option<ConfirmAction>,
+    confirm_action_return_mode: Option<InputMode>,
     project_name_buffer: String,
     project_location_buffer: String,
     project_creation_stage: ProjectCreationStage,
@@ -1554,6 +1606,9 @@ pub struct App {
     training_running: bool,
     training_metrics: Vec<MetricSample>,
     metrics_timeline: Vec<MetricSample>,
+    training_metrics_log_path: Option<PathBuf>,
+    training_metrics_log_error: bool,
+    training_metrics_trim_notice_shown: bool,
     metrics_resume_iteration: Option<u64>,
     metrics_resume_label: Option<String>,
     saved_run_overlays: Vec<RunOverlay>,
@@ -1724,6 +1779,8 @@ impl App {
             active_project: None,
             selected_project: 0,
             input_mode: InputMode::Normal,
+            confirm_action: None,
+            confirm_action_return_mode: None,
             project_name_buffer: String::new(),
             project_location_buffer: String::new(),
             project_creation_stage: ProjectCreationStage::Name,
@@ -1757,6 +1814,9 @@ impl App {
             training_cancel: None,
             training_metrics: Vec::new(),
             metrics_timeline: Vec::new(),
+            training_metrics_log_path: None,
+            training_metrics_log_error: false,
+            training_metrics_trim_notice_shown: false,
             metrics_resume_iteration: None,
             metrics_resume_label: None,
             saved_run_overlays: Vec::new(),
@@ -1953,10 +2013,6 @@ impl App {
 
     pub fn project_archive_session_selection(&self) -> usize {
         self.project_archive_session_selection
-    }
-
-    pub fn project_archive_options(&self) -> &ProjectArchiveOptions {
-        &self.project_archive_options
     }
 
     pub fn project_archive_selected_sessions(&self) -> &[String] {
@@ -2204,7 +2260,7 @@ impl App {
         let sample = self.selected_metric_sample()?;
         let iter = sample.training_iteration()?;
         let meta = self.session_run_for_iteration(iter)?;
-        self.compute_checkpoint_target(sample, meta)
+        self.compute_checkpoint_target(&sample, meta)
     }
 
     pub fn is_viewing_saved_run(&self) -> bool {
@@ -2417,40 +2473,84 @@ impl App {
         );
     }
 
-    pub fn training_metrics_history(&self) -> &[MetricSample] {
+    pub fn metrics_history_total_len(&self) -> usize {
         if let Some(view) = &self.archived_run_view {
-            view.metrics()
+            view.metrics_len()
         } else if let Some(metrics) = &self.session_merged_metrics {
-            metrics
+            metrics.len()
         } else {
-            &self.metrics_timeline
+            self.metrics_timeline.len()
         }
+    }
+
+    fn metrics_sample_by_index_from_oldest(&self, index: usize) -> Option<MetricSample> {
+        if let Some(view) = &self.archived_run_view {
+            view.metrics_get(index)
+        } else if let Some(metrics) = &self.session_merged_metrics {
+            metrics.get(index).cloned()
+        } else {
+            self.metrics_timeline.get(index).cloned()
+        }
+    }
+
+    fn metrics_range_by_index_from_oldest(&self, start: usize, end: usize) -> Vec<MetricSample> {
+        if let Some(view) = &self.archived_run_view {
+            return view.metrics_range(start, end);
+        }
+        if let Some(metrics) = &self.session_merged_metrics {
+            let start = start.min(metrics.len());
+            let end = end.min(metrics.len());
+            return metrics[start..end].to_vec();
+        }
+        let start = start.min(self.metrics_timeline.len());
+        let end = end.min(self.metrics_timeline.len());
+        self.metrics_timeline[start..end].to_vec()
+    }
+
+    pub fn metrics_history_window(
+        &self,
+        start_display: usize,
+        end_display: usize,
+        newest_first: bool,
+    ) -> Vec<MetricSample> {
+        let total = self.metrics_history_total_len();
+        if total == 0 {
+            return Vec::new();
+        }
+        let start = start_display.min(total);
+        let end = end_display.min(total);
+        if start >= end {
+            return Vec::new();
+        }
+        if !newest_first {
+            return self.metrics_range_by_index_from_oldest(start, end);
+        }
+        let underlying_start = total - end;
+        let underlying_end = total - start;
+        let mut window = self.metrics_range_by_index_from_oldest(underlying_start, underlying_end);
+        window.reverse();
+        window
     }
 
     pub fn metrics_history_selected_index(&self) -> usize {
-        let history = self.training_metrics_history();
-        if history.is_empty() {
+        let total = self.metrics_history_total_len();
+        if total == 0 {
             0
         } else {
-            self.metrics_history_index
-                .min(history.len().saturating_sub(1))
+            self.metrics_history_index.min(total.saturating_sub(1))
         }
     }
 
-    pub fn metrics_sample_at(&self, offset_from_latest: usize) -> Option<&MetricSample> {
-        let history = self.training_metrics_history();
-        if history.is_empty() {
+    pub fn metrics_sample_at(&self, offset_from_latest: usize) -> Option<MetricSample> {
+        let total = self.metrics_history_total_len();
+        if total == 0 || offset_from_latest >= total {
             return None;
         }
-        let len = history.len();
-        if offset_from_latest >= len {
-            None
-        } else {
-            history.get(len - 1 - offset_from_latest)
-        }
+        let index_from_oldest = total - 1 - offset_from_latest;
+        self.metrics_sample_by_index_from_oldest(index_from_oldest)
     }
 
-    pub fn selected_metric_sample(&self) -> Option<&MetricSample> {
+    pub fn selected_metric_sample(&self) -> Option<MetricSample> {
         let index = self.metrics_history_selected_index();
         self.metrics_sample_at(index)
     }
@@ -2462,7 +2562,7 @@ impl App {
     }
 
     pub fn metrics_history_move_older(&mut self) {
-        let len = self.training_metrics_history().len();
+        let len = self.metrics_history_total_len();
         if self.metrics_history_index + 1 < len {
             self.metrics_history_index += 1;
         } else if len > 0 {
@@ -2479,11 +2579,11 @@ impl App {
     }
 
     pub fn metrics_history_page_older(&mut self, count: usize) {
-        let history = self.training_metrics_history();
-        if history.is_empty() {
+        let total = self.metrics_history_total_len();
+        if total == 0 {
             return;
         }
-        let max_index = history.len() - 1;
+        let max_index = total - 1;
         let new_index = self.metrics_history_index.saturating_add(count);
         self.metrics_history_index = new_index.min(max_index);
     }
@@ -2497,9 +2597,9 @@ impl App {
     }
 
     pub fn metrics_history_to_oldest(&mut self) {
-        let history = self.training_metrics_history();
-        if !history.is_empty() {
-            self.metrics_history_index = history.len() - 1;
+        let total = self.metrics_history_total_len();
+        if total > 0 {
+            self.metrics_history_index = total - 1;
         }
     }
 
@@ -2644,29 +2744,29 @@ impl App {
         smoothing: ChartSmoothingKind,
     ) -> Option<ChartData> {
         let metric = self.current_chart_metric()?;
-        let samples = self.training_metrics_history();
-        if samples.is_empty() {
+        let total = self.metrics_history_total_len();
+        if total == 0 {
             return None;
         }
 
         let max_points = max_points.max(1);
-        let len = samples.len();
         let selected_idx = self.metrics_history_selected_index();
-        let selected_pos = len.saturating_sub(1).saturating_sub(selected_idx);
-        let start = if selected_pos + max_points >= len {
-            len.saturating_sub(max_points)
+        let selected_pos = total.saturating_sub(1).saturating_sub(selected_idx);
+        let start = if selected_pos + max_points >= total {
+            total.saturating_sub(max_points)
         } else {
             selected_pos
         };
-        let end = (start + max_points).min(len);
+        let end = (start + max_points).min(total);
+        let samples = self.metrics_range_by_index_from_oldest(start, end);
         let mut points = Vec::new();
 
-        for (idx, sample) in samples.iter().enumerate().take(end).skip(start) {
+        for (local_idx, sample) in samples.iter().enumerate() {
             if let Some(value) = App::chart_value_for_sample(sample, &metric) {
                 let x = sample
                     .training_iteration()
                     .map(|iter| iter as f64)
-                    .unwrap_or_else(|| idx as f64);
+                    .unwrap_or_else(|| (start + local_idx) as f64);
                 points.push((x, value));
             }
         }
@@ -2704,7 +2804,7 @@ impl App {
     pub fn selected_chart_value(&self) -> Option<f64> {
         let sample = self.selected_metric_sample()?;
         let metric = self.current_chart_metric()?;
-        App::chart_value_for_sample(sample, &metric)
+        App::chart_value_for_sample(&sample, &metric)
     }
 
     fn visible_resume_points(&self) -> Vec<ResumePoint> {
@@ -2735,13 +2835,59 @@ impl App {
             .or(self.metrics_resume_iteration)
     }
 
+    fn sample_for_training_iteration(&self, iteration: u64) -> Option<MetricSample> {
+        if let Some(view) = &self.archived_run_view {
+            if view.metrics_stream.is_none() {
+                return view
+                    .run
+                    .metrics
+                    .iter()
+                    .cloned()
+                    .find(|s| s.training_iteration() == Some(iteration));
+            }
+
+            let total = view.metrics_len();
+            if total == 0 {
+                return None;
+            }
+
+            let mut lo: usize = 0;
+            let mut hi: usize = total.saturating_sub(1);
+            while lo <= hi {
+                let mid = lo + (hi - lo) / 2;
+                let sample = view.metrics_get(mid)?;
+                let mid_iter = sample.training_iteration().unwrap_or(mid as u64);
+                if mid_iter == iteration {
+                    return Some(sample);
+                }
+                if mid_iter < iteration {
+                    lo = mid.saturating_add(1);
+                } else {
+                    if mid == 0 {
+                        break;
+                    }
+                    hi = mid - 1;
+                }
+            }
+            return None;
+        }
+
+        if let Some(metrics) = &self.session_merged_metrics {
+            return metrics
+                .iter()
+                .cloned()
+                .find(|s| s.training_iteration() == Some(iteration));
+        }
+        self.metrics_timeline
+            .iter()
+            .cloned()
+            .find(|s| s.training_iteration() == Some(iteration))
+    }
+
     pub fn resume_marker_value(&self, option: &ChartMetricOption) -> Option<f64> {
         let iteration = self.resume_marker_iteration()?;
-        let sample = self
-            .training_metrics_history()
-            .iter()
-            .find(|s| s.training_iteration() == Some(iteration))?;
-        App::chart_value_for_sample(sample, option)
+        let sample = self.sample_for_training_iteration(iteration)?;
+        App::chart_value_for_sample(&sample, option)
     }
 
     pub fn resume_markers_for_metric(
@@ -2752,10 +2898,8 @@ impl App {
             .iter()
             .map(|point| {
                 let y = self
-                    .training_metrics_history()
-                    .iter()
-                    .find(|s| s.training_iteration() == Some(point.iteration))
-                    .and_then(|s| App::chart_value_for_sample(s, option));
+                    .sample_for_training_iteration(point.iteration)
+                    .and_then(|s| App::chart_value_for_sample(&s, option));
                 let color = if point.color.trim().is_empty() {
                     self.chart_resume_marker_color()
                 } else {
@@ -2767,8 +2911,8 @@ impl App {
     }
 
     pub fn latest_chart_value(&self, option: &ChartMetricOption) -> Option<f64> {
-        let sample = self.training_metrics_history().last()?;
-        App::chart_value_for_sample(sample, option)
+        let sample = self.metrics_sample_at(0)?;
+        App::chart_value_for_sample(&sample, option)
     }
 
     fn chart_value_for_sample(sample: &MetricSample, option: &ChartMetricOption) -> Option<f64> {
@@ -2873,11 +3017,12 @@ impl App {
                 .collect()
         }
 
+        let history = self.metrics_history_vec_for_processing(max_points);
         let mut raw = match option.kind() {
             ChartMetricKind::AllPoliciesRewardMean
             | ChartMetricKind::AllPoliciesEpisodeLenMean
             | ChartMetricKind::AllPoliciesLearnerStat(_) => collect_policy_series(
-                self.training_metrics_history(),
+                &history,
                 option.kind(),
                 None,
                 false,
@@ -2910,9 +3055,23 @@ impl App {
         self.apply_multi_series_smoothing(raw, smoothing, max_points.max(1))
     }
 
+    fn metrics_history_vec_for_processing(&self, max_points: usize) -> Vec<MetricSample> {
+        let total = self.metrics_history_total_len();
+        if total == 0 {
+            return Vec::new();
+        }
+        if max_points == usize::MAX {
+            return self.metrics_range_by_index_from_oldest(0, total);
+        }
+        let wanted = max_points.max(1);
+        let start = total.saturating_sub(wanted);
+        self.metrics_range_by_index_from_oldest(start, total)
+    }
+
     fn chart_points_for_option(&self, option: &ChartMetricOption) -> Vec<(f64, f64)> {
+        let samples = self.metrics_history_vec_for_processing(usize::MAX);
         let mut points = Vec::new();
-        for (idx, sample) in self.training_metrics_history().iter().enumerate() {
+        for (idx, sample) in samples.iter().enumerate() {
             if let Some(value) = App::chart_value_for_sample(sample, option) {
                 let x = sample
                     .training_iteration()
@@ -3164,8 +3323,7 @@ impl App {
             }
         }
 
-        if let (Some(area), Some(sel_sample)) = (stats_area, self.selected_metric_sample().cloned())
-        {
+        if let (Some(area), Some(sel_sample)) = (stats_area, self.selected_metric_sample()) {
             let overlay_sample = self.selected_overlay_sample().cloned();
             let lines =
                 self.build_export_stats_lines(&metric_option, &sel_sample, overlay_sample.as_ref());
@@ -3188,7 +3346,7 @@ impl App {
             | ChartMetricKind::AllPoliciesLearnerStat(_) => None,
             _ => {
                 let sample = self.selected_metric_sample()?;
-                let y = App::chart_value_for_sample(sample, option)?;
+                let y = App::chart_value_for_sample(&sample, option)?;
                 let x = sample
                     .training_iteration()
                     .map(|iter| iter as f64)
@@ -3392,10 +3550,6 @@ impl App {
 
     pub fn metrics_info_settings(&self) -> &MetricsInfoSettings {
         &self.metrics_info_settings
-    }
-
-    pub fn metrics_resume_points(&self) -> &[ResumePoint] {
-        &self.metrics_resume_points
     }
 
     pub fn metrics_settings_edit_buffer(&self) -> &str {
@@ -3614,7 +3768,7 @@ impl App {
             return Ok(());
         }
 
-        let sample = match self.selected_metric_sample().cloned() {
+        let sample = match self.selected_metric_sample() {
             Some(sample) => sample,
             None => {
                 self.set_status(
@@ -3963,7 +4117,7 @@ impl App {
             let path = project.root_path.join(&link.run_path);
             if let Ok(run) = runs::load_saved_run(&path) {
                 run_count += 1;
-                if let Some((lo, hi)) = Self::run_iter_span(&run.metrics) {
+                if let Some((lo, hi)) = Self::run_iter_span_for_run(&run) {
                     let span = hi.saturating_sub(lo);
                     total_iters = total_iters.max(link.start_iteration.saturating_add(span));
                 }
@@ -4247,10 +4401,6 @@ impl App {
 
     pub fn chart_resume_marker_color(&self) -> Color {
         Self::color_from_name(&self.metrics_color_settings.resume_marker_color)
-    }
-
-    pub fn color_from_name_public(&self, name: &str) -> Color {
-        Self::color_from_name(name)
     }
 
     pub fn policy_color(&self, policy_id: &str, idx: usize) -> Color {
@@ -4537,7 +4687,7 @@ impl App {
         }
 
         // Horizontal scroll - limit to reasonable policy count
-        if let Some(sample) = self.training_metrics_history().last() {
+        if let Some(sample) = self.latest_training_metric() {
             let num_policies = sample.policies().len();
             if num_policies > 0 {
                 self.metrics_policies_horizontal_scroll = self
@@ -4934,8 +5084,8 @@ impl App {
         self.export_output_scroll = 0;
     }
 
-    pub fn latest_training_metric(&self) -> Option<&MetricSample> {
-        self.training_metrics_history().last()
+    pub fn latest_training_metric(&self) -> Option<MetricSample> {
+        self.metrics_sample_at(0)
     }
 
     pub fn is_training_running(&self) -> bool {
@@ -5031,6 +5181,84 @@ impl App {
 
     pub fn confirm_quit(&mut self) {
         self.should_quit = true;
+    }
+
+    fn begin_confirm_action(&mut self, action: ConfirmAction) {
+        if self.input_mode == InputMode::ConfirmQuit {
+            return;
+        }
+        if self.input_mode == InputMode::ConfirmAction {
+            return;
+        }
+        self.confirm_action = Some(action);
+        self.confirm_action_return_mode = Some(self.input_mode);
+        self.input_mode = InputMode::ConfirmAction;
+    }
+
+    pub fn confirm_action(&mut self) {
+        let action = match self.confirm_action.take() {
+            Some(action) => action,
+            None => {
+                self.input_mode = self
+                    .confirm_action_return_mode
+                    .take()
+                    .unwrap_or(InputMode::Normal);
+                return;
+            }
+        };
+        let return_mode = self
+            .confirm_action_return_mode
+            .take()
+            .unwrap_or(InputMode::Normal);
+        self.input_mode = return_mode;
+        match action {
+            ConfirmAction::CancelTraining => self.cancel_training(),
+            ConfirmAction::ClearTrainingOutput => self.clear_training_output(),
+            ConfirmAction::ClearRunOverlays => self.clear_run_overlays(),
+        }
+    }
+
+    pub fn cancel_confirm_action(&mut self) {
+        self.confirm_action = None;
+        self.input_mode = self
+            .confirm_action_return_mode
+            .take()
+            .unwrap_or(InputMode::Normal);
+        self.set_status("Cancelled", StatusKind::Info);
+    }
+
+    pub fn confirm_action_prompt(&self) -> Option<(&'static str, &'static str)> {
+        let action = self.confirm_action?;
+        let (title, body) = match action {
+            ConfirmAction::CancelTraining => ("Cancel Training", "Cancel the active training run?"),
+            ConfirmAction::ClearTrainingOutput => ("Clear Training Log", "Clear the training output log?"),
+            ConfirmAction::ClearRunOverlays => ("Clear Overlays", "Remove all loaded run overlays?"),
+        };
+        Some((title, body))
+    }
+
+    pub fn request_cancel_training(&mut self) {
+        if !self.training_running {
+            self.set_status("No training is running", StatusKind::Info);
+            return;
+        }
+        self.begin_confirm_action(ConfirmAction::CancelTraining);
+    }
+
+    pub fn request_clear_training_output(&mut self) {
+        if self.training_output.is_empty() {
+            self.set_status("Training output is already clear", StatusKind::Info);
+            return;
+        }
+        self.begin_confirm_action(ConfirmAction::ClearTrainingOutput);
+    }
+
+    pub fn request_clear_run_overlays(&mut self) {
+        if self.saved_run_overlays.is_empty() {
+            self.set_status("No overlays loaded", StatusKind::Info);
+            return;
+        }
+        self.begin_confirm_action(ConfirmAction::ClearRunOverlays);
     }
 
     pub fn start_config_edit(&mut self, field: ConfigField) {
@@ -5165,6 +5393,142 @@ impl App {
             idx = ((idx % len) + len) % len;
             menu.selected = idx as usize;
         }
+    }
+
+    pub fn open_discovered_run_menu(&mut self) -> Result<()> {
+        let origin_mode = self.input_mode;
+        self.config_return_mode = Some(origin_mode);
+        self.input_mode = InputMode::SelectingConfigOption;
+
+        self.refresh_discovered_runs();
+        let mut options: Vec<ConfigChoice> = Vec::new();
+        options.push(ConfigChoice::new(
+            "Pick a run file manually",
+            "manual",
+            "Opens the file browser to select a saved run json file.",
+        ));
+
+        for run in &self.discovered_runs {
+            let desc = run
+                .latest_checkpoint
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str())
+                .map(|ckpt| format!("Latest checkpoint: {ckpt}"))
+                .unwrap_or_else(|| "result.json metrics".to_string());
+            options.push(ConfigChoice::new(
+                run.label.clone(),
+                run.path.to_string_lossy().to_string(),
+                desc,
+            ));
+        }
+
+        let selected = self
+            .selected_discovered_index
+            .map(|idx| idx.saturating_add(1))
+            .unwrap_or(0)
+            .min(options.len().saturating_sub(1));
+
+        self.choice_menu = Some(ChoiceMenuState {
+            target: ChoiceMenuTarget::DiscoveredRun,
+            label: "RLlib Runs".to_string(),
+            options,
+            selected,
+        });
+        Ok(())
+    }
+
+    fn refresh_discovered_runs(&mut self) {
+        self.discovered_runs.clear();
+        self.selected_discovered_index = None;
+
+        let Some(project) = self.active_project.as_ref() else {
+            return;
+        };
+
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        let roots = [
+            project.logs_path.join("rllib"),
+            project.root_path.join("ray_results"),
+        ];
+        for root in roots {
+            self.scan_rllib_run_dirs(&root, 4, &mut candidates, 256);
+        }
+        candidates.sort();
+        candidates.dedup();
+
+        for dir in candidates {
+            let manifest = self.parse_run_manifest(&dir);
+            let algo = manifest
+                .as_ref()
+                .map(|m| m.algorithm.clone())
+                .unwrap_or_else(|| "RLlib".to_string());
+            let tag = manifest.as_ref().map(|m| m.tag.clone()).unwrap_or_else(|| {
+                dir.file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("run")
+                    .to_string()
+            });
+            let label = format!("{algo} • {tag}");
+            let latest_checkpoint = self.latest_checkpoint_dir_in_dir(&dir);
+            self.discovered_runs.push(DiscoveredRun {
+                path: dir,
+                label,
+                latest_checkpoint,
+            });
+        }
+    }
+
+    fn scan_rllib_run_dirs(
+        &self,
+        root: &Path,
+        depth_left: usize,
+        out: &mut Vec<PathBuf>,
+        limit: usize,
+    ) {
+        if out.len() >= limit || !root.is_dir() {
+            return;
+        }
+        if root.join("result.json").is_file() {
+            out.push(root.to_path_buf());
+            return;
+        }
+        if depth_left == 0 {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if out.len() >= limit {
+                break;
+            }
+            let path = entry.path();
+            if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                self.scan_rllib_run_dirs(&path, depth_left - 1, out, limit);
+            }
+        }
+    }
+
+    fn latest_checkpoint_dir_in_dir(&self, path: &Path) -> Option<PathBuf> {
+        let Ok(entries) = fs::read_dir(path) else {
+            return None;
+        };
+        let mut best: Option<(u32, PathBuf)> = None;
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let Some(num) = Self::checkpoint_number_from_path(&entry_path) else {
+                continue;
+            };
+            match best.as_ref() {
+                Some((current, _)) if *current >= num => {}
+                _ => best = Some((num, entry_path)),
+            }
+        }
+        best.map(|(_, p)| p)
     }
 
     pub fn confirm_choice_selection(&mut self) -> Result<()> {
@@ -5867,12 +6231,39 @@ impl App {
             }
             ConfigField::RllibResumeFrom => self.training_config.rllib_resume_from.clone(),
             ConfigField::RllibStopMode => match self.training_config.rllib_stop_mode {
+                RllibStopMode::None => "none".to_string(),
                 RllibStopMode::TimeSeconds => "time_seconds".to_string(),
                 RllibStopMode::Timesteps => "timesteps".to_string(),
             },
             ConfigField::RllibStopTimeSeconds => {
                 self.training_config.rllib_stop_time_seconds.to_string()
             }
+            ConfigField::RllibStopTimestepsTotal => {
+                self.training_config.rllib_stop_timesteps_total.to_string()
+            }
+            ConfigField::RllibStopSustainedRewardEnabled => if self
+                .training_config
+                .rllib_stop_sustained_reward_enabled
+            {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string(),
+            ConfigField::RllibStopSustainedRewardThreshold => {
+                format_f64(self.training_config.rllib_stop_sustained_reward_threshold)
+            }
+            ConfigField::RllibStopSustainedRewardWindow => self
+                .training_config
+                .rllib_stop_sustained_reward_window
+                .to_string(),
+            ConfigField::RllibStopFileEnabled => if self.training_config.rllib_stop_file_enabled {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string(),
+            ConfigField::RllibStopFilePath => self.training_config.rllib_stop_file_path.clone(),
             ConfigField::MarsEnvPath => self.mars_config.env_path.clone(),
             ConfigField::MarsEnvName => self.mars_config.env_name.clone(),
             ConfigField::MarsMethod => self.mars_config.method.clone(),
@@ -6763,6 +7154,7 @@ impl App {
                     false
                 } else {
                     self.training_config.rllib_stop_mode = defaults.rllib_stop_mode;
+                    self.rebuild_advanced_fields();
                     true
                 }
             }
@@ -6772,6 +7164,70 @@ impl App {
                     false
                 } else {
                     self.training_config.rllib_stop_time_seconds = defaults.rllib_stop_time_seconds;
+                    true
+                }
+            }
+            ConfigField::RllibStopTimestepsTotal => {
+                if self.training_config.rllib_stop_timesteps_total
+                    == defaults.rllib_stop_timesteps_total
+                {
+                    false
+                } else {
+                    self.training_config.rllib_stop_timesteps_total =
+                        defaults.rllib_stop_timesteps_total;
+                    true
+                }
+            }
+            ConfigField::RllibStopSustainedRewardEnabled => {
+                if self.training_config.rllib_stop_sustained_reward_enabled
+                    == defaults.rllib_stop_sustained_reward_enabled
+                {
+                    false
+                } else {
+                    self.training_config.rllib_stop_sustained_reward_enabled =
+                        defaults.rllib_stop_sustained_reward_enabled;
+                    self.rebuild_advanced_fields();
+                    true
+                }
+            }
+            ConfigField::RllibStopSustainedRewardThreshold => {
+                if self.training_config.rllib_stop_sustained_reward_threshold
+                    == defaults.rllib_stop_sustained_reward_threshold
+                {
+                    false
+                } else {
+                    self.training_config.rllib_stop_sustained_reward_threshold =
+                        defaults.rllib_stop_sustained_reward_threshold;
+                    true
+                }
+            }
+            ConfigField::RllibStopSustainedRewardWindow => {
+                if self.training_config.rllib_stop_sustained_reward_window
+                    == defaults.rllib_stop_sustained_reward_window
+                {
+                    false
+                } else {
+                    self.training_config.rllib_stop_sustained_reward_window =
+                        defaults.rllib_stop_sustained_reward_window;
+                    true
+                }
+            }
+            ConfigField::RllibStopFileEnabled => {
+                if self.training_config.rllib_stop_file_enabled == defaults.rllib_stop_file_enabled
+                {
+                    false
+                } else {
+                    self.training_config.rllib_stop_file_enabled = defaults.rllib_stop_file_enabled;
+                    self.rebuild_advanced_fields();
+                    true
+                }
+            }
+            ConfigField::RllibStopFilePath => {
+                if self.training_config.rllib_stop_file_path == defaults.rllib_stop_file_path {
+                    false
+                } else {
+                    self.training_config.rllib_stop_file_path =
+                        defaults.rllib_stop_file_path.clone();
                     true
                 }
             }
@@ -7296,11 +7752,13 @@ impl App {
             ConfigField::RllibStopMode => {
                 let mode = trimmed.to_lowercase();
                 let stop_mode = match mode.as_str() {
+                    "none" | "manual" | "infinite" | "inf" => RllibStopMode::None,
                     "time" | "time_seconds" | "seconds" | "s" => RllibStopMode::TimeSeconds,
                     "timesteps" | "steps" | "timesteps_total" | "t" => RllibStopMode::Timesteps,
-                    _ => bail!("Stop mode must be 'time' or 'timesteps'"),
+                    _ => bail!("Stop mode must be 'none', 'time', or 'timesteps'"),
                 };
                 self.training_config.rllib_stop_mode = stop_mode;
+                self.rebuild_advanced_fields();
             }
             ConfigField::RllibStopTimeSeconds => {
                 let val: u64 = trimmed
@@ -7310,6 +7768,43 @@ impl App {
                     bail!("Time limit must be at least 1 second");
                 }
                 self.training_config.rllib_stop_time_seconds = val;
+            }
+            ConfigField::RllibStopTimestepsTotal => {
+                let val: u64 = trimmed
+                    .parse()
+                    .wrap_err("Timesteps limit must be a positive integer")?;
+                if val == 0 {
+                    bail!("Timesteps limit must be at least 1");
+                }
+                self.training_config.rllib_stop_timesteps_total = val;
+            }
+            ConfigField::RllibStopSustainedRewardEnabled => {
+                self.training_config.rllib_stop_sustained_reward_enabled =
+                    matches!(trimmed.to_lowercase().as_str(), "true" | "yes" | "1" | "on");
+                self.rebuild_advanced_fields();
+            }
+            ConfigField::RllibStopSustainedRewardThreshold => {
+                let val: f64 = trimmed
+                    .parse()
+                    .wrap_err("Reward threshold must be a number")?;
+                self.training_config.rllib_stop_sustained_reward_threshold = val;
+            }
+            ConfigField::RllibStopSustainedRewardWindow => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("Reward window must be a positive integer")?;
+                if val == 0 {
+                    bail!("Reward window must be at least 1");
+                }
+                self.training_config.rllib_stop_sustained_reward_window = val;
+            }
+            ConfigField::RllibStopFileEnabled => {
+                self.training_config.rllib_stop_file_enabled =
+                    matches!(trimmed.to_lowercase().as_str(), "true" | "yes" | "1" | "on");
+                self.rebuild_advanced_fields();
+            }
+            ConfigField::RllibStopFilePath => {
+                self.training_config.rllib_stop_file_path = trimmed.to_string();
             }
             ConfigField::MarsEnvPath => {
                 self.mars_config.env_path = trimmed.to_string();
@@ -7411,6 +7906,501 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn validate_config_field_input(&self, field: ConfigField, value: &str) -> Result<String> {
+        let trimmed = value.trim();
+        match field {
+            ConfigField::EnvPath => Ok(trimmed.to_string()),
+            ConfigField::Timesteps => {
+                let val: u64 = trimmed
+                    .parse()
+                    .wrap_err("Timesteps must be a positive number")?;
+                Ok(val.to_string())
+            }
+            ConfigField::ExperimentName => {
+                if trimmed.is_empty() {
+                    bail!("Experiment name cannot be empty");
+                }
+                Ok(trimmed.to_string())
+            }
+            ConfigField::Sb3PolicyType => {
+                let Some(policy) = PolicyType::from_str(trimmed) else {
+                    bail!("Unknown SB3 policy type '{trimmed}'");
+                };
+                Ok(policy.as_str().to_string())
+            }
+            ConfigField::Sb3Speedup => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("Speedup must be a positive integer")?;
+                if val == 0 {
+                    bail!("Speedup must be at least 1");
+                }
+                Ok(val.to_string())
+            }
+            ConfigField::Sb3NParallel => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("N parallel must be a positive integer")?;
+                if val == 0 {
+                    bail!("N parallel must be at least 1");
+                }
+                Ok(val.to_string())
+            }
+            ConfigField::Sb3Viz => Ok(
+                matches!(trimmed.to_lowercase().as_str(), "true" | "yes" | "1" | "on").to_string(),
+            ),
+            ConfigField::Sb3PolicyLayers
+            | ConfigField::Sb3CnnChannels
+            | ConfigField::RllibFcnetHiddens
+            | ConfigField::RllibCnnChannels => {
+                let layers = parse_usize_list(trimmed)?;
+                Ok(format_usize_list_compact(&layers))
+            }
+            ConfigField::Sb3LstmHiddenSize
+            | ConfigField::Sb3GrnHiddenSize
+            | ConfigField::RllibLstmCellSize
+            | ConfigField::RllibGrnHiddenSize => {
+                let val: usize = trimmed
+                    .parse()
+                    .wrap_err("Hidden size must be a positive integer")?;
+                if val == 0 {
+                    bail!("Hidden size must be greater than 0");
+                }
+                Ok(val.to_string())
+            }
+            ConfigField::Sb3LstmNumLayers | ConfigField::RllibLstmNumLayers => {
+                let val: usize = trimmed
+                    .parse()
+                    .wrap_err("Number of layers must be a positive integer")?;
+                if val == 0 {
+                    bail!("Number of layers must be at least 1");
+                }
+                Ok(val.to_string())
+            }
+            ConfigField::Sb3LearningRate => {
+                let val: f64 = trimmed.parse().wrap_err("Learning rate must be a number")?;
+                if val <= 0.0 {
+                    bail!("Learning rate must be greater than 0");
+                }
+                Ok(format_f64(val))
+            }
+            ConfigField::Sb3BatchSize => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("Batch size must be a positive integer")?;
+                if val == 0 {
+                    bail!("Batch size must be at least 1");
+                }
+                Ok(val.to_string())
+            }
+            ConfigField::Sb3NSteps => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("n_steps must be a positive integer")?;
+                if val == 0 {
+                    bail!("n_steps must be at least 1");
+                }
+                Ok(val.to_string())
+            }
+            ConfigField::Sb3Gamma => {
+                let val: f64 = trimmed.parse().wrap_err("Gamma must be a number")?;
+                if !(0.0..=1.0).contains(&val) {
+                    bail!("Gamma must be between 0 and 1");
+                }
+                Ok(format_f64(val))
+            }
+            ConfigField::Sb3GaeLambda => {
+                let val: f64 = trimmed.parse().wrap_err("GAE lambda must be a number")?;
+                if !(0.0..=1.0).contains(&val) {
+                    bail!("GAE lambda must be between 0 and 1");
+                }
+                Ok(format_f64(val))
+            }
+            ConfigField::Sb3EntCoef => {
+                let val: f64 = trimmed.parse().wrap_err("Entropy coefficient must be a number")?;
+                if val < 0.0 {
+                    bail!("Entropy coefficient cannot be negative");
+                }
+                Ok(format_f64(val))
+            }
+            ConfigField::Sb3ClipRange => {
+                let val: f64 = trimmed.parse().wrap_err("Clip range must be a number")?;
+                if val <= 0.0 {
+                    bail!("Clip range must be greater than 0");
+                }
+                Ok(format_f64(val))
+            }
+            ConfigField::Sb3VfCoef => {
+                let val: f64 = trimmed
+                    .parse()
+                    .wrap_err("Value function coefficient must be a number")?;
+                if val < 0.0 {
+                    bail!("Value function coefficient cannot be negative");
+                }
+                Ok(format_f64(val))
+            }
+            ConfigField::Sb3MaxGradNorm => {
+                let val: f64 = trimmed.parse().wrap_err("Max grad norm must be a number")?;
+                if val <= 0.0 {
+                    bail!("Max grad norm must be greater than 0");
+                }
+                Ok(format_f64(val))
+            }
+            ConfigField::RllibConfigFile => {
+                if trimmed.is_empty() {
+                    bail!("Config file path cannot be empty");
+                }
+                Ok(normalize_rllib_config_value(trimmed))
+            }
+            ConfigField::RllibShowWindow => Ok(
+                matches!(trimmed.to_lowercase().as_str(), "true" | "yes" | "1" | "on").to_string(),
+            ),
+            ConfigField::RllibAlgorithm => {
+                let Some(algo) = RllibAlgorithm::from_str(trimmed) else {
+                    bail!("Unknown RLlib algorithm '{trimmed}'");
+                };
+                Ok(algo.as_str().to_string())
+            }
+            ConfigField::RllibEnvActionRepeat => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("Action repeat must be a positive integer")?;
+                if val == 0 {
+                    bail!("Action repeat must be at least 1");
+                }
+                Ok(val.to_string())
+            }
+            ConfigField::RllibEnvSpeedup => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("Speedup must be a positive integer")?;
+                if val == 0 {
+                    bail!("Speedup must be at least 1");
+                }
+                Ok(val.to_string())
+            }
+            ConfigField::RllibNumWorkers => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("Number of workers must be a positive integer")?;
+                if val == 0 {
+                    bail!("Number of workers must be at least 1");
+                }
+                Ok(val.to_string())
+            }
+            ConfigField::RllibNumEnvWorkers => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("Environments per worker must be a positive integer")?;
+                if val == 0 {
+                    bail!("Environments per worker must be at least 1");
+                }
+                Ok(val.to_string())
+            }
+            ConfigField::RllibTrainBatchSize => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("Train batch size must be a positive integer")?;
+                if val == 0 {
+                    bail!("Train batch size must be at least 1");
+                }
+                Ok(val.to_string())
+            }
+            ConfigField::RllibSgdMinibatchSize => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("SGD minibatch size must be a positive integer")?;
+                if val == 0 {
+                    bail!("SGD minibatch size must be at least 1");
+                }
+                Ok(val.to_string())
+            }
+            ConfigField::RllibNumSgdIter => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("Number of SGD iterations must be a positive integer")?;
+                if val == 0 {
+                    bail!("Number of SGD iterations must be at least 1");
+                }
+                Ok(val.to_string())
+            }
+            ConfigField::RllibRolloutFragmentLength => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("Rollout fragment length must be a positive integer")?;
+                if val == 0 {
+                    bail!("Rollout fragment length must be at least 1");
+                }
+                Ok(val.to_string())
+            }
+            ConfigField::RllibMaxSeqLen => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("Max sequence length must be a positive integer")?;
+                if val == 0 {
+                    bail!("Max sequence length must be at least 1");
+                }
+                Ok(val.to_string())
+            }
+            ConfigField::RllibCheckpointFrequency => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("Checkpoint frequency must be a positive integer")?;
+                if val == 0 {
+                    bail!("Checkpoint frequency must be at least 1");
+                }
+                Ok(val.to_string())
+            }
+            ConfigField::RllibStopSustainedRewardWindow => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("Reward window must be a positive integer")?;
+                if val == 0 {
+                    bail!("Reward window must be at least 1");
+                }
+                Ok(val.to_string())
+            }
+            ConfigField::RllibLr => {
+                let val: f64 = trimmed.parse().wrap_err("Learning rate must be a number")?;
+                if val <= 0.0 {
+                    bail!("Learning rate must be greater than 0");
+                }
+                Ok(format_f64(val))
+            }
+            ConfigField::RllibGamma => {
+                let val: f64 = trimmed.parse().wrap_err("Gamma must be a number")?;
+                if !(0.0..=1.0).contains(&val) {
+                    bail!("Gamma must be between 0 and 1");
+                }
+                Ok(format_f64(val))
+            }
+            ConfigField::RllibLambda => {
+                let val: f64 = trimmed.parse().wrap_err("Lambda must be a number")?;
+                if !(0.0..=1.0).contains(&val) {
+                    bail!("Lambda must be between 0 and 1");
+                }
+                Ok(format_f64(val))
+            }
+            ConfigField::RllibClipParam => {
+                let val: f64 = trimmed.parse().wrap_err("Clip param must be a number")?;
+                if val <= 0.0 {
+                    bail!("Clip param must be greater than 0");
+                }
+                Ok(format_f64(val))
+            }
+            ConfigField::RllibEntropyCoeff => {
+                let val: f64 = trimmed
+                    .parse()
+                    .wrap_err("Entropy coefficient must be a number")?;
+                if val < 0.0 {
+                    bail!("Entropy coefficient cannot be negative");
+                }
+                Ok(format_f64(val))
+            }
+            ConfigField::RllibVfLossCoeff => {
+                let val: f64 = trimmed
+                    .parse()
+                    .wrap_err("VF loss coefficient must be a number")?;
+                if val < 0.0 {
+                    bail!("VF loss coefficient cannot be negative");
+                }
+                Ok(format_f64(val))
+            }
+            ConfigField::RllibGradClip => {
+                let val: f64 = trimmed.parse().wrap_err("Grad clip must be a number")?;
+                if val <= 0.0 {
+                    bail!("Grad clip must be greater than 0");
+                }
+                Ok(format_f64(val))
+            }
+            ConfigField::RllibStopSustainedRewardThreshold => {
+                let val: f64 = trimmed
+                    .parse()
+                    .wrap_err("Reward threshold must be a number")?;
+                Ok(format_f64(val))
+            }
+            ConfigField::RllibNumGpus => {
+                let val: f64 = trimmed.parse().wrap_err("Number of GPUs must be a number")?;
+                if val < 0.0 {
+                    bail!("Number of GPUs cannot be negative");
+                }
+                Ok(format_f64(val))
+            }
+            ConfigField::RllibFramework => {
+                if trimmed.is_empty() {
+                    bail!("Framework cannot be empty");
+                }
+                Ok(trimmed.to_string())
+            }
+            ConfigField::RllibActivation => {
+                if trimmed.is_empty() {
+                    bail!("Activation cannot be empty");
+                }
+                Ok(trimmed.to_string())
+            }
+            ConfigField::RllibBatchMode => {
+                if trimmed.is_empty() {
+                    bail!("Batch mode cannot be empty");
+                }
+                let lower = trimmed.to_lowercase();
+                if lower != "truncate_episodes" && lower != "complete_episodes" {
+                    bail!("Batch mode must be 'truncate_episodes' or 'complete_episodes'");
+                }
+                Ok(lower)
+            }
+            ConfigField::RllibResumeFrom | ConfigField::RllibStopFilePath => Ok(trimmed.to_string()),
+            ConfigField::RllibPolicyType => {
+                let Some(policy) = PolicyType::from_str(trimmed) else {
+                    bail!("Unknown RLlib policy type '{trimmed}'");
+                };
+                Ok(policy.as_str().to_string())
+            }
+            ConfigField::RllibLstmIncludePrevActions
+            | ConfigField::RllibStopSustainedRewardEnabled
+            | ConfigField::RllibStopFileEnabled => Ok(
+                matches!(trimmed.to_lowercase().as_str(), "true" | "yes" | "1" | "on").to_string(),
+            ),
+            ConfigField::RllibStopMode => {
+                let mode = trimmed.to_lowercase();
+                let stop_mode = match mode.as_str() {
+                    "none" | "manual" | "infinite" | "inf" => "none",
+                    "time" | "time_seconds" | "seconds" | "s" => "time_seconds",
+                    "timesteps" | "steps" | "timesteps_total" | "t" => "timesteps",
+                    _ => bail!("Stop mode must be 'none', 'time', or 'timesteps'"),
+                };
+                Ok(stop_mode.to_string())
+            }
+            ConfigField::RllibStopTimeSeconds => {
+                let val: u64 = trimmed
+                    .parse()
+                    .wrap_err("Time limit must be a positive integer of seconds")?;
+                if val == 0 {
+                    bail!("Time limit must be at least 1 second");
+                }
+                Ok(val.to_string())
+            }
+            ConfigField::RllibStopTimestepsTotal => {
+                let val: u64 = trimmed
+                    .parse()
+                    .wrap_err("Timesteps limit must be a positive integer")?;
+                if val == 0 {
+                    bail!("Timesteps limit must be at least 1");
+                }
+                Ok(val.to_string())
+            }
+            ConfigField::MarsEnvPath => Ok(trimmed.to_string()),
+            ConfigField::MarsMaxEpisodes => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("Max episodes must be a positive integer")?;
+                if val == 0 {
+                    bail!("Max episodes must be at least 1");
+                }
+                Ok(val.to_string())
+            }
+            ConfigField::MarsMaxStepsPerEpisode => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("Max steps per episode must be a positive integer")?;
+                if val == 0 {
+                    bail!("Max steps per episode must be at least 1");
+                }
+                Ok(val.to_string())
+            }
+            ConfigField::MarsNumEnvs => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("Number of envs must be a positive integer")?;
+                if val == 0 {
+                    bail!("Number of envs must be at least 1");
+                }
+                Ok(val.to_string())
+            }
+            ConfigField::MarsNumProcess => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("Number of processes must be a positive integer")?;
+                if val == 0 {
+                    bail!("Number of processes must be at least 1");
+                }
+                Ok(val.to_string())
+            }
+            ConfigField::MarsBatchSize => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("Batch size must be a positive integer")?;
+                if val == 0 {
+                    bail!("Batch size must be at least 1");
+                }
+                Ok(val.to_string())
+            }
+            ConfigField::MarsLearningRate => {
+                let val: f64 = trimmed.parse().wrap_err("Learning rate must be a number")?;
+                if val <= 0.0 {
+                    bail!("Learning rate must be greater than 0");
+                }
+                Ok(format_f64(val))
+            }
+            ConfigField::MarsLogInterval => {
+                let val: u32 = trimmed
+                    .parse()
+                    .wrap_err("Log interval must be a positive integer")?;
+                if val == 0 {
+                    bail!("Log interval must be at least 1");
+                }
+                Ok(val.to_string())
+            }
+            ConfigField::MarsEnvName => {
+                if trimmed.is_empty() {
+                    bail!("Env name cannot be empty");
+                }
+                Ok(trimmed.to_string())
+            }
+            ConfigField::MarsMethod => {
+                if trimmed.is_empty() {
+                    bail!("Method cannot be empty");
+                }
+                Ok(trimmed.to_string())
+            }
+            ConfigField::MarsAlgorithm => {
+                if trimmed.is_empty() {
+                    bail!("Algorithm cannot be empty");
+                }
+                Ok(trimmed.to_string())
+            }
+            ConfigField::MarsSeed => {
+                let val: i64 = trimmed.parse().wrap_err("Seed must be an integer")?;
+                Ok(val.to_string())
+            }
+            ConfigField::MarsSaveId => {
+                if trimmed.is_empty() {
+                    bail!("Save id cannot be empty");
+                }
+                Ok(trimmed.to_string())
+            }
+            ConfigField::MarsSavePath => {
+                if trimmed.is_empty() {
+                    bail!("Save path cannot be empty");
+                }
+                Ok(trimmed.to_string())
+            }
+        }
+    }
+
+    pub fn config_edit_validation(&self) -> Option<(bool, String, Option<String>)> {
+        if !matches!(
+            self.input_mode,
+            InputMode::EditingConfig | InputMode::EditingAdvancedConfig
+        ) {
+            return None;
+        }
+        let field = self.active_config_field?;
+        match self.validate_config_field_input(field, &self.config_edit_buffer) {
+            Ok(normalized) => Some((true, String::new(), Some(normalized))),
+            Err(error) => Some((false, error.to_string(), None)),
+        }
     }
 
     fn persist_training_config(&mut self) -> Result<()> {
@@ -7586,6 +8576,19 @@ impl App {
         }
     }
 
+    fn run_iter_span_for_run(run: &SavedRun) -> Option<(u64, u64)> {
+        let summary = runs::run_metrics_summary(run);
+        if let (Some(lo), Some(hi)) = (summary.min_training_iteration, summary.max_training_iteration)
+        {
+            return Some((lo, hi));
+        }
+        if run.metrics.is_empty() {
+            None
+        } else {
+            Self::run_iter_span(&run.metrics)
+        }
+    }
+
     fn session_next_start_iteration(&self) -> u64 {
         let mut next_start = 0;
         if let Some(session) = self.active_session() {
@@ -7595,7 +8598,7 @@ impl App {
                 for link in &runs {
                     let path = project.root_path.join(&link.run_path);
                     if let Ok(run) = runs::load_saved_run(&path) {
-                        if let Some((lo, hi)) = Self::run_iter_span(&run.metrics) {
+                        if let Some((lo, hi)) = Self::run_iter_span_for_run(&run) {
                             let length = hi.saturating_sub(lo);
                             let end = link.start_iteration.saturating_add(length);
                             next_start = next_start.max(end.saturating_add(1));
@@ -7699,14 +8702,25 @@ impl App {
             let path = project_root.join(&link.run_path);
             match runs::load_saved_run(&path) {
                 Ok(run) => {
-                    if run.metrics.is_empty() {
-                        self.log_line(format!(
-                            "[session] run {} is empty, skipping",
-                            path.display()
-                        ));
+                    let metrics = match runs::load_run_metrics(&path, &run) {
+                        Ok(metrics) => metrics,
+                        Err(error) => {
+                            warnings.push(format!(
+                                "Could not load metrics for run {}: {}",
+                                path.display(),
+                                error
+                            ));
+                            continue;
+                        }
+                    };
+                    if metrics.is_empty() {
+                        self.log_line(format!("[session] run {} is empty, skipping", path.display()));
                         continue;
                     }
-                    let Some((lo, hi)) = Self::run_iter_span(&run.metrics) else {
+
+                    let Some((lo, hi)) = Self::run_iter_span_for_run(&run)
+                        .or_else(|| Self::run_iter_span(&metrics))
+                    else {
                         self.log_line(format!(
                             "[session] run {} missing iteration info, skipping",
                             path.display()
@@ -7740,8 +8754,6 @@ impl App {
                     let meta = SessionRunMeta {
                         start: link.start_iteration,
                         end,
-                        run_path: path.clone(),
-                        is_rllib: run.training_mode.to_lowercase().contains("rllib"),
                         rllib_trial_dir: trial_dir,
                         rllib_resume_from: resume_from,
                         checkpoint_frequency,
@@ -7750,7 +8762,7 @@ impl App {
                     loaded.push(LoadedRun {
                         start: link.start_iteration,
                         label: run.name.clone(),
-                        metrics: run.metrics.clone(),
+                        metrics,
                         meta,
                     });
                 }
@@ -7907,7 +8919,7 @@ impl App {
         let mut start_iteration = start_iteration;
         if start_iteration == 0 {
             if let Ok(run) = runs::load_saved_run(run_path) {
-                if let Some((lo, _)) = Self::run_iter_span(&run.metrics) {
+                if let Some((lo, _)) = Self::run_iter_span_for_run(&run) {
                     start_iteration = lo;
                 }
             }
@@ -8491,6 +9503,29 @@ impl App {
             );
         }
 
+        if cfg.rllib_stop_mode == RllibStopMode::Timesteps && cfg.rllib_stop_timesteps_total == 0 {
+            errors.insert(
+                ConfigField::RllibStopTimestepsTotal,
+                "Timesteps limit must be at least 1".to_string(),
+            );
+        }
+
+        if cfg.rllib_stop_sustained_reward_enabled {
+            if cfg.rllib_stop_sustained_reward_window == 0 {
+                errors.insert(
+                    ConfigField::RllibStopSustainedRewardWindow,
+                    "Reward window must be at least 1".to_string(),
+                );
+            }
+        }
+
+        if cfg.rllib_stop_file_enabled && cfg.rllib_stop_file_path.trim().is_empty() {
+            errors.insert(
+                ConfigField::RllibStopFilePath,
+                "Stop file path cannot be empty when enabled".to_string(),
+            );
+        }
+
         errors
     }
 
@@ -8545,7 +9580,28 @@ impl App {
                 let mut fields = vec![
                     ConfigField::RllibConfigFile,
                     ConfigField::RllibStopMode,
-                    ConfigField::RllibStopTimeSeconds,
+                ];
+
+                match self.training_config.rllib_stop_mode {
+                    RllibStopMode::TimeSeconds => fields.push(ConfigField::RllibStopTimeSeconds),
+                    RllibStopMode::Timesteps => fields.push(ConfigField::RllibStopTimestepsTotal),
+                    RllibStopMode::None => {}
+                }
+
+                fields.extend_from_slice(&[
+                    ConfigField::RllibStopSustainedRewardEnabled,
+                ]);
+                if self.training_config.rllib_stop_sustained_reward_enabled {
+                    fields.push(ConfigField::RllibStopSustainedRewardThreshold);
+                    fields.push(ConfigField::RllibStopSustainedRewardWindow);
+                }
+
+                fields.push(ConfigField::RllibStopFileEnabled);
+                if self.training_config.rllib_stop_file_enabled {
+                    fields.push(ConfigField::RllibStopFilePath);
+                }
+
+                fields.extend_from_slice(&[
                     ConfigField::RllibResumeFrom,
                     ConfigField::RllibShowWindow,
                     ConfigField::RllibAlgorithm,
@@ -8553,7 +9609,7 @@ impl App {
                     ConfigField::RllibEnvSpeedup,
                     ConfigField::RllibPolicyType,
                     ConfigField::RllibFcnetHiddens,
-                ];
+                ]);
                 match self.training_config.rllib_policy_type {
                     PolicyType::Cnn => fields.push(ConfigField::RllibCnnChannels),
                     PolicyType::Lstm => {
@@ -9430,7 +10486,8 @@ impl App {
             bail!("Environment path must be a file: {}", env_path.display());
         }
 
-        if self.training_config.timesteps == 0 {
+        if self.training_config.mode == TrainingMode::SingleAgent && self.training_config.timesteps == 0
+        {
             bail!("Timesteps must be greater than 0");
         }
 
@@ -9448,14 +10505,29 @@ impl App {
             }
 
             match self.training_config.rllib_stop_mode {
+                RllibStopMode::None => {}
                 RllibStopMode::TimeSeconds => {
                     if self.training_config.rllib_stop_time_seconds == 0 {
                         bail!("RLlib time limit must be at least 1 second");
                     }
                 }
                 RllibStopMode::Timesteps => {
-                    // Already verified timesteps > 0 above
+                    if self.training_config.rllib_stop_timesteps_total == 0 {
+                        bail!("RLlib timesteps limit must be at least 1");
+                    }
                 }
+            }
+
+            if self.training_config.rllib_stop_sustained_reward_enabled {
+                if self.training_config.rllib_stop_sustained_reward_window == 0 {
+                    bail!("RLlib reward window must be at least 1");
+                }
+            }
+
+            if self.training_config.rllib_stop_file_enabled
+                && self.training_config.rllib_stop_file_path.trim().is_empty()
+            {
+                bail!("RLlib stop file path cannot be empty when enabled");
             }
 
             let resume_trimmed = self.training_config.rllib_resume_from.trim();
@@ -9750,7 +10822,10 @@ impl App {
     }
 
     fn load_run_overlay_from_path(&mut self, path: PathBuf) -> Result<()> {
-        let saved_run = runs::load_saved_run(&path)?;
+        let mut saved_run = runs::load_saved_run(&path)?;
+        if saved_run.metrics.is_empty() {
+            saved_run.metrics = runs::load_run_metrics(&path, &saved_run)?;
+        }
         self.push_overlay_from_run(&saved_run, path.clone())?;
 
         if self.should_activate_archived_run_view() {
@@ -10072,7 +11147,9 @@ impl App {
 
         if let Some(baseline) = &self.resume_baseline {
             let max_iter = self.resume_baseline_max_iteration();
+            let resume_iter = self.metrics_resume_iteration;
             let mut raw_points = Vec::new();
+            let mut ghost_points = Vec::new();
             for (idx, sample) in baseline.iter().enumerate() {
                 let iter_u64 = sample.training_iteration().unwrap_or(idx as u64);
                 if let Some(max_iter) = max_iter {
@@ -10081,19 +11158,35 @@ impl App {
                     }
                 }
                 if let Some(value) = App::chart_value_for_sample(sample, option) {
-                    raw_points.push((iter_u64 as f64, value));
-                }
-            }
-            let start = raw_points.len().saturating_sub(max_points);
-            let mut points: Vec<(f64, f64)> = raw_points.into_iter().skip(start).collect();
-            if !points.is_empty() {
-                if align_to_start {
-                    if let Some((first_x, _)) = points.first().copied() {
-                        for p in points.iter_mut() {
-                            p.0 -= first_x;
-                        }
+                    if resume_iter.map(|resume| iter_u64 > resume).unwrap_or(false) {
+                        ghost_points.push((iter_u64 as f64, value));
+                    } else {
+                        raw_points.push((iter_u64 as f64, value));
                     }
                 }
+            }
+            let reference_first_x = raw_points
+                .first()
+                .or_else(|| ghost_points.first())
+                .map(|p| p.0);
+
+            let start = raw_points.len().saturating_sub(max_points);
+            let mut points: Vec<(f64, f64)> = raw_points.into_iter().skip(start).collect();
+            let ghost_start = ghost_points.len().saturating_sub(max_points);
+            let mut ghost: Vec<(f64, f64)> = ghost_points.into_iter().skip(ghost_start).collect();
+
+            if align_to_start {
+                if let Some(first_x) = reference_first_x {
+                    for p in points.iter_mut() {
+                        p.0 -= first_x;
+                    }
+                    for p in ghost.iter_mut() {
+                        p.0 -= first_x;
+                    }
+                }
+            }
+
+            if !points.is_empty() {
                 let points = apply_chart_smoothing(&points, smoothing);
                 overlays.push(ChartOverlaySeries {
                     label: self
@@ -10102,6 +11195,19 @@ impl App {
                         .unwrap_or_else(|| "Resume baseline".to_string()),
                     color: self.chart_resume_before_color(),
                     points,
+                });
+            }
+
+            if !ghost.is_empty() {
+                let ghost = apply_chart_smoothing(&ghost, smoothing);
+                overlays.push(ChartOverlaySeries {
+                    label: self
+                        .metrics_resume_label
+                        .clone()
+                        .unwrap_or_else(|| "Resume baseline".to_string())
+                        + " (ghost)",
+                    color: Color::DarkGray,
+                    points: ghost,
                 });
             }
         }
@@ -10137,7 +11243,7 @@ impl App {
             }
         }
 
-        for (idx_overlay, overlay) in self.saved_run_overlays.iter().enumerate() {
+        for overlay in &self.saved_run_overlays {
             let metrics = overlay.metrics();
             let len = metrics.len();
             let start = len.saturating_sub(max_points);
@@ -10162,7 +11268,7 @@ impl App {
                 let points = apply_chart_smoothing(&points, smoothing);
                 overlays.push(ChartOverlaySeries {
                     label: overlay.label.clone(),
-                    color: self.overlay_palette_color(idx_overlay),
+                    color: overlay.color,
                     points,
                 });
             }
@@ -10337,11 +11443,7 @@ impl App {
         let resuming_multi = self.training_config.mode == TrainingMode::MultiAgent
             && !self.training_config.rllib_resume_from.trim().is_empty();
         if resuming_multi {
-            let mut data = self.training_metrics_history().to_vec();
-            if data.len() > TRAINING_METRIC_HISTORY_LIMIT {
-                let excess = data.len() - TRAINING_METRIC_HISTORY_LIMIT;
-                data.drain(0..excess);
-            }
+            let data = self.metrics_history_vec_for_processing(TRAINING_METRIC_HISTORY_LIMIT);
             self.resume_baseline = if data.is_empty() { None } else { Some(data) };
         } else {
             self.resume_baseline = None;
@@ -10355,6 +11457,7 @@ impl App {
         self.training_cancel = None;
         self.training_running = true;
         self.metrics_timeline.clear();
+        self.reset_training_metrics_log();
         if !resuming_multi {
             self.clear_resume_markers();
         }
@@ -12777,7 +13880,7 @@ impl App {
         let Some(project) = self.active_project.as_ref() else {
             return;
         };
-        if self.metrics_timeline.is_empty() {
+        if self.metrics_timeline.is_empty() && self.training_metrics_log_path.is_none() {
             return;
         }
 
@@ -12804,6 +13907,9 @@ impl App {
             counter += 1;
         }
 
+        let metrics_path = path.with_extension("metrics.jsonl");
+        let metrics_index_path = path.with_extension("metrics.idx.json");
+
         let duration_seconds = self
             .current_run_start
             .and_then(|start| SystemTime::now().duration_since(start).ok())
@@ -12828,7 +13934,7 @@ impl App {
             }
         }
 
-        let run = SavedRun::new(
+        let mut run = SavedRun::new(
             file_name.clone(),
             project.name.clone(),
             self.training_config.experiment_name.clone(),
@@ -12838,10 +13944,48 @@ impl App {
             },
             timestamp,
             duration_seconds,
-            self.metrics_timeline.clone(),
+            Vec::new(),
             self.training_output.clone(),
             rllib_info,
         );
+
+        let mut using_external_metrics = false;
+        if !self.training_metrics_log_error {
+            if let Some(staging) = self.training_metrics_log_path.as_ref() {
+                if staging.is_file() {
+                    if let Some(parent) = metrics_path.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    let moved: std::io::Result<()> =
+                        fs::rename(staging, &metrics_path).or_else(|_| {
+                            fs::copy(staging, &metrics_path)?;
+                            fs::remove_file(staging).ok();
+                            Ok(())
+                        });
+                    if moved.is_ok() {
+                        if let Ok(summary) =
+                            runs::build_metrics_index(&metrics_path, &metrics_index_path)
+                        {
+                            run.metrics_path = metrics_path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .map(|s| s.to_string());
+                            run.metrics_index_path = metrics_index_path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .map(|s| s.to_string());
+                            run.metrics_summary = Some(summary);
+                            using_external_metrics = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !using_external_metrics {
+            run.metrics = self.metrics_timeline.clone();
+            run.metrics_summary = Some(runs::run_metrics_summary(&run));
+        }
 
         match runs::save_saved_run(&path, &run) {
             Ok(()) => {
@@ -13419,6 +14563,67 @@ impl App {
         let _ = self.append_training_log_line(&log_path, line);
     }
 
+    fn compute_training_metrics_log_path(&self) -> Option<PathBuf> {
+        self.active_project.as_ref().map(|project| {
+            project
+                .root_path
+                .join(PROJECT_CONFIG_DIR)
+                .join(TRAINING_METRICS_LOG_FILENAME)
+        })
+    }
+
+    fn reset_training_metrics_log(&mut self) {
+        self.training_metrics_log_error = false;
+        self.training_metrics_trim_notice_shown = false;
+        self.training_metrics_log_path = self.compute_training_metrics_log_path();
+        let Some(path) = &self.training_metrics_log_path else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Err(error) = fs::write(path, "") {
+            self.training_metrics_log_error = true;
+            self.log_line(format!(
+                "[metrics] failed to reset metrics log {}: {}",
+                path.display(),
+                error
+            ));
+        }
+    }
+
+    fn append_training_metrics_log_sample(&mut self, sample: &MetricSample) {
+        let Some(path) = self.training_metrics_log_path.as_ref() else {
+            return;
+        };
+        if self.training_metrics_log_error {
+            return;
+        }
+        let json = match serde_json::to_string(sample) {
+            Ok(json) => json,
+            Err(error) => {
+                self.training_metrics_log_error = true;
+                self.log_line(format!(
+                    "[metrics] failed to serialize metric sample for {}: {}",
+                    path.display(),
+                    error
+                ));
+                return;
+            }
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Err(error) = self.append_training_log_line(path, &json) {
+            self.training_metrics_log_error = true;
+            self.log_line(format!(
+                "[metrics] failed to append metric sample to {}: {}",
+                path.display(),
+                error
+            ));
+        }
+    }
+
     fn append_training_log_line(&self, path: &Path, line: &str) -> std::io::Result<()> {
         let mut file = fs::OpenOptions::new()
             .create(true)
@@ -13490,22 +14695,39 @@ impl App {
         sample.set_time_this_iter_s(iter_duration);
 
         self.metric_last_sample_time = Some(now);
+        self.append_training_metrics_log_sample(&sample);
         let previous_offset = self.metrics_history_index;
         self.training_metrics.push(sample.clone());
         self.metrics_timeline.push(sample);
 
+        let mut trimmed = false;
         if self.training_metrics.len() > TRAINING_METRIC_HISTORY_LIMIT {
             let excess = self.training_metrics.len() - TRAINING_METRIC_HISTORY_LIMIT;
             self.training_metrics.drain(0..excess);
+            trimmed = true;
         }
         if self.metrics_timeline.len() > TRAINING_METRIC_HISTORY_LIMIT {
             let excess = self.metrics_timeline.len() - TRAINING_METRIC_HISTORY_LIMIT;
             self.metrics_timeline.drain(0..excess);
+            trimmed = true;
+        }
+        if trimmed && !self.training_metrics_trim_notice_shown {
+            self.training_metrics_trim_notice_shown = true;
+            let mut hint = format!(
+                "Metrics history is limited to the last {} iterations (older samples are dropped from the UI).",
+                TRAINING_METRIC_HISTORY_LIMIT
+            );
+            if self.training_metrics_log_error {
+                hint.push_str(" (Full-history metric logging failed; saved runs may be truncated.)");
+            } else {
+                hint.push_str(" (Saved runs will keep the full history.)");
+            }
+            self.set_status(hint, StatusKind::Info);
         }
         if previous_offset != 0 {
             self.metrics_history_index = previous_offset.saturating_add(1);
         }
-        let history_len = self.training_metrics_history().len();
+        let history_len = self.metrics_history_total_len();
         if self.metrics_history_settings.auto_follow_latest {
             self.metrics_history_index = 0;
         } else {
@@ -15018,11 +16240,44 @@ fn write_rllib_config(path: &Path, config: &TrainingConfig) -> Result<()> {
     let framework = &config.rllib_framework;
     let checkpoint_frequency = config.rllib_checkpoint_frequency;
     let num_gpus = format_f64(config.rllib_num_gpus);
-    let stop_line = match config.rllib_stop_mode {
+    let mut stop_lines: Vec<String> = Vec::new();
+    match config.rllib_stop_mode {
+        RllibStopMode::None => {}
         RllibStopMode::TimeSeconds => {
-            format!("    time_total_s: {}", config.rllib_stop_time_seconds)
+            stop_lines.push(format!(
+                "    time_total_s: {}",
+                config.rllib_stop_time_seconds
+            ));
         }
-        RllibStopMode::Timesteps => format!("    timesteps_total: {}", config.timesteps),
+        RllibStopMode::Timesteps => {
+            stop_lines.push(format!(
+                "    timesteps_total: {}",
+                config.rllib_stop_timesteps_total
+            ));
+        }
+    }
+    if config.rllib_stop_sustained_reward_enabled {
+        let threshold = format_f64(config.rllib_stop_sustained_reward_threshold);
+        stop_lines.push("    sustained_episode_reward_mean:".to_string());
+        stop_lines.push(format!("        threshold: {threshold}"));
+        stop_lines.push(format!(
+            "        window: {}",
+            config.rllib_stop_sustained_reward_window.max(1)
+        ));
+    }
+    if config.rllib_stop_file_enabled {
+        let path = config.rllib_stop_file_path.trim();
+        if !path.is_empty() {
+            stop_lines.push(format!(
+                "    stop_file: '{}'",
+                escape_single_quotes(path)
+            ));
+        }
+    }
+    let stop_block = if stop_lines.is_empty() {
+        "    # manual stop only".to_string()
+    } else {
+        stop_lines.join("\n")
     };
 
     let format_list = |values: &[usize]| {
@@ -15067,7 +16322,7 @@ fn write_rllib_config(path: &Path, config: &TrainingConfig) -> Result<()> {
     };
 
     let content = format!(
-        "algorithm: {algorithm}\n\n# Multi-agent-env setting:\n# If true:\n# - Any AIController with done = true will receive zeroes as action values until all AIControllers are done, an episode ends at that point.\n# - ai_controller.needs_reset will also be set to true every time a new episode begins (but you can ignore it in your env if needed).\n# If false:\n# - AIControllers auto-reset in Godot and will receive actions after setting done = true.\n# - Each AIController has its own episodes that can end/reset at any point.\n# Set to false if you have a single policy name for all agents set in AIControllers\nenv_is_multiagent: true\n\ncheckpoint_frequency: {checkpoint_frequency}\n\n# You can set one or more stopping criteria\nstop:\n    #episode_reward_mean: 0\n    #training_iteration: 1000\n    #timesteps_total: 10000\n{stop_line}\n\nconfig:\n    env: godot\n    env_config:\n      env_path: {escaped_env_path} # Set your env path here (exported executable from Godot) - e.g. env_path: 'env_path.exe' on Windows\n      action_repeat: {action_repeat} # Doesn't need to be set here, you can set this in sync node in Godot editor as well\n      show_window: {show_window} # Displays game window while training. Might be faster when false in some cases, turning off also reduces GPU usage if you don't need rendering.\n      speedup: {speedup} # Speeds up Godot physics\n\n    framework: {framework} # ONNX models exported with torch are compatible with the current Godot RL Agents Plugin\n\n    lr: {lr}\n    lambda: {lambda}\n    gamma: {gamma}\n\n    vf_loss_coeff: {vf_loss_coeff}\n    vf_clip_param: .inf\n    #clip_param: {clip_param_comment}\n    entropy_coeff: {entropy_coeff}\n    entropy_coeff_schedule: null\n    #grad_clip: {grad_clip_comment}\n\n    normalize_actions: False\n    clip_actions: True # During onnx inference we simply clip the actions to [-1.0, 1.0] range, set here to match\n\n    rollout_fragment_length: {rollout_fragment_length}\n    sgd_minibatch_size: {sgd_minibatch_size}\n    minibatch_size: {sgd_minibatch_size}\n    num_workers: {num_workers}\n    num_envs_per_worker: {num_envs_per_worker} # This will be set automatically if not multi-agent. If multi-agent, changing this changes how many envs to launch per worker.\n    sample_timeout_s: 120\n    train_batch_size: {train_batch_size}\n\n    num_sgd_iter: {num_sgd_iter}\n    batch_mode: {batch_mode}\n\n    num_gpus: {num_gpus}\n{model_block}"
+        "algorithm: {algorithm}\n\n# Multi-agent-env setting:\n# If true:\n# - Any AIController with done = true will receive zeroes as action values until all AIControllers are done, an episode ends at that point.\n# - ai_controller.needs_reset will also be set to true every time a new episode begins (but you can ignore it in your env if needed).\n# If false:\n# - AIControllers auto-reset in Godot and will receive actions after setting done = true.\n# - Each AIController has its own episodes that can end/reset at any point.\n# Set to false if you have a single policy name for all agents set in AIControllers\nenv_is_multiagent: true\n\ncheckpoint_frequency: {checkpoint_frequency}\n\n# You can set one or more stopping criteria\nstop:\n    #episode_reward_mean: 0\n    #training_iteration: 1000\n    #timesteps_total: 10000\n{stop_block}\n\nconfig:\n    env: godot\n    env_config:\n      env_path: {escaped_env_path} # Set your env path here (exported executable from Godot) - e.g. env_path: 'env_path.exe' on Windows\n      action_repeat: {action_repeat} # Doesn't need to be set here, you can set this in sync node in Godot editor as well\n      show_window: {show_window} # Displays game window while training. Might be faster when false in some cases, turning off also reduces GPU usage if you don't need rendering.\n      speedup: {speedup} # Speeds up Godot physics\n\n    framework: {framework} # ONNX models exported with torch are compatible with the current Godot RL Agents Plugin\n\n    lr: {lr}\n    lambda: {lambda}\n    gamma: {gamma}\n\n    vf_loss_coeff: {vf_loss_coeff}\n    vf_clip_param: .inf\n    #clip_param: {clip_param_comment}\n    entropy_coeff: {entropy_coeff}\n    entropy_coeff_schedule: null\n    #grad_clip: {grad_clip_comment}\n\n    normalize_actions: False\n    clip_actions: True # During onnx inference we simply clip the actions to [-1.0, 1.0] range, set here to match\n\n    rollout_fragment_length: {rollout_fragment_length}\n    sgd_minibatch_size: {sgd_minibatch_size}\n    minibatch_size: {sgd_minibatch_size}\n    num_workers: {num_workers}\n    num_envs_per_worker: {num_envs_per_worker} # This will be set automatically if not multi-agent. If multi-agent, changing this changes how many envs to launch per worker.\n    sample_timeout_s: 120\n    train_batch_size: {train_batch_size}\n\n    num_sgd_iter: {num_sgd_iter}\n    batch_mode: {batch_mode}\n\n    num_gpus: {num_gpus}\n{model_block}"
     );
 
     fs::write(path, content)

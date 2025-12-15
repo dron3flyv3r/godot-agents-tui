@@ -397,6 +397,21 @@ fn render_home_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     .add_modifier(Modifier::BOLD),
             ));
             lines.push(Line::from(spans));
+            if let Some((ok, err, normalized)) = app.config_edit_validation() {
+                let (prefix, msg, color) = if ok {
+                    (
+                        "✓ ",
+                        normalized.unwrap_or_else(|| "OK".to_string()),
+                        Color::LightGreen,
+                    )
+                } else {
+                    ("⚠ ", err, Color::LightRed)
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("{prefix}{msg}"),
+                    Style::default().fg(color),
+                )));
+            }
             lines.push(Line::from(Span::styled(
                 "Enter to confirm • Esc to cancel",
                 Style::default().fg(Color::DarkGray),
@@ -458,6 +473,7 @@ fn render_home_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         InputMode::BrowsingFiles
         | InputMode::Help
         | InputMode::ConfirmQuit
+        | InputMode::ConfirmAction
         | InputMode::AdvancedConfig
         | InputMode::ChartExportOptions
         | InputMode::EditingChartExportOption
@@ -516,6 +532,7 @@ fn render_training_config(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let config = app.training_config();
     let input_mode = app.input_mode();
     let active_field = app.active_config_field();
+    let editing_basic = matches!(input_mode, InputMode::EditingConfig);
 
     let mode_text = match config.mode {
         crate::app::TrainingMode::SingleAgent => "Single-Agent (Stable Baselines 3)",
@@ -544,21 +561,30 @@ fn render_training_config(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Line::from(vec![
             Span::styled("Env: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                if config.env_path.is_empty() {
-                    "<not set>"
-                } else {
-                    &config.env_path
+                {
+                    let is_editing = editing_basic && active_field == Some(ConfigField::EnvPath);
+                    if is_editing {
+                        format!("{}_", app.config_edit_buffer())
+                    } else if config.env_path.is_empty() {
+                        "<not set>".to_string()
+                    } else {
+                        config.env_path.clone()
+                    }
                 },
                 {
-                    let base_color = if config.env_path.is_empty() {
+                    let is_editing = editing_basic && active_field == Some(ConfigField::EnvPath);
+                    let display_empty = if is_editing {
+                        app.config_edit_buffer().trim().is_empty()
+                    } else {
+                        config.env_path.is_empty()
+                    };
+                    let base_color = if display_empty {
                         Color::Red
                     } else {
                         Color::White
                     };
                     let mut style = Style::default().fg(base_color);
-                    if input_mode == InputMode::EditingConfig
-                        && active_field == Some(ConfigField::EnvPath)
-                    {
+                    if is_editing {
                         style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
                     }
                     style
@@ -568,27 +594,44 @@ fn render_training_config(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ]),
         Line::from(vec![
             Span::styled("Steps: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("{}", config.timesteps), {
-                let mut style = Style::default().fg(Color::White);
-                if input_mode == InputMode::EditingConfig
-                    && active_field == Some(ConfigField::Timesteps)
+            Span::styled(
                 {
-                    style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
-                }
-                style
-            }),
+                    let is_editing = editing_basic && active_field == Some(ConfigField::Timesteps);
+                    if is_editing {
+                        format!("{}_", app.config_edit_buffer())
+                    } else {
+                        format!("{}", config.timesteps)
+                    }
+                },
+                {
+                    let mut style = Style::default().fg(Color::White);
+                    if editing_basic && active_field == Some(ConfigField::Timesteps) {
+                        style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+                    }
+                    style
+                },
+            ),
             Span::styled(" (s:edit)", Style::default().fg(Color::DarkGray)),
             Span::styled("  •  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Name: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&config.experiment_name, {
-                let mut style = Style::default().fg(Color::White);
-                if input_mode == InputMode::EditingConfig
-                    && active_field == Some(ConfigField::ExperimentName)
+            Span::styled(
                 {
-                    style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
-                }
-                style
-            }),
+                    let is_editing =
+                        editing_basic && active_field == Some(ConfigField::ExperimentName);
+                    if is_editing {
+                        format!("{}_", app.config_edit_buffer())
+                    } else {
+                        config.experiment_name.clone()
+                    }
+                },
+                {
+                    let mut style = Style::default().fg(Color::White);
+                    if editing_basic && active_field == Some(ConfigField::ExperimentName) {
+                        style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+                    }
+                    style
+                },
+            ),
             Span::styled(" (n:edit)", Style::default().fg(Color::DarkGray)),
         ]),
         Line::from(vec![
@@ -609,6 +652,40 @@ fn render_training_config(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Span::styled(" for help", Style::default().fg(Color::DarkGray)),
         ]),
     ];
+
+    if editing_basic {
+        if let Some(field) = active_field {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("Editing ", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    field.label(),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(": {}_", app.config_edit_buffer()),
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+            if let Some((ok, error, normalized)) = app.config_edit_validation() {
+                let (prefix, msg, color) = if ok {
+                    (
+                        "✓ ",
+                        normalized.unwrap_or_else(|| "OK".to_string()),
+                        Color::LightGreen,
+                    )
+                } else {
+                    ("⚠ ", error, Color::LightRed)
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("{prefix}{msg}"),
+                    Style::default().fg(color),
+                )));
+            }
+        }
+    }
 
     if matches!(
         input_mode,
@@ -827,7 +904,7 @@ fn render_training_output(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 pub fn render_metrics(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    if app.training_metrics_history().is_empty() {
+    if app.metrics_history_total_len() == 0 {
         let placeholder =
             Paragraph::new("No metrics yet. Start a training run to see live updates.")
                 .block(Block::default().borders(Borders::ALL).title("Metrics"))
@@ -2230,14 +2307,16 @@ fn render_metrics_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 }
 fn render_metrics_history(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let history = app.training_metrics_history();
     let settings = app.metrics_history_settings();
     let available_rows = area.height.saturating_sub(2) as usize;
     if available_rows == 0 {
         return;
     }
 
-    let total = history.len();
+    let total = app.metrics_history_total_len();
+    if total == 0 {
+        return;
+    }
     let selected_offset_from_latest = app
         .metrics_history_selected_index()
         .min(total.saturating_sub(1));
@@ -2257,12 +2336,8 @@ fn render_metrics_history(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let mut items = Vec::new();
     let max_width = area.width.saturating_sub(4) as usize;
-    let iter: Box<dyn Iterator<Item = &MetricSample>> = if settings.sort_newest_first {
-        Box::new(history.iter().rev().skip(start).take(end - start))
-    } else {
-        Box::new(history.iter().skip(start).take(end - start))
-    };
-    for sample in iter {
+    let window = app.metrics_history_window(start, end, settings.sort_newest_first);
+    for sample in window.iter() {
         items.push(ListItem::new(metric_history_line(
             sample,
             max_width,
@@ -2314,14 +2389,14 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let is_focused = app.metrics_focus() == MetricsFocus::Chart;
     let chart_settings = app.metrics_chart_settings();
     let border_color = focused_border_color(app, is_focused);
-    let mut title = if is_focused {
+    let mut base_title = if is_focused {
         "Metric Chart [FOCUSED - Enter to view policies, x to export, Tab to switch]".to_string()
     } else {
         "Metric Chart [Enter to view policies]".to_string()
     };
     if let Some(label) = app.viewed_run_label() {
         if chart_settings.show_caption {
-            title.push_str(&format!(" • Saved run: {label}"));
+            base_title.push_str(&format!(" • Saved run: {label}"));
         }
     }
     if chart_settings.show_caption && chart_settings.show_resume {
@@ -2337,18 +2412,18 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .and_then(|m| app.latest_chart_value(m))
                 .map(|v| format!("{v:.3}"))
                 .unwrap_or_else(|| "-".to_string());
-            title.push_str(&format!(" • Resume @ {iter} (pre {pre} → live {post})"));
+            base_title.push_str(&format!(" • Resume @ {iter} (pre {pre} → live {post})"));
         }
     }
 
-    let block = Block::default()
+    let base_block = Block::default()
         .borders(Borders::ALL)
-        .title(title)
+        .title(base_title.clone())
         .border_style(Style::default().fg(border_color));
 
     let Some(metric_option) = app.current_chart_metric() else {
         let placeholder = Paragraph::new("No metric selected.")
-            .block(block)
+            .block(base_block)
             .alignment(Alignment::Center)
             .style(Style::default().fg(Color::DarkGray));
         frame.render_widget(placeholder, area);
@@ -2360,7 +2435,7 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ChartMetricKind::AllPoliciesRewardMean
         | ChartMetricKind::AllPoliciesEpisodeLenMean
         | ChartMetricKind::AllPoliciesLearnerStat(_) => {
-            render_multi_series_chart(frame, area, app, &metric_option, block);
+            render_multi_series_chart(frame, area, app, &metric_option, base_block);
             return;
         }
         _ => {}
@@ -2379,7 +2454,7 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     if chart_data.is_none() && overlay_series.is_empty() {
         let placeholder = Paragraph::new("No data for the selected metric yet.")
-            .block(block)
+            .block(base_block)
             .alignment(Alignment::Center)
             .style(Style::default().fg(Color::DarkGray));
         frame.render_widget(placeholder, area);
@@ -2387,21 +2462,10 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     let mut datasets = Vec::new();
-    let mut y_min = f64::INFINITY;
-    let mut y_max = f64::NEG_INFINITY;
+    let mut y_min_primary = f64::INFINITY;
+    let mut y_max_primary = f64::NEG_INFINITY;
     let mut x_min = f64::INFINITY;
     let mut x_max = f64::NEG_INFINITY;
-
-    let mut update_bounds = |points: &[(f64, f64)]| {
-        for &(x, y) in points {
-            if y.is_finite() {
-                y_min = y_min.min(y);
-                y_max = y_max.max(y);
-            }
-            x_min = x_min.min(x);
-            x_max = x_max.max(x);
-        }
-    };
 
     let primary_color = app.chart_primary_color();
     let selection_color = app.chart_selection_color();
@@ -2459,7 +2523,14 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     for (label, points, color) in &owned_segments {
-        update_bounds(points);
+        for &(x, y) in points {
+            if y.is_finite() {
+                y_min_primary = y_min_primary.min(y);
+                y_max_primary = y_max_primary.max(y);
+            }
+            x_min = x_min.min(x);
+            x_max = x_max.max(x);
+        }
         datasets.push(
             Dataset::default()
                 .name(label.clone())
@@ -2471,13 +2542,67 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     for series in &overlay_series {
-        update_bounds(&series.points);
+        for &(x, _) in &series.points {
+            x_min = x_min.min(x);
+            x_max = x_max.max(x);
+        }
+    }
+
+    // Live-priority scaling: while training, let the primary series control the Y axis.
+    // If the primary series has no points yet, fall back to full scaling so the chart isn't empty.
+    let live_priority_scaling = app.is_training_running();
+    let live_scale_active =
+        live_priority_scaling && y_min_primary.is_finite() && y_max_primary.is_finite();
+    let mut y_min = y_min_primary;
+    let mut y_max = y_max_primary;
+    if !live_scale_active {
+        for series in &overlay_series {
+            for &(_, y) in &series.points {
+                if y.is_finite() {
+                    y_min = y_min.min(y);
+                    y_max = y_max.max(y);
+                }
+            }
+        }
+    }
+
+    let mut overlay_clipped_above = false;
+    let mut overlay_clipped_below = false;
+    if live_scale_active && y_min.is_finite() && y_max.is_finite() {
+        for series in &overlay_series {
+            for &(_, y) in &series.points {
+                if !y.is_finite() {
+                    continue;
+                }
+                if y > y_max {
+                    overlay_clipped_above = true;
+                } else if y < y_min {
+                    overlay_clipped_below = true;
+                }
+                if overlay_clipped_above && overlay_clipped_below {
+                    break;
+                }
+            }
+            if overlay_clipped_above && overlay_clipped_below {
+                break;
+            }
+        }
+    }
+
+    for series in &overlay_series {
+        let overlay_style = if live_scale_active {
+            Style::default()
+                .fg(series.color)
+                .add_modifier(Modifier::DIM)
+        } else {
+            Style::default().fg(series.color)
+        };
         datasets.push(
             Dataset::default()
                 .name(series.label.clone())
                 .marker(Marker::Braille)
                 .graph_type(GraphType::Line)
-                .style(Style::default().fg(series.color))
+                .style(overlay_style)
                 .data(&series.points),
         );
     }
@@ -2489,16 +2614,19 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let selected_y = app.selected_chart_value();
     let mut selection_line = Vec::new();
     let mut selection_marker = Vec::new();
+    let mut overlay_clip_markers: Vec<(f64, f64)> = Vec::new();
 
     for (x, y, _, _) in &resume_markers {
         if x.is_finite() {
             x_min = x_min.min(*x);
             x_max = x_max.max(*x);
         }
-        if let Some(val) = y {
-            if val.is_finite() {
-                y_min = y_min.min(*val);
-                y_max = y_max.max(*val);
+        if !live_scale_active {
+            if let Some(val) = y {
+                if val.is_finite() {
+                    y_min = y_min.min(*val);
+                    y_max = y_max.max(*val);
+                }
             }
         }
     }
@@ -2518,6 +2646,26 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
     if (x_max - x_min).abs() < 1e-3 {
         x_max = x_min + 1.0;
+    }
+
+    if live_scale_active && (overlay_clipped_above || overlay_clipped_below) {
+        if overlay_clipped_above {
+            overlay_clip_markers.push((x_max, y_max));
+        }
+        if overlay_clipped_below {
+            overlay_clip_markers.push((x_max, y_min));
+        }
+    }
+
+    if !overlay_clip_markers.is_empty() {
+        datasets.push(
+            Dataset::default()
+                .name(String::new())
+                .marker(Marker::Block)
+                .graph_type(GraphType::Scatter)
+                .style(Style::default().fg(Color::DarkGray))
+                .data(&overlay_clip_markers),
+        );
     }
 
     if chart_settings.show_selection {
@@ -2628,7 +2776,29 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .bounds([y_min, y_max]);
 
     let mut chart = Chart::new(datasets)
-        .block(block)
+        .block({
+            let mut title = base_title.clone();
+            if live_scale_active {
+                title.push_str(" • live scale");
+                if overlay_series.is_empty() {
+                    // no-op
+                } else if overlay_clipped_above || overlay_clipped_below {
+                    let arrows = match (overlay_clipped_above, overlay_clipped_below) {
+                        (true, true) => "↑↓",
+                        (true, false) => "↑",
+                        (false, true) => "↓",
+                        _ => "",
+                    };
+                    title.push_str(&format!(" (overlays clipped {arrows})"));
+                } else {
+                    title.push_str(" (overlays muted)");
+                }
+            }
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(Style::default().fg(border_color))
+        })
         .x_axis(x_axis)
         .y_axis(y_axis);
 
@@ -3957,7 +4127,7 @@ fn summarize_custom_metrics(
 
 fn render_training_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let instructions = if app.is_training_running() {
-        "Training running… press 'c' to cancel"
+        "Training running… press 'c' to cancel (confirm)"
     } else {
         match app.input_mode() {
             InputMode::EditingConfig | InputMode::EditingAdvancedConfig => {
@@ -4657,7 +4827,7 @@ pub fn render_help_overlay(frame: &mut Frame<'_>, app: &App) {
     }
 
     help_text.push(Line::from(Span::styled(
-        "Press h / F1 / Esc to close",
+        "Press ? / h / F1 / Esc to close",
         Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::ITALIC),
@@ -4679,14 +4849,47 @@ pub fn render_help_overlay(frame: &mut Frame<'_>, app: &App) {
 
 fn build_help_sections(app: &App) -> Vec<(String, Vec<String>)> {
     let mut sections = Vec::new();
+    let mut context_lines = Vec::new();
+    context_lines.push(format!(
+        "Tab: {}  •  Input: {}",
+        app.active_tab().title,
+        input_mode_label(app.input_mode())
+    ));
+    let extra = match app.active_tab().id {
+        TabId::Train => format!(
+            "Training: {}",
+            if app.is_training_running() { "running" } else { "idle" }
+        ),
+        TabId::Metrics => format!("Metrics focus: {}", metrics_focus_label(app.metrics_focus())),
+        TabId::Simulator => format!(
+            "Simulator focus: {}",
+            match app.simulator_focus() {
+                SimulatorFocus::Events => "Events",
+                SimulatorFocus::Actions => "Actions",
+            }
+        ),
+        TabId::Interface => format!(
+            "Interface focus: {}",
+            match app.interface_focus() {
+                InterfaceFocus::Events => "Events",
+                InterfaceFocus::Actions => "Actions",
+            }
+        ),
+        _ => String::new(),
+    };
+    if !extra.is_empty() {
+        context_lines.push(extra);
+    }
+    sections.push(("Context".to_string(), context_lines));
     sections.push((
         "Global".to_string(),
         vec![
-            "h / F1   Toggle this help overlay".to_string(),
+            "? / h / F1   Toggle this help overlay".to_string(),
             "q / Esc  Quit (when idle) or back out of dialogs".to_string(),
             "1-8      Jump to Home, Train, Metrics, Simulator, Interface, Export Model, Projects, Settings"
                 .to_string(),
             "Home/End Jump to Home or Settings tab".to_string(),
+            "y/n      Confirm or cancel prompts".to_string(),
         ],
     ));
 
@@ -4710,6 +4913,37 @@ fn build_help_sections(app: &App) -> Vec<(String, Vec<String>)> {
     sections
 }
 
+fn input_mode_label(mode: InputMode) -> &'static str {
+    match mode {
+        InputMode::Normal => "Normal",
+        InputMode::CreatingProject => "Creating project",
+        InputMode::EditingConfig => "Editing config",
+        InputMode::EditingAdvancedConfig => "Editing advanced config",
+        InputMode::SelectingConfigOption => "Selecting option",
+        InputMode::AdvancedConfig => "Advanced config",
+        InputMode::BrowsingFiles => "Browsing files",
+        InputMode::Help => "Help",
+        InputMode::ConfirmQuit => "Confirm quit",
+        InputMode::ConfirmAction => "Confirm action",
+        InputMode::EditingExport => "Editing export",
+        InputMode::ChartExportOptions => "Chart export options",
+        InputMode::EditingChartExportOption => "Editing chart export option",
+        InputMode::MetricsSettings => "Metrics settings",
+        InputMode::EditingMetricsSetting => "Editing metrics setting",
+        InputMode::EditingProjectArchive => "Editing project archive",
+        InputMode::ConfirmProjectImport => "Confirm project import",
+    }
+}
+
+fn metrics_focus_label(focus: MetricsFocus) -> &'static str {
+    match focus {
+        MetricsFocus::History => "History",
+        MetricsFocus::Summary => "Summary",
+        MetricsFocus::Policies => "Policies",
+        MetricsFocus::Chart => "Chart",
+    }
+}
+
 fn home_help_lines() -> Vec<String> {
     vec![
         "Up/Down / j/k  Select a project".to_string(),
@@ -4724,13 +4958,13 @@ fn train_help_lines() -> Vec<String> {
     vec![
         "t              Start training (after validation)".to_string(),
         "d              Launch demo training".to_string(),
-        "c              Cancel the running training process".to_string(),
+        "c              Cancel the running training process (asks to confirm)".to_string(),
         "m              Toggle Single-Agent / Multi-Agent mode".to_string(),
         "g              Generate an RLlib config template".to_string(),
         "p / s / n      Edit env path, timesteps, or experiment name".to_string(),
         "a              Open advanced settings (Esc to close)".to_string(),
         "b              Browse for the environment path".to_string(),
-        "l              Clear the training output log".to_string(),
+        "l              Clear the training output log (asks to confirm)".to_string(),
         "Up/Down / j/k  Scroll training output".to_string(),
         "PgUp/PgDn      Fast-scroll training output".to_string(),
     ]
@@ -4749,9 +4983,8 @@ fn metrics_help_lines(app: &App) -> Vec<String> {
         "x (chart focus)  Export chart as PNG (adjust options after choosing path)".to_string(),
         "l                Load a saved run as the primary view (no overlays)".to_string(),
         "c                Load a saved run overlay from disk".to_string(),
-        "f / g / G        Refresh detected RLlib runs • load latest detected • cycle+load"
-            .to_string(),
-        "C                Clear all overlays".to_string(),
+        "f                Pick a detected RLlib run (or manual)".to_string(),
+        "C                Clear all overlays (asks to confirm)".to_string(),
         "o                Toggle viewing the selected saved run".to_string(),
         "O                Cycle through loaded runs".to_string(),
         "v                Return to live metrics when viewing a run".to_string(),
@@ -4967,6 +5200,51 @@ pub fn render_confirm_quit(frame: &mut Frame<'_>, _app: &App) {
         .alignment(Alignment::Center)
         .wrap(Wrap { trim: true });
 
+    frame.render_widget(paragraph, dialog_area);
+}
+
+pub fn render_confirm_action(frame: &mut Frame<'_>, app: &App) {
+    let Some((title, body)) = app.confirm_action_prompt() else {
+        return;
+    };
+    let area = frame.area();
+
+    let dialog_width = 56;
+    let dialog_height = 8;
+    let dialog_area = Rect {
+        x: (area.width.saturating_sub(dialog_width)) / 2,
+        y: (area.height.saturating_sub(dialog_height)) / 2,
+        width: dialog_width.min(area.width),
+        height: dialog_height.min(area.height),
+    };
+
+    let text = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            body,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Press 'y' to confirm, 'n' or Esc to cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(format!(" {title} "))
+        .title_alignment(Alignment::Center);
+
+    let paragraph = Paragraph::new(text)
+        .block(block)
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true });
+
+    frame.render_widget(Clear, dialog_area);
     frame.render_widget(paragraph, dialog_area);
 }
 
@@ -5471,7 +5749,7 @@ pub fn render_advanced_config(frame: &mut Frame<'_>, app: &App) {
             Constraint::Length(3),
             Constraint::Min(5),
             Constraint::Length(5),
-            Constraint::Length(4),
+            Constraint::Length(5),
         ])
         .split(overlay_area);
 
@@ -5629,9 +5907,30 @@ pub fn render_advanced_config(frame: &mut Frame<'_>, app: &App) {
                 Style::default().fg(Color::White),
             ));
 
+            let validation_line = app
+                .config_edit_validation()
+                .map(|(ok, err, normalized)| {
+                    if ok {
+                        Line::from(Span::styled(
+                            format!(
+                                "✓ {}",
+                                normalized.unwrap_or_else(|| "OK".to_string())
+                            ),
+                            Style::default().fg(Color::LightGreen),
+                        ))
+                    } else {
+                        Line::from(Span::styled(
+                            format!("⚠ {err}"),
+                            Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD),
+                        ))
+                    }
+                })
+                .unwrap_or_else(|| Line::from(Span::raw("")));
+
             (
                 vec![
                     Line::from(first_line_spans),
+                    validation_line,
                     Line::from(Span::styled(
                         "Enter: save • Esc: cancel • Backspace: delete",
                         Style::default().fg(Color::DarkGray),

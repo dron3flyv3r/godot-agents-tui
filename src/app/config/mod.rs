@@ -203,6 +203,7 @@ impl Default for MarsTrainingConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RllibStopMode {
+    None,
     TimeSeconds,
     Timesteps,
 }
@@ -272,6 +273,12 @@ pub struct TrainingConfig {
     pub rllib_resume_from: String,
     pub rllib_stop_mode: RllibStopMode,
     pub rllib_stop_time_seconds: u64,
+    pub rllib_stop_timesteps_total: u64,
+    pub rllib_stop_sustained_reward_enabled: bool,
+    pub rllib_stop_sustained_reward_threshold: f64,
+    pub rllib_stop_sustained_reward_window: u32,
+    pub rllib_stop_file_enabled: bool,
+    pub rllib_stop_file_path: String,
 }
 
 impl Default for TrainingConfig {
@@ -333,6 +340,12 @@ impl Default for TrainingConfig {
             rllib_resume_from: String::new(),
             rllib_stop_mode: RllibStopMode::TimeSeconds,
             rllib_stop_time_seconds: 1_000_000,
+            rllib_stop_timesteps_total: 1_000_000,
+            rllib_stop_sustained_reward_enabled: false,
+            rllib_stop_sustained_reward_threshold: 0.0,
+            rllib_stop_sustained_reward_window: 20,
+            rllib_stop_file_enabled: true,
+            rllib_stop_file_path: ".rlcontroller/STOP".to_string(),
         }
     }
 }
@@ -395,6 +408,12 @@ pub enum ConfigField {
     RllibResumeFrom,
     RllibStopMode,
     RllibStopTimeSeconds,
+    RllibStopTimestepsTotal,
+    RllibStopSustainedRewardEnabled,
+    RllibStopSustainedRewardThreshold,
+    RllibStopSustainedRewardWindow,
+    RllibStopFileEnabled,
+    RllibStopFilePath,
 
     // MARS experimental fields
     MarsEnvPath,
@@ -615,6 +634,12 @@ impl ConfigField {
             ConfigField::RllibResumeFrom => "RLlib Resume Directory",
             ConfigField::RllibStopMode => "RLlib Stop Mode",
             ConfigField::RllibStopTimeSeconds => "RLlib Time Limit (s)",
+            ConfigField::RllibStopTimestepsTotal => "RLlib Additional Timesteps",
+            ConfigField::RllibStopSustainedRewardEnabled => "RLlib Stop on Sustained Reward",
+            ConfigField::RllibStopSustainedRewardThreshold => "RLlib Reward Threshold",
+            ConfigField::RllibStopSustainedRewardWindow => "RLlib Reward Window (iters)",
+            ConfigField::RllibStopFileEnabled => "RLlib Stop File Enabled",
+            ConfigField::RllibStopFilePath => "RLlib Stop File Path",
             ConfigField::MarsEnvPath => "MARS Godot Env Path",
             ConfigField::MarsEnvName => "MARS Env Name",
             ConfigField::MarsMethod => "MARS Method",
@@ -742,10 +767,28 @@ impl ConfigField {
                 "Optional checkpoint directory to resume RLlib training from."
             }
             ConfigField::RllibStopMode => {
-                "Select whether RLlib stops by elapsed time or total timesteps."
+                "Select whether RLlib stops by elapsed time, total timesteps, or runs until manually stopped."
             }
             ConfigField::RllibStopTimeSeconds => {
                 "Target duration in seconds when using time-based stopping."
+            }
+            ConfigField::RllibStopTimestepsTotal => {
+                "Additional environment timesteps to run for this training session (added on top of the resumed total)."
+            }
+            ConfigField::RllibStopSustainedRewardEnabled => {
+                "Stop when episode_reward_mean stays above the configured threshold for a number of iterations."
+            }
+            ConfigField::RllibStopSustainedRewardThreshold => {
+                "Reward threshold (episode_reward_mean) used for sustained-reward stopping."
+            }
+            ConfigField::RllibStopSustainedRewardWindow => {
+                "Number of consecutive iterations that must meet the reward threshold before stopping."
+            }
+            ConfigField::RllibStopFileEnabled => {
+                "When enabled, training stops once the stop file exists."
+            }
+            ConfigField::RllibStopFilePath => {
+                "Path to a stop file; create this file to request training stop."
             }
             ConfigField::MarsEnvPath => {
                 "Executable path to the exported Godot environment (required for MARS)."

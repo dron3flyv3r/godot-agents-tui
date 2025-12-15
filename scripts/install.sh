@@ -19,9 +19,9 @@ INSTALL_DIR="${INSTALL_DIR:-${HOME}/.local/bin}"
 
 echo "Building controller-mk2 in release mode..."
 if [[ ${#BUILD_ENV[@]} -gt 0 ]]; then
-    env "${BUILD_ENV[@]}" cargo build --release
+    env "${BUILD_ENV[@]}" cargo build --release --locked --bin controller-mk2
 else
-    cargo build --release
+    cargo build --release --locked --bin controller-mk2
 fi
 mkdir -p "${INSTALL_DIR}"
 

@@ -10,6 +10,7 @@ import signal
 import sys
 import time
 import uuid
+from collections import deque
 from datetime import datetime, timezone
 from numbers import Number
 from typing import Any, Optional, Type
@@ -925,6 +926,27 @@ if __name__ == "__main__":
     algorithm_name = str(exp.get("algorithm") or "UNKNOWN")
 
     resume_checkpoint = args.restore
+    base_timesteps_total: Optional[int] = None
+
+    stop_file_path: Optional[str] = None
+    configured_stop_file = stop_config.get("stop_file")
+    if isinstance(configured_stop_file, str) and configured_stop_file.strip():
+        stop_file_path = os.path.abspath(os.path.expanduser(configured_stop_file.strip()))
+
+    sustained_cfg = stop_config.get("sustained_episode_reward_mean")
+    sustained_threshold: Optional[float] = None
+    sustained_window: int = 0
+    sustained_history: deque[float] = deque()
+    if isinstance(sustained_cfg, dict):
+        try:
+            sustained_threshold = float(sustained_cfg.get("threshold", 0.0))
+            sustained_window = int(sustained_cfg.get("window") or 0)
+            if sustained_window > 0:
+                sustained_history = deque(maxlen=sustained_window)
+            else:
+                sustained_threshold = None
+        except Exception:
+            sustained_threshold = None
 
     def _locate_checkpoint_from_tune_dir(path: pathlib.Path) -> Optional[str]:
         marker = path / "tuner.pkl"
@@ -1043,7 +1065,53 @@ if __name__ == "__main__":
         algo_obj.save_checkpoint(str(path))
         return path
 
+    def _timesteps_total_delta(result: dict[str, Any]) -> Optional[int]:
+        """Return timesteps_total since this run started (delta), if available."""
+        global base_timesteps_total
+        current_total = result.get("timesteps_total")
+        try:
+            current_total_i = int(current_total) if current_total is not None else 0
+        except Exception:
+            return None
+
+        if base_timesteps_total is None:
+            if resume_checkpoint:
+                # Best-effort baseline: subtract the steps collected in the first post-restore train
+                # iteration to approximate the pre-iteration total.
+                this_iter = (
+                    result.get("timesteps_this_iter")
+                    or result.get("num_env_steps_sampled_this_iter")
+                    or result.get("env_steps_this_iter")
+                    or 0
+                )
+                try:
+                    base_timesteps_total = max(0, current_total_i - int(this_iter))
+                except Exception:
+                    base_timesteps_total = current_total_i
+            else:
+                base_timesteps_total = 0
+
+        return max(0, current_total_i - int(base_timesteps_total or 0))
+
     def _should_stop(stop_cfg: dict[str, Any], result: dict[str, Any], start_time: float) -> bool:
+        if stop_file_path and os.path.exists(stop_file_path):
+            return True
+        if (trial_dir / "STOP").exists():
+            return True
+
+        if sustained_threshold is not None and sustained_window > 0:
+            reward = result.get("episode_reward_mean")
+            try:
+                if reward is not None:
+                    sustained_history.append(float(reward))
+                if (
+                    len(sustained_history) == sustained_window
+                    and all(val >= sustained_threshold for val in sustained_history)
+                ):
+                    return True
+            except Exception:
+                pass
+
         for key, target in stop_cfg.items():
             if target is None:
                 continue
@@ -1052,6 +1120,9 @@ if __name__ == "__main__":
                 current = result.get("time_total_s")
                 if current is None:
                     current = time.perf_counter() - start_time
+            elif key == "timesteps_total":
+                # Interpret as "additional timesteps to train" rather than absolute total.
+                current = _timesteps_total_delta(result)
             else:
                 current = result.get(key)
             try:

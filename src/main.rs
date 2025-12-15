@@ -47,6 +47,7 @@ fn handle_key_event(app: &mut App, key: KeyCode) -> Result<()> {
         InputMode::BrowsingFiles => handle_file_browser_input(app, key)?,
         InputMode::Help => handle_help_input(app, key)?,
         InputMode::ConfirmQuit => handle_confirm_quit_input(app, key)?,
+        InputMode::ConfirmAction => handle_confirm_action_input(app, key)?,
         InputMode::EditingExport => handle_export_edit_input(app, key)?,
         InputMode::ChartExportOptions => handle_chart_export_options_input(app, key)?,
         InputMode::EditingChartExportOption => handle_chart_export_option_edit_input(app, key)?,
@@ -100,7 +101,9 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
     match key {
         KeyCode::Char('q') => app.request_quit(),
         KeyCode::Esc => app.request_quit(),
-        KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::F(1) => app.show_help(),
+        KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::Char('?') | KeyCode::F(1) => {
+            app.show_help()
+        }
         // KeyCode::Left => app.previous_tab(),
         // KeyCode::Right => app.next_tab(),
         KeyCode::Char('1') => app.activate(TabId::Home),
@@ -133,8 +136,8 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
         if app.is_experimental() {
             match key {
                 KeyCode::Char('t') | KeyCode::Char('T') => app.start_training()?,
-                KeyCode::Char('c') | KeyCode::Char('C') => app.cancel_training(),
-                KeyCode::Char('l') | KeyCode::Char('L') => app.clear_training_output(),
+                KeyCode::Char('c') | KeyCode::Char('C') => app.request_cancel_training(),
+                KeyCode::Char('l') | KeyCode::Char('L') => app.request_clear_training_output(),
                 KeyCode::Char('p') | KeyCode::Char('P') if !app.is_training_running() => {
                     app.start_config_edit(app::ConfigField::MarsEnvPath);
                 }
@@ -191,7 +194,7 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
                         app::StatusKind::Info,
                     );
                 }
-                KeyCode::Char('c') | KeyCode::Char('C') => app.cancel_training(),
+                KeyCode::Char('c') | KeyCode::Char('C') => app.request_cancel_training(),
                 KeyCode::Char('g') | KeyCode::Char('G') => app.generate_rllib_config()?,
                 KeyCode::Char('e') | KeyCode::Char('E') => {
                     app.set_status(
@@ -199,7 +202,7 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
                         app::StatusKind::Info,
                     );
                 }
-                KeyCode::Char('l') | KeyCode::Char('L') => app.clear_training_output(),
+                KeyCode::Char('l') | KeyCode::Char('L') => app.request_clear_training_output(),
                 KeyCode::Char('p') | KeyCode::Char('P') if !app.is_training_running() => {
                     app.start_config_edit(app::ConfigField::EnvPath);
                 }
@@ -319,8 +322,11 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
             KeyCode::Char('c') => {
                 app.start_run_overlay_browser()?;
             }
+            KeyCode::Char('f') | KeyCode::Char('F') => {
+                app.open_discovered_run_menu()?;
+            }
             KeyCode::Char('C') => {
-                app.clear_run_overlays();
+                app.request_clear_run_overlays();
             }
             KeyCode::Char('l') | KeyCode::Char('L') => {
                 app.start_run_view_only_browser()?;
@@ -649,6 +655,7 @@ fn handle_help_input(app: &mut App, key: KeyCode) -> Result<()> {
         KeyCode::Esc
         | KeyCode::Char('h')
         | KeyCode::Char('H')
+        | KeyCode::Char('?')
         | KeyCode::Char('q')
         | KeyCode::F(1) => {
             app.hide_help();
@@ -662,6 +669,15 @@ fn handle_confirm_quit_input(app: &mut App, key: KeyCode) -> Result<()> {
     match key {
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => app.confirm_quit(),
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.cancel_quit(),
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_confirm_action_input(app: &mut App, key: KeyCode) -> Result<()> {
+    match key {
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => app.confirm_action(),
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.cancel_confirm_action(),
         _ => {}
     }
     Ok(())
