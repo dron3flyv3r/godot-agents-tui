@@ -11,11 +11,15 @@ use clap::Parser;
 use cli::Cli;
 use color_eyre::Result;
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode};
+use crossterm::event::{KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Alignment;
+use ratatui::style::{Color, Style};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
 
 fn setup_terminal() -> Result<(Terminal<CrosstermBackend<Stdout>>, CrosstermGuard)> {
@@ -37,24 +41,24 @@ impl Drop for CrosstermGuard {
     }
 }
 
-fn handle_key_event(app: &mut App, key: KeyCode) -> Result<()> {
+fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<()> {
     match app.input_mode() {
-        InputMode::CreatingProject => handle_project_creation_input(app, key)?,
-        InputMode::EditingConfig => handle_config_edit_input(app, key)?,
-        InputMode::EditingAdvancedConfig => handle_config_edit_input(app, key)?,
-        InputMode::SelectingConfigOption => handle_choice_menu_input(app, key)?,
-        InputMode::AdvancedConfig => handle_advanced_config_input(app, key)?,
-        InputMode::BrowsingFiles => handle_file_browser_input(app, key)?,
-        InputMode::Help => handle_help_input(app, key)?,
-        InputMode::ConfirmQuit => handle_confirm_quit_input(app, key)?,
-        InputMode::ConfirmAction => handle_confirm_action_input(app, key)?,
-        InputMode::EditingExport => handle_export_edit_input(app, key)?,
-        InputMode::ChartExportOptions => handle_chart_export_options_input(app, key)?,
-        InputMode::EditingChartExportOption => handle_chart_export_option_edit_input(app, key)?,
-        InputMode::MetricsSettings => handle_metrics_settings_input(app, key)?,
-        InputMode::EditingMetricsSetting => handle_metrics_setting_edit_input(app, key)?,
-        InputMode::EditingProjectArchive => handle_project_archive_edit_input(app, key)?,
-        InputMode::ConfirmProjectImport => handle_project_import_prompt_input(app, key)?,
+        InputMode::CreatingProject => handle_project_creation_input(app, key.code)?,
+        InputMode::EditingConfig => handle_config_edit_input(app, key.code)?,
+        InputMode::EditingAdvancedConfig => handle_config_edit_input(app, key.code)?,
+        InputMode::SelectingConfigOption => handle_choice_menu_input(app, key.code)?,
+        InputMode::AdvancedConfig => handle_advanced_config_input(app, key.code)?,
+        InputMode::BrowsingFiles => handle_file_browser_input(app, key.code)?,
+        InputMode::Help => handle_help_input(app, key.code)?,
+        InputMode::ConfirmQuit => handle_confirm_quit_input(app, key.code)?,
+        InputMode::ConfirmAction => handle_confirm_action_input(app, key.code)?,
+        InputMode::EditingExport => handle_export_edit_input(app, key.code)?,
+        InputMode::ChartExportOptions => handle_chart_export_options_input(app, key.code)?,
+        InputMode::EditingChartExportOption => handle_chart_export_option_edit_input(app, key.code)?,
+        InputMode::MetricsSettings => handle_metrics_settings_input(app, key.code)?,
+        InputMode::EditingMetricsSetting => handle_metrics_setting_edit_input(app, key.code)?,
+        InputMode::EditingProjectArchive => handle_project_archive_edit_input(app, key.code)?,
+        InputMode::ConfirmProjectImport => handle_project_import_prompt_input(app, key.code)?,
         InputMode::Normal => handle_normal_mode_key(app, key)?,
     }
     Ok(())
@@ -97,7 +101,9 @@ fn handle_project_import_prompt_input(app: &mut App, key: KeyCode) -> Result<()>
     Ok(())
 }
 
-fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
+fn handle_normal_mode_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    let modifiers = key.modifiers;
+    let key = key.code;
     match key {
         KeyCode::Char('q') => app.request_quit(),
         KeyCode::Esc => app.request_quit(),
@@ -238,6 +244,18 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
             }
         }
     } else if app.active_tab().id == TabId::Metrics {
+        let zoom_modifier_active = modifiers.contains(KeyModifiers::CONTROL)
+            || modifiers.contains(KeyModifiers::SHIFT);
+        if zoom_modifier_active && app.metrics_focus() == app::MetricsFocus::Chart {
+            match key {
+                KeyCode::Left => app.metrics_chart_zoom_x(true),
+                KeyCode::Right => app.metrics_chart_zoom_x(false),
+                KeyCode::Up => app.metrics_chart_zoom_y(true),
+                KeyCode::Down => app.metrics_chart_zoom_y(false),
+                _ => {}
+            }
+            return Ok(());
+        }
         match key {
             KeyCode::Tab => {
                 app.metrics_cycle_focus_next();
@@ -274,6 +292,8 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
                 // Otherwise scroll the focused panel up
                 if app.metrics_focus() == app::MetricsFocus::History {
                     app.metrics_history_move_newer();
+                } else if app.metrics_focus() == app::MetricsFocus::Chart {
+                    app.metrics_chart_pan_y(1);
                 } else {
                     app.metrics_scroll_up(1);
                 }
@@ -283,6 +303,8 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
                 // Otherwise scroll the focused panel down
                 if app.metrics_focus() == app::MetricsFocus::History {
                     app.metrics_history_move_older();
+                } else if app.metrics_focus() == app::MetricsFocus::Chart {
+                    app.metrics_chart_pan_y(-1);
                 } else {
                     app.metrics_scroll_down(1);
                 }
@@ -316,6 +338,12 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
             KeyCode::Char('s') | KeyCode::Char('S') => {
                 app.open_metrics_settings();
             }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                app.toggle_metrics_auto_follow_latest();
+            }
+            KeyCode::Char('p') | KeyCode::Char('P') => {
+                app.open_chart_metric_menu();
+            }
             KeyCode::Char('x') | KeyCode::Char('X') => {
                 app.start_chart_export();
             }
@@ -339,6 +367,9 @@ fn handle_normal_mode_key(app: &mut App, key: KeyCode) -> Result<()> {
             }
             KeyCode::Char('v') | KeyCode::Char('V') => {
                 app.clear_archived_run_view();
+            }
+            KeyCode::Delete | KeyCode::Char('z') | KeyCode::Char('Z') => {
+                app.metrics_chart_reset_view();
             }
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 app.apply_selected_checkpoint_to_config()?;
@@ -621,6 +652,7 @@ fn handle_file_browser_input(app: &mut App, key: KeyCode) -> Result<()> {
             KeyCode::Enter => app.file_browser_enter(),
             KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => app.file_browser_go_up(),
             KeyCode::Char('f') | KeyCode::Char('F') => app.file_browser_finalize_selection(),
+            KeyCode::Char('/') => app.file_browser_begin_filter(),
             KeyCode::Char('n') | KeyCode::Char('N') => {
                 if matches!(
                     app.file_browser_kind(),
@@ -637,6 +669,15 @@ fn handle_file_browser_input(app: &mut App, key: KeyCode) -> Result<()> {
                     );
                 }
             }
+            _ => {}
+        },
+        FileBrowserState::Filtering => match key {
+            KeyCode::Esc => app.file_browser_cancel_filter(),
+            KeyCode::Enter => app.file_browser_exit_filter(),
+            KeyCode::Backspace => app.file_browser_filter_pop_char(),
+            KeyCode::Down => app.file_browser_select_next(),
+            KeyCode::Up => app.file_browser_select_previous(),
+            KeyCode::Char(ch) => app.file_browser_filter_push_char(ch),
             _ => {}
         },
         FileBrowserState::NamingFolder | FileBrowserState::NamingFile => match key {
@@ -712,24 +753,31 @@ fn handle_advanced_config_input(app: &mut App, key: KeyCode) -> Result<()> {
 
 fn run(mode: AppMode, log_path: Option<std::path::PathBuf>) -> Result<()> {
     let (mut terminal, _guard) = setup_terminal()?;
+    terminal.draw(|frame| {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title("Starting Controller")
+            .style(Style::default().fg(Color::Yellow));
+        let paragraph = Paragraph::new("Loading...\n\n(Checking Python environment in background)")
+            .block(block)
+            .alignment(Alignment::Center);
+        frame.render_widget(paragraph, frame.area());
+    })?;
     let mut app = App::new(mode, log_path)?;
-    let mut frame_counter: u32 = 0;
 
     while !app.should_quit() {
         app.process_background_tasks();
         app.clamp_all_metrics_scrolls();
 
-        // Every 60 frames, do a full redraw with buffer clearing
-        if frame_counter % 60 == 0 {
-            terminal.clear()?;
-        }
-
         terminal.draw(|frame| ui::render(frame, &app))?;
-        frame_counter = frame_counter.wrapping_add(1);
 
         if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key_event) = event::read()? {
-                handle_key_event(&mut app, key_event.code)?;
+            match event::read()? {
+                Event::Key(key_event) => handle_key_event(&mut app, key_event)?,
+                Event::Resize(_, _) => {
+                    terminal.clear()?;
+                }
+                _ => {}
             }
         }
     }

@@ -32,6 +32,7 @@ pub enum FileBrowserKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileBrowserState {
     Browsing,
+    Filtering,
     NamingFolder,
     NamingFile,
 }

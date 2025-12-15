@@ -461,6 +461,7 @@ impl ConfigChoice {
 enum ChoiceMenuTarget {
     Config(ConfigField),
     Metrics(MetricsSettingField),
+    ChartMetric,
     DiscoveredRun,
     Session,
     ProjectArchive(ProjectArchiveField),
@@ -1530,6 +1531,14 @@ enum InterfaceEvent {
 }
 
 #[derive(Debug)]
+enum PythonCheckEvent {
+    Finished {
+        sb3_available: Option<bool>,
+        ray_available: Option<bool>,
+    },
+}
+
+#[derive(Debug)]
 enum ProjectArchiveEvent {
     Line(String),
     Error(String),
@@ -1584,6 +1593,7 @@ pub struct App {
     advanced_fields: Vec<ConfigField>,
     advanced_selection: usize,
     file_browser_path: PathBuf,
+    file_browser_all_entries: Vec<FileBrowserEntry>,
     file_browser_entries: Vec<FileBrowserEntry>,
     file_browser_selected: usize,
     file_browser_target: Option<FileBrowserTarget>,
@@ -1591,6 +1601,7 @@ pub struct App {
     file_browser_state: FileBrowserState,
     file_browser_default_name: Option<String>,
     file_browser_input: String,
+    file_browser_filter: String,
 
     status: Option<StatusMessage>,
 
@@ -1627,6 +1638,9 @@ pub struct App {
     metrics_policies_expanded: bool,
     metrics_policies_horizontal_scroll: usize,
     metrics_chart_settings: MetricsChartSettings,
+    metrics_chart_zoom_x: f64,
+    metrics_chart_zoom_y: f64,
+    metrics_chart_pan_y_ratio: f64,
     metrics_history_settings: MetricsHistorySettings,
     metrics_summary_settings: MetricsSummarySettings,
     metrics_policies_settings: MetricsPoliciesSettings,
@@ -1703,6 +1717,9 @@ pub struct App {
     python_sb3_available: Option<bool>,
     python_ray_available: Option<bool>,
     python_check_user_triggered: bool,
+    python_check_receiver: Option<Receiver<PythonCheckEvent>>,
+    python_check_running: bool,
+    python_check_has_run: bool,
 
     controller_settings: ControllerSettings,
     settings_selection: usize,
@@ -1791,6 +1808,7 @@ impl App {
             advanced_fields: Vec::new(),
             advanced_selection: 0,
             file_browser_path: std::env::current_dir().unwrap_or_default(),
+            file_browser_all_entries: Vec::new(),
             file_browser_entries: Vec::new(),
             file_browser_selected: 0,
             file_browser_target: None,
@@ -1801,6 +1819,7 @@ impl App {
             file_browser_state: FileBrowserState::Browsing,
             file_browser_default_name: None,
             file_browser_input: String::new(),
+            file_browser_filter: String::new(),
             status: None,
             training_config: TrainingConfig::default(),
             mars_config: MarsTrainingConfig::default(),
@@ -1835,6 +1854,9 @@ impl App {
             metrics_policies_expanded: false,
             metrics_policies_horizontal_scroll: 0,
             metrics_chart_settings: MetricsChartSettings::default(),
+            metrics_chart_zoom_x: 1.0,
+            metrics_chart_zoom_y: 1.0,
+            metrics_chart_pan_y_ratio: 0.0,
             metrics_history_settings: MetricsHistorySettings::default(),
             metrics_summary_settings: MetricsSummarySettings::default(),
             metrics_policies_settings: MetricsPoliciesSettings::default(),
@@ -1909,6 +1931,9 @@ impl App {
             python_sb3_available: None,
             python_ray_available: None,
             python_check_user_triggered: false,
+            python_check_receiver: None,
+            python_check_running: false,
+            python_check_has_run: false,
 
             controller_settings: ControllerSettings::default(),
             settings_selection: 0,
@@ -1939,7 +1964,7 @@ impl App {
         app.refresh_project_summaries();
         app.ensure_selection_valid();
         app.rebuild_export_fields();
-        app.check_python_environment();
+        app.start_python_environment_check(false);
 
         Ok(app)
     }
@@ -2096,17 +2121,35 @@ impl App {
         self.python_ray_available
     }
 
+    pub fn python_check_running(&self) -> bool {
+        self.python_check_running
+    }
+
+    pub fn python_check_has_run(&self) -> bool {
+        self.python_check_has_run
+    }
+
     pub fn python_check_hint_visible(&self) -> bool {
-        !self.python_check_user_triggered
+        !self.python_check_user_triggered && !self.python_check_running
     }
 
     pub fn refresh_python_environment(&mut self) {
         self.python_check_user_triggered = true;
-        self.set_status("Checking Python environment...", StatusKind::Info);
-        self.check_python_environment();
+        self.start_python_environment_check(true);
     }
 
-    fn check_python_environment(&mut self) {
+    fn start_python_environment_check(&mut self, show_status: bool) {
+        if self.python_check_running {
+            return;
+        }
+
+        self.python_sb3_available = None;
+        self.python_ray_available = None;
+        self.python_check_running = true;
+        if show_status {
+            self.set_status("Checking Python environment...", StatusKind::Info);
+        }
+
         let python_cmd = determine_python_command();
         let base_dir = controller_scripts_root()
             .or_else(|| std::env::current_dir().ok())
@@ -2117,6 +2160,8 @@ impl App {
             Err(err) => {
                 self.python_sb3_available = None;
                 self.python_ray_available = None;
+                self.python_check_running = false;
+                self.python_check_has_run = true;
                 self.set_status(
                     format!("Python check script not found: {err}"),
                     StatusKind::Warning,
@@ -2125,44 +2170,28 @@ impl App {
             }
         };
 
-        let output = Command::new(&python_cmd).arg(&check_script).output();
+        let (tx, rx) = mpsc::channel();
+        self.python_check_receiver = Some(rx);
 
-        match output {
-            Ok(result) => {
-                match result.status.code() {
-                    Some(0) => {
-                        // Both available
-                        self.python_sb3_available = Some(true);
-                        self.python_ray_available = Some(true);
-                    }
-                    Some(2) => {
-                        // Only SB3 available
-                        self.python_sb3_available = Some(true);
-                        self.python_ray_available = Some(false);
-                    }
-                    Some(3) => {
-                        // Only Ray available
-                        self.python_sb3_available = Some(false);
-                        self.python_ray_available = Some(true);
-                    }
-                    Some(4) => {
-                        // Neither available
-                        self.python_sb3_available = Some(false);
-                        self.python_ray_available = Some(false);
-                    }
-                    _ => {
-                        // Unknown error
-                        self.python_sb3_available = None;
-                        self.python_ray_available = None;
-                    }
-                }
-            }
-            Err(_) => {
-                // Failed to run check
-                self.python_sb3_available = None;
-                self.python_ray_available = None;
-            }
-        }
+        thread::spawn(move || {
+            let (sb3_available, ray_available) = match Command::new(&python_cmd)
+                .arg(&check_script)
+                .output()
+            {
+                Ok(result) => match result.status.code() {
+                    Some(0) => (Some(true), Some(true)),
+                    Some(2) => (Some(true), Some(false)),
+                    Some(3) => (Some(false), Some(true)),
+                    Some(4) => (Some(false), Some(false)),
+                    _ => (None, None),
+                },
+                Err(_) => (None, None),
+            };
+            let _ = tx.send(PythonCheckEvent::Finished {
+                sb3_available,
+                ray_available,
+            });
+        });
     }
 
     pub fn training_output(&self) -> &[String] {
@@ -2265,6 +2294,10 @@ impl App {
 
     pub fn is_viewing_saved_run(&self) -> bool {
         self.archived_run_view.is_some()
+    }
+
+    pub fn is_viewing_session_merge(&self) -> bool {
+        self.session_merged_metrics.is_some()
     }
 
     pub fn viewed_run_label(&self) -> Option<&str> {
@@ -2592,6 +2625,21 @@ impl App {
         self.metrics_history_index = 0;
     }
 
+    pub fn toggle_metrics_auto_follow_latest(&mut self) {
+        self.metrics_history_settings.auto_follow_latest =
+            !self.metrics_history_settings.auto_follow_latest;
+        if self.metrics_history_settings.auto_follow_latest {
+            self.metrics_history_index = 0;
+        }
+        let state = if self.metrics_history_settings.auto_follow_latest {
+            "on"
+        } else {
+            "off"
+        };
+        self.set_status(format!("Auto-follow latest: {state}"), StatusKind::Info);
+        self.persist_metrics_settings_if_possible();
+    }
+
     pub fn metrics_history_page_step(&self) -> usize {
         self.metrics_history_settings.page_step.max(1)
     }
@@ -2695,6 +2743,51 @@ impl App {
         options
     }
 
+    fn chart_metric_key(option: &ChartMetricOption) -> String {
+        match option.kind() {
+            ChartMetricKind::EpisodeRewardMean => "episode_reward_mean".to_string(),
+            ChartMetricKind::EpisodeLenMean => "episode_len_mean".to_string(),
+            ChartMetricKind::EnvThroughput => "env_throughput".to_string(),
+            ChartMetricKind::CustomMetric(name) => format!("custom:{name}"),
+            ChartMetricKind::PolicyRewardMean => format!(
+                "policy:{}:reward_mean",
+                option.policy_id().unwrap_or_default()
+            ),
+            ChartMetricKind::PolicyEpisodeLenMean => format!(
+                "policy:{}:episode_len_mean",
+                option.policy_id().unwrap_or_default()
+            ),
+            ChartMetricKind::PolicyLearnerStat(key) => format!(
+                "policy:{}:learner:{key}",
+                option.policy_id().unwrap_or_default()
+            ),
+            ChartMetricKind::PolicyCustomMetric(key) => format!(
+                "policy:{}:custom:{key}",
+                option.policy_id().unwrap_or_default()
+            ),
+            ChartMetricKind::AllPoliciesRewardMean => "all_policies:reward_mean".to_string(),
+            ChartMetricKind::AllPoliciesEpisodeLenMean => "all_policies:episode_len_mean".to_string(),
+            ChartMetricKind::AllPoliciesLearnerStat(key) => format!("all_policies:learner:{key}"),
+        }
+    }
+
+    fn set_chart_metric_by_key(&mut self, key: &str) -> bool {
+        let options = self.available_chart_metrics();
+        if options.is_empty() {
+            self.metrics_chart_index = 0;
+            return false;
+        }
+        if let Some(index) = options
+            .iter()
+            .position(|option| Self::chart_metric_key(option) == key)
+        {
+            self.metrics_chart_index = index;
+            true
+        } else {
+            false
+        }
+    }
+
     fn ensure_chart_metric_index(&mut self) {
         let options = self.available_chart_metrics();
         if options.is_empty() {
@@ -2713,6 +2806,18 @@ impl App {
                 .metrics_chart_index
                 .min(options.len().saturating_sub(1));
             Some(options[index].clone())
+        }
+    }
+
+    pub fn current_chart_metric_position(&self) -> Option<(usize, usize)> {
+        let options = self.available_chart_metrics();
+        if options.is_empty() {
+            None
+        } else {
+            let index = self
+                .metrics_chart_index
+                .min(options.len().saturating_sub(1));
+            Some((index + 1, options.len()))
         }
     }
 
@@ -2750,14 +2855,13 @@ impl App {
         }
 
         let max_points = max_points.max(1);
+        let wanted = max_points.min(total).max(1);
         let selected_idx = self.metrics_history_selected_index();
         let selected_pos = total.saturating_sub(1).saturating_sub(selected_idx);
-        let start = if selected_pos + max_points >= total {
-            total.saturating_sub(max_points)
-        } else {
-            selected_pos
-        };
-        let end = (start + max_points).min(total);
+        let half = wanted / 2;
+        let mut start = selected_pos.saturating_sub(half);
+        let end = (start + wanted).min(total);
+        start = end.saturating_sub(wanted);
         let samples = self.metrics_range_by_index_from_oldest(start, end);
         let mut points = Vec::new();
 
@@ -2805,6 +2909,24 @@ impl App {
         let sample = self.selected_metric_sample()?;
         let metric = self.current_chart_metric()?;
         App::chart_value_for_sample(&sample, &metric)
+    }
+
+    pub fn chart_value_at(&self, offset_from_latest: usize) -> Option<f64> {
+        let sample = self.metrics_sample_at(offset_from_latest)?;
+        let metric = self.current_chart_metric()?;
+        App::chart_value_for_sample(&sample, &metric)
+    }
+
+    pub fn selected_overlay_chart_value(&self) -> Option<f64> {
+        let metric = self.current_chart_metric()?;
+        let overlay = self.selected_overlay_sample()?;
+        App::chart_value_for_sample(overlay, &metric)
+    }
+
+    pub fn selected_overlay_chart_delta(&self) -> Option<f64> {
+        self.selected_chart_value()
+            .zip(self.selected_overlay_chart_value())
+            .map(|(a, b)| a - b)
     }
 
     fn visible_resume_points(&self) -> Vec<ResumePoint> {
@@ -3017,7 +3139,7 @@ impl App {
                 .collect()
         }
 
-        let history = self.metrics_history_vec_for_processing(max_points);
+        let history = self.metrics_history_vec_for_chart_window(max_points);
         let mut raw = match option.kind() {
             ChartMetricKind::AllPoliciesRewardMean
             | ChartMetricKind::AllPoliciesEpisodeLenMean
@@ -3053,6 +3175,24 @@ impl App {
         }
 
         self.apply_multi_series_smoothing(raw, smoothing, max_points.max(1))
+    }
+
+    fn metrics_history_vec_for_chart_window(&self, max_points: usize) -> Vec<MetricSample> {
+        let total = self.metrics_history_total_len();
+        if total == 0 {
+            return Vec::new();
+        }
+        if max_points == usize::MAX {
+            return self.metrics_range_by_index_from_oldest(0, total);
+        }
+        let wanted = max_points.max(1).min(total);
+        let selected_idx = self.metrics_history_selected_index();
+        let selected_pos = total.saturating_sub(1).saturating_sub(selected_idx);
+        let half = wanted / 2;
+        let mut start = selected_pos.saturating_sub(half);
+        let end = (start + wanted).min(total);
+        start = end.saturating_sub(wanted);
+        self.metrics_range_by_index_from_oldest(start, end)
     }
 
     fn metrics_history_vec_for_processing(&self, max_points: usize) -> Vec<MetricSample> {
@@ -3534,6 +3674,114 @@ impl App {
 
     pub fn metrics_chart_settings(&self) -> &MetricsChartSettings {
         &self.metrics_chart_settings
+    }
+
+    pub fn metrics_chart_reset_view(&mut self) {
+        self.metrics_chart_zoom_x = 1.0;
+        self.metrics_chart_zoom_y = 1.0;
+        self.metrics_chart_pan_y_ratio = 0.0;
+        self.set_status("Chart zoom reset", StatusKind::Info);
+    }
+
+    pub fn metrics_chart_zoom_x(&mut self, zoom_in: bool) {
+        let factor = if zoom_in { 1.25 } else { 0.8 };
+        self.metrics_chart_zoom_x = (self.metrics_chart_zoom_x * factor).clamp(1.0, 100.0);
+    }
+
+    pub fn metrics_chart_zoom_y(&mut self, zoom_in: bool) {
+        let factor = if zoom_in { 1.25 } else { 0.8 };
+        self.metrics_chart_zoom_y = (self.metrics_chart_zoom_y * factor).clamp(1.0, 100.0);
+    }
+
+    pub fn metrics_chart_pan_y(&mut self, direction: i32) {
+        let step = 0.12 / self.metrics_chart_zoom_y.max(1.0);
+        self.metrics_chart_pan_y_ratio =
+            (self.metrics_chart_pan_y_ratio + (direction as f64) * step).clamp(-20.0, 20.0);
+    }
+
+    pub fn metrics_chart_view_x_bounds(
+        &self,
+        base_min: f64,
+        base_max: f64,
+        center: Option<f64>,
+    ) -> (f64, f64) {
+        if !base_min.is_finite() || !base_max.is_finite() {
+            return (base_min, base_max);
+        }
+        let base_range = base_max - base_min;
+        if !(base_range > 0.0) || !base_range.is_finite() {
+            return (base_min, base_max);
+        }
+
+        let zoom = self.metrics_chart_zoom_x.max(1.0);
+        if (zoom - 1.0).abs() < 1e-6 {
+            return (base_min, base_max);
+        }
+
+        let mut view_range = base_range / zoom;
+        if !(view_range > 0.0) || !view_range.is_finite() {
+            view_range = base_range;
+        }
+        view_range = view_range.min(base_range);
+
+        let mut center = center.unwrap_or_else(|| (base_min + base_max) / 2.0);
+        if !center.is_finite() {
+            center = (base_min + base_max) / 2.0;
+        }
+        center = center.clamp(base_min, base_max);
+
+        let mut min = center - view_range / 2.0;
+        let mut max = center + view_range / 2.0;
+
+        if min < base_min {
+            max += base_min - min;
+            min = base_min;
+        }
+        if max > base_max {
+            min -= max - base_max;
+            max = base_max;
+        }
+        min = min.clamp(base_min, base_max);
+        max = max.clamp(base_min, base_max);
+        if max - min < 1e-9 {
+            (base_min, base_max)
+        } else {
+            (min, max)
+        }
+    }
+
+    pub fn metrics_chart_view_y_bounds(&self, base_min: f64, base_max: f64) -> (f64, f64) {
+        if !base_min.is_finite() || !base_max.is_finite() {
+            return (base_min, base_max);
+        }
+        let base_range = base_max - base_min;
+        if !(base_range > 0.0) || !base_range.is_finite() {
+            return (base_min, base_max);
+        }
+
+        let zoom = self.metrics_chart_zoom_y.max(1.0);
+        let mut view_range = base_range / zoom;
+        if !(view_range > 0.0) || !view_range.is_finite() {
+            view_range = base_range;
+        }
+        view_range = view_range.min(base_range);
+
+        let base_center = (base_min + base_max) / 2.0;
+        let mut center = base_center + self.metrics_chart_pan_y_ratio * base_range;
+        if !center.is_finite() {
+            center = base_center;
+        }
+
+        let min = center - view_range / 2.0;
+        let max = center + view_range / 2.0;
+        if !min.is_finite() || !max.is_finite() || max - min < 1e-9 {
+            return (base_min, base_max);
+        }
+        (min, max)
+    }
+
+    pub fn chart_smoothing_label(&self) -> String {
+        self.metrics_chart_settings.smoothing.label().to_string()
     }
 
     pub fn metrics_history_settings(&self) -> &MetricsHistorySettings {
@@ -5438,6 +5686,48 @@ impl App {
         Ok(())
     }
 
+    pub fn open_chart_metric_menu(&mut self) {
+        let origin_mode = self.input_mode;
+        self.config_return_mode = Some(origin_mode);
+        self.input_mode = InputMode::SelectingConfigOption;
+
+        let metrics = self.available_chart_metrics();
+        if metrics.is_empty() {
+            self.set_status("No chart metrics available yet", StatusKind::Warning);
+            self.exit_choice_menu();
+            return;
+        }
+
+        let options: Vec<ConfigChoice> = metrics
+            .iter()
+            .map(|metric| {
+                let value = Self::chart_metric_key(metric);
+                let desc = metric
+                    .policy_id()
+                    .map(|p| format!("Policy: {p}"))
+                    .unwrap_or_else(|| String::from(" "));
+                ConfigChoice::new(metric.label(), value, desc)
+            })
+            .collect();
+
+        let current_key = self
+            .current_chart_metric()
+            .map(|metric| Self::chart_metric_key(&metric))
+            .unwrap_or_default();
+        let selected = options
+            .iter()
+            .position(|choice| choice.value == current_key)
+            .unwrap_or(0)
+            .min(options.len().saturating_sub(1));
+
+        self.choice_menu = Some(ChoiceMenuState {
+            target: ChoiceMenuTarget::ChartMetric,
+            label: "Chart Metric".to_string(),
+            options,
+            selected,
+        });
+    }
+
     fn refresh_discovered_runs(&mut self) {
         self.discovered_runs.clear();
         self.selected_discovered_index = None;
@@ -5561,6 +5851,14 @@ impl App {
             },
             ChoiceMenuTarget::Metrics(field) => {
                 self.apply_metrics_choice(field, &value);
+                self.exit_choice_menu();
+                Ok(())
+            }
+            ChoiceMenuTarget::ChartMetric => {
+                let ok = self.set_chart_metric_by_key(&value);
+                if !ok {
+                    self.set_status("Metric not available anymore", StatusKind::Warning);
+                }
                 self.exit_choice_menu();
                 Ok(())
             }
@@ -9740,6 +10038,7 @@ impl App {
         self.file_browser_state = FileBrowserState::Browsing;
         self.file_browser_default_name = suggested_name;
         self.file_browser_input.clear();
+        self.file_browser_filter.clear();
         self.file_browser_selected = 0;
 
         self.file_browser_path = self.determine_browser_start_path(&target);
@@ -9858,10 +10157,12 @@ impl App {
     pub fn cancel_file_browser(&mut self) {
         self.input_mode = InputMode::Normal;
         self.file_browser_target = None;
+        self.file_browser_all_entries.clear();
         self.file_browser_entries.clear();
         self.file_browser_selected = 0;
         self.file_browser_state = FileBrowserState::Browsing;
         self.file_browser_input.clear();
+        self.file_browser_filter.clear();
         self.file_browser_default_name = None;
     }
 
@@ -9883,6 +10184,10 @@ impl App {
 
     pub fn file_browser_input(&self) -> &str {
         &self.file_browser_input
+    }
+
+    pub fn file_browser_filter(&self) -> &str {
+        &self.file_browser_filter
     }
 
     pub fn file_browser_kind(&self) -> &FileBrowserKind {
@@ -9915,6 +10220,8 @@ impl App {
             match entry {
                 FileBrowserEntry::Parent(path) | FileBrowserEntry::Directory(path) => {
                     self.file_browser_path = path;
+                    self.file_browser_filter.clear();
+                    self.file_browser_state = FileBrowserState::Browsing;
                     self.file_browser_selected = 0;
                     self.refresh_file_browser();
                 }
@@ -9932,9 +10239,55 @@ impl App {
     pub fn file_browser_go_up(&mut self) {
         if let Some(parent) = self.file_browser_path.parent() {
             self.file_browser_path = parent.to_path_buf();
+            self.file_browser_filter.clear();
+            self.file_browser_state = FileBrowserState::Browsing;
             self.file_browser_selected = 0;
             self.refresh_file_browser();
         }
+    }
+
+    pub fn file_browser_begin_filter(&mut self) {
+        if !matches!(
+            self.file_browser_state,
+            FileBrowserState::Browsing | FileBrowserState::Filtering
+        ) {
+            return;
+        }
+        self.file_browser_state = FileBrowserState::Filtering;
+        self.file_browser_filter.clear();
+        self.apply_file_browser_filter();
+    }
+
+    pub fn file_browser_exit_filter(&mut self) {
+        if self.file_browser_state == FileBrowserState::Filtering {
+            self.file_browser_state = FileBrowserState::Browsing;
+        }
+    }
+
+    pub fn file_browser_cancel_filter(&mut self) {
+        if self.file_browser_state == FileBrowserState::Filtering {
+            self.file_browser_state = FileBrowserState::Browsing;
+        }
+        self.file_browser_filter.clear();
+        self.apply_file_browser_filter();
+    }
+
+    pub fn file_browser_filter_push_char(&mut self, ch: char) {
+        if self.file_browser_state != FileBrowserState::Filtering {
+            return;
+        }
+        if !ch.is_control() && self.file_browser_filter.len() < 128 {
+            self.file_browser_filter.push(ch);
+            self.apply_file_browser_filter();
+        }
+    }
+
+    pub fn file_browser_filter_pop_char(&mut self) {
+        if self.file_browser_state != FileBrowserState::Filtering {
+            return;
+        }
+        self.file_browser_filter.pop();
+        self.apply_file_browser_filter();
     }
 
     pub fn file_browser_finalize_selection(&mut self) {
@@ -10036,6 +10389,7 @@ impl App {
         match self.file_browser_state {
             FileBrowserState::NamingFolder => self.confirm_new_folder(),
             FileBrowserState::NamingFile => self.confirm_new_file(),
+            FileBrowserState::Filtering => {}
             FileBrowserState::Browsing => {}
         }
     }
@@ -10070,6 +10424,7 @@ impl App {
         }
 
         self.set_status("Folder created", StatusKind::Success);
+        self.file_browser_filter.clear();
         self.file_browser_state = FileBrowserState::Browsing;
         self.file_browser_input.clear();
         self.refresh_file_browser();
@@ -10417,10 +10772,10 @@ impl App {
     }
 
     fn refresh_file_browser(&mut self) {
-        self.file_browser_entries.clear();
+        self.file_browser_all_entries.clear();
 
         if let Some(parent) = self.file_browser_path.parent() {
-            self.file_browser_entries
+            self.file_browser_all_entries
                 .push(FileBrowserEntry::Parent(parent.to_path_buf()));
         }
 
@@ -10441,7 +10796,7 @@ impl App {
             files.sort();
 
             for dir in dirs {
-                self.file_browser_entries
+                self.file_browser_all_entries
                     .push(FileBrowserEntry::Directory(dir));
             }
 
@@ -10450,9 +10805,52 @@ impl App {
                 | FileBrowserKind::OutputFile { .. }
                 | FileBrowserKind::Directory { .. } => {
                     for file in files {
-                        self.file_browser_entries.push(FileBrowserEntry::File(file));
+                        self.file_browser_all_entries.push(FileBrowserEntry::File(file));
                     }
                 }
+            }
+        }
+
+        self.apply_file_browser_filter();
+    }
+
+    fn apply_file_browser_filter(&mut self) {
+        let selected_path = self
+            .file_browser_entries
+            .get(self.file_browser_selected)
+            .map(|entry| entry.path().to_path_buf());
+
+        let needle = self.file_browser_filter.trim().to_lowercase();
+        self.file_browser_entries.clear();
+        if needle.is_empty() {
+            self.file_browser_entries
+                .extend(self.file_browser_all_entries.iter().cloned());
+        } else {
+            for entry in &self.file_browser_all_entries {
+                if entry.is_parent() {
+                    self.file_browser_entries.push(entry.clone());
+                    continue;
+                }
+                let name = entry.display_name().to_lowercase();
+                if name.contains(&needle) {
+                    self.file_browser_entries.push(entry.clone());
+                }
+            }
+        }
+
+        if self.file_browser_entries.is_empty() {
+            self.file_browser_selected = 0;
+            return;
+        }
+
+        if let Some(path) = selected_path {
+            if let Some(idx) = self
+                .file_browser_entries
+                .iter()
+                .position(|entry| entry.path() == path.as_path())
+            {
+                self.file_browser_selected = idx;
+                return;
             }
         }
 
@@ -11206,7 +11604,7 @@ impl App {
                         .clone()
                         .unwrap_or_else(|| "Resume baseline".to_string())
                         + " (ghost)",
-                    color: Color::DarkGray,
+                    color: Color::Gray,
                     points: ghost,
                 });
             }
@@ -11237,7 +11635,7 @@ impl App {
                 let points = apply_chart_smoothing(&points, smoothing);
                 overlays.push(ChartOverlaySeries {
                     label: ghost.label.clone(),
-                    color: Color::DarkGray,
+                    color: Color::Gray,
                     points,
                 });
             }
@@ -14077,6 +14475,8 @@ impl App {
     pub fn process_background_tasks(&mut self) {
         let mut events = Vec::new();
         let mut disconnected = false;
+        let mut python_check_events = Vec::new();
+        let mut python_check_disconnected = false;
         let mut simulator_events = Vec::new();
         let mut simulator_disconnected = false;
         let mut interface_events = Vec::new();
@@ -14097,6 +14497,28 @@ impl App {
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(rx) = self.python_check_receiver.as_ref() {
+            loop {
+                match rx.try_recv() {
+                    Ok(PythonCheckEvent::Finished {
+                        sb3_available,
+                        ray_available,
+                    }) => {
+                        python_check_events.push(PythonCheckEvent::Finished {
+                            sb3_available,
+                            ray_available,
+                        });
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        python_check_disconnected = true;
                         break;
                     }
                 }
@@ -14205,6 +14627,48 @@ impl App {
                     StatusKind::Warning,
                 );
             }
+        }
+
+        let python_check_finished = !python_check_events.is_empty();
+        for event in python_check_events {
+            match event {
+                PythonCheckEvent::Finished {
+                    sb3_available,
+                    ray_available,
+                } => {
+                    self.python_sb3_available = sb3_available;
+                    self.python_ray_available = ray_available;
+                    self.python_check_running = false;
+                    self.python_check_has_run = true;
+                    if self.python_check_user_triggered {
+                        let summary = match (sb3_available, ray_available) {
+                            (Some(true), Some(true)) => "Python check: SB3 ✓, Ray ✓".to_string(),
+                            (Some(true), Some(false)) => {
+                                "Python check: SB3 ✓, Ray ✗".to_string()
+                            }
+                            (Some(false), Some(true)) => {
+                                "Python check: SB3 ✗, Ray ✓".to_string()
+                            }
+                            (Some(false), Some(false)) => {
+                                "Python check: SB3 ✗, Ray ✗".to_string()
+                            }
+                            _ => "Python check failed to run.".to_string(),
+                        };
+                        self.set_status(summary, StatusKind::Info);
+                    }
+                }
+            }
+        }
+        if python_check_disconnected {
+            self.python_check_running = false;
+            self.python_check_receiver = None;
+            self.python_check_has_run = true;
+            self.set_status(
+                "Python environment check disconnected unexpectedly.",
+                StatusKind::Warning,
+            );
+        } else if python_check_finished {
+            self.python_check_receiver = None;
         }
 
         let mut simulator_finished = false;
@@ -15199,18 +15663,58 @@ fn sanitize_console_line(input: &str) -> String {
     let mut chars = input.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '\u{1b}' {
-            if matches!(chars.peek(), Some('[')) {
-                chars.next();
-                while let Some(next) = chars.next() {
-                    if ('@'..='~').contains(&next) {
-                        break;
+            match chars.peek().copied() {
+                // CSI: ESC [ ... <final byte>
+                Some('[') => {
+                    chars.next();
+                    while let Some(next) = chars.next() {
+                        if ('@'..='~').contains(&next) {
+                            break;
+                        }
                     }
+                    continue;
                 }
-                continue;
+                // OSC: ESC ] ... BEL or ST (ESC \)
+                Some(']') => {
+                    chars.next();
+                    while let Some(next) = chars.next() {
+                        if next == '\u{07}' {
+                            break;
+                        }
+                        if next == '\u{1b}' && matches!(chars.peek(), Some('\\')) {
+                            chars.next();
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                // DCS/SOS/PM/APC: ESC P / ESC X / ESC ^ / ESC _ ... ST (ESC \)
+                Some('P') | Some('X') | Some('^') | Some('_') => {
+                    chars.next();
+                    while let Some(next) = chars.next() {
+                        if next == '\u{1b}' && matches!(chars.peek(), Some('\\')) {
+                            chars.next();
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                // Other single-character escapes (e.g. ESC 7 / ESC 8 / ESC c)
+                Some(_) => {
+                    chars.next();
+                    continue;
+                }
+                None => continue,
             }
         }
+
+        // Strip C0 control chars that can desync terminal state.
         match ch {
-            '\r' | '\x07' | '\x0b' | '\x0c' => continue,
+            '\u{00}'..='\u{1f}' => match ch {
+                '\t' => output.push(' '),
+                _ => continue,
+            },
+            '\u{7f}' => continue, // DEL
             _ => output.push(ch),
         }
     }

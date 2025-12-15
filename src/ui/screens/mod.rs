@@ -50,12 +50,20 @@ fn format_axis_value(value: f64, prefer_integers: bool) -> String {
         }
     };
 
-    if prefer_integers || scaled.abs() >= 10.0 {
-        format!("{scaled:.0}{suffix}")
+    if !suffix.is_empty() {
+        let abs_scaled = scaled.abs();
+        let near_int = (scaled - scaled.round()).abs() < 1e-6;
+        if abs_scaled >= 10.0 || near_int {
+            format!("{scaled:.0}{suffix}")
+        } else {
+            format!("{scaled:.1}{suffix}")
+        }
+    } else if prefer_integers || scaled.abs() >= 10.0 {
+        format!("{scaled:.0}")
     } else if scaled.abs() >= 1.0 {
-        format!("{scaled:.1}{suffix}")
+        format!("{scaled:.1}")
     } else {
-        format!("{scaled:.2}{suffix}")
+        format!("{scaled:.2}")
     }
 }
 
@@ -277,9 +285,24 @@ fn render_python_environment(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::styled("Ray/RLlib", Style::default().fg(Color::White)),
     ]));
 
-    if app.python_check_hint_visible() {
+    if app.python_check_running() {
+        let mut label = "Checking libraries...".to_string();
+        if let Some(ch) = app.spinner_char() {
+            label.push(' ');
+            label.push(ch);
+        }
         lines.push(Line::from(Span::styled(
-            "Press 'p' to run the library check",
+            label,
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else if app.python_check_hint_visible() {
+        let hint = if app.python_check_has_run() {
+            "Press 'p' to re-run the library check"
+        } else {
+            "Press 'p' to run the library check"
+        };
+        lines.push(Line::from(Span::styled(
+            hint,
             Style::default().fg(Color::DarkGray),
         )));
     }
@@ -2441,9 +2464,13 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
         _ => {}
     }
 
-    let max_points = chart_settings
-        .max_points
-        .unwrap_or_else(|| (area.width as usize).saturating_mul(4).max(1));
+    let max_points = chart_settings.max_points.unwrap_or_else(|| {
+        if app.is_viewing_session_merge() || app.is_viewing_saved_run() {
+            app.metrics_history_total_len().min(10_000).max(1)
+        } else {
+            (area.width as usize).saturating_mul(4).max(1)
+        }
+    });
     let chart_data = app.chart_data(max_points, chart_settings.smoothing);
     let overlay_series = app.overlay_chart_series(
         &metric_option,
@@ -2590,12 +2617,19 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     for series in &overlay_series {
-        let overlay_style = if live_scale_active {
+        let is_ghost_overlay =
+            series.label.contains("(ghost)") || matches!(series.color, Color::DarkGray);
+        let overlay_color = if is_ghost_overlay {
+            Color::Gray
+        } else {
+            series.color
+        };
+        let overlay_style = if live_scale_active && !is_ghost_overlay {
             Style::default()
-                .fg(series.color)
+                .fg(overlay_color)
                 .add_modifier(Modifier::DIM)
         } else {
-            Style::default().fg(series.color)
+            Style::default().fg(overlay_color)
         };
         datasets.push(
             Dataset::default()
@@ -2647,6 +2681,13 @@ fn render_metrics_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if (x_max - x_min).abs() < 1e-3 {
         x_max = x_min + 1.0;
     }
+
+    let (x_min_view, x_max_view) = app.metrics_chart_view_x_bounds(x_min, x_max, selected_x);
+    x_min = x_min_view;
+    x_max = x_max_view;
+    let (y_min_view, y_max_view) = app.metrics_chart_view_y_bounds(y_min, y_max);
+    y_min = y_min_view;
+    y_max = y_max_view;
 
     if live_scale_active && (overlay_clipped_above || overlay_clipped_below) {
         if overlay_clipped_above {
@@ -2835,7 +2876,13 @@ fn render_multi_series_chart(
     };
     let max_points = chart_settings
         .max_points
-        .unwrap_or_else(|| (area.width as usize).saturating_mul(4).max(1));
+        .unwrap_or_else(|| {
+            if app.is_viewing_session_merge() || app.is_viewing_saved_run() {
+                app.metrics_history_total_len().min(10_000).max(1)
+            } else {
+                (area.width as usize).saturating_mul(4).max(1)
+            }
+        });
     let multi_data =
         app.chart_multi_series_data(metric_option, max_points, chart_settings.smoothing);
 
@@ -2897,11 +2944,22 @@ fn render_multi_series_chart(
         x_max = x_min + 1.0;
     }
 
+    let selected_x = app
+        .selected_metric_sample()
+        .and_then(|sample| sample.training_iteration().map(|iter| iter as f64))
+        .or_else(|| Some(app.metrics_history_selected_index() as f64));
+    let (x_min_view, x_max_view) = app.metrics_chart_view_x_bounds(x_min, x_max, selected_x);
+    x_min = x_min_view;
+    x_max = x_max_view;
+    let (y_min_view, y_max_view) = app.metrics_chart_view_y_bounds(y_min, y_max);
+    y_min = y_min_view;
+    y_max = y_max_view;
+
     // Ghost series first (drawn under primaries), then primaries.
     let ghost_palette = [
-        Color::DarkGray,
         Color::Gray,
-        Color::Rgb(180, 180, 180),
+        Color::Rgb(160, 160, 160),
+        Color::Rgb(200, 200, 200),
         Color::White,
     ];
     let mut datasets: Vec<Dataset> = Vec::new();
@@ -2929,10 +2987,6 @@ fn render_multi_series_chart(
         );
     }
 
-    let selected_x = app
-        .selected_metric_sample()
-        .and_then(|sample| sample.training_iteration().map(|iter| iter as f64))
-        .or_else(|| Some(app.metrics_history_selected_index() as f64));
     let mut selection_line = Vec::new();
     if chart_settings.show_selection {
         if let Some(x) = selected_x {
@@ -3063,6 +3117,10 @@ fn render_metrics_chart_info(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .as_ref()
         .map(|m| m.label().to_string())
         .unwrap_or_else(|| "n/a".to_string());
+    let metric_position = app
+        .current_chart_metric_position()
+        .map(|(idx, total)| format!("{idx}/{total}"))
+        .unwrap_or_else(|| "—".to_string());
     let policy_label = metric
         .as_ref()
         .and_then(|m| m.policy_id().map(|p| p.to_string()))
@@ -3071,6 +3129,24 @@ fn render_metrics_chart_info(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .selected_chart_value()
         .map(|v| format!("{v:.4}"))
         .unwrap_or_else(|| "—".to_string());
+    let follow_label = if app.metrics_history_settings().auto_follow_latest {
+        "On"
+    } else {
+        "Off"
+    };
+    let smoothing_label = app.chart_smoothing_label();
+
+    let offset = app.metrics_history_selected_index();
+    let prev_delta = app
+        .selected_chart_value()
+        .zip(app.chart_value_at(offset.saturating_add(1)))
+        .map(|(cur, prev)| cur - prev);
+    let overlay_delta = app.selected_overlay_chart_delta();
+    let resume_delta = metric.as_ref().and_then(|metric| {
+        app.selected_chart_value()
+            .zip(app.resume_marker_value(metric))
+            .map(|(cur, resume)| cur - resume)
+    });
 
     let columns = Layout::default()
         .direction(Direction::Horizontal)
@@ -3088,6 +3164,10 @@ fn render_metrics_chart_info(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" ({metric_position})"),
+                Style::default().fg(Color::DarkGray),
             ),
             Span::raw("  "),
             Span::styled("Value: ", Style::default().fg(Color::DarkGray)),
@@ -3110,6 +3190,10 @@ fn render_metrics_chart_info(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
+            Span::styled(
+                format!(" ({metric_position})"),
+                Style::default().fg(Color::DarkGray),
+            ),
             Span::raw("  "),
             Span::styled("Value: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
@@ -3125,20 +3209,65 @@ fn render_metrics_chart_info(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ]));
     }
 
+    let mut delta_line: Vec<Span> = Vec::new();
+    if let Some(delta) = prev_delta {
+        delta_line.push(Span::styled("Δ prev: ", Style::default().fg(Color::DarkGray)));
+        delta_line.push(delta_span(delta));
+    }
+    if let Some(delta) = overlay_delta {
+        if !delta_line.is_empty() {
+            delta_line.push(Span::raw("  "));
+        }
+        let label = app.selected_overlay_label().unwrap_or("overlay");
+        delta_line.push(Span::styled(
+            format!("Δ {label}: "),
+            Style::default().fg(Color::DarkGray),
+        ));
+        delta_line.push(delta_span(delta));
+    }
+    if let Some(delta) = resume_delta {
+        if !delta_line.is_empty() {
+            delta_line.push(Span::raw("  "));
+        }
+        delta_line.push(Span::styled("Δ resume: ", Style::default().fg(Color::DarkGray)));
+        delta_line.push(delta_span(delta));
+    }
+    if !delta_line.is_empty() {
+        lines.push(Line::from(delta_line));
+    }
+
+    lines.push(Line::from(vec![
+        Span::styled("Smoothing: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(smoothing_label, Style::default().fg(Color::Gray)),
+        Span::raw("  "),
+        Span::styled("Auto-follow: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            follow_label,
+            Style::default()
+                .fg(if app.metrics_history_settings().auto_follow_latest {
+                    Color::LightGreen
+                } else {
+                    Color::LightRed
+                })
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" (a)", Style::default().fg(Color::DarkGray)),
+    ]));
+
     if info_settings.show_hints {
         if available_width >= 90 {
             lines.push(Line::from(vec![Span::styled(
-                "↑/↓: navigate history  •  PgUp/PgDn: jump  •  Home/End: edges  •  , / . : cycle metric",
+                "↑/↓: navigate history  •  PgUp/PgDn: jump  •  Home/End: edges  •  , / . : cycle metric  •  p: pick metric",
                 Style::default().fg(Color::DarkGray),
             )]));
         } else if available_width >= 60 {
             lines.push(Line::from(vec![Span::styled(
-                "↑/↓: history  •  PgUp/Dn: jump marker  •  Home/End: edges  •  ,/.: metric",
+                "↑/↓: history  •  PgUp/Dn: jump marker  •  Home/End: edges  •  ,/.: metric  •  p: pick",
                 Style::default().fg(Color::DarkGray),
             )]));
         } else {
             lines.push(Line::from(vec![Span::styled(
-                "↑/↓: history  •  PgUp/Dn: jump marker  •  ,/.: metric",
+                "↑/↓: history  •  PgUp/Dn: jump marker  •  ,/.: metric  •  p: pick  •  a: follow",
                 Style::default().fg(Color::DarkGray),
             )]));
         }
@@ -3235,6 +3364,9 @@ fn marker_stats_lines(app: &App) -> Vec<Line<'static>> {
         }
     };
 
+    let offset = app.metrics_history_selected_index();
+    let prev_sample = app.metrics_sample_at(offset.saturating_add(1));
+
     let mut lines = Vec::new();
     lines.push(Line::from(vec![
         Span::styled("Iter: ", Style::default().fg(Color::DarkGray)),
@@ -3257,12 +3389,72 @@ fn marker_stats_lines(app: &App) -> Vec<Line<'static>> {
             Style::default().fg(Color::LightMagenta),
         ),
         Span::raw("  "),
+        Span::styled("Δ: ", Style::default().fg(Color::DarkGray)),
+        sample
+            .episode_reward_mean()
+            .zip(prev_sample.as_ref().and_then(|p| p.episode_reward_mean()))
+            .map(|(cur, prev)| delta_span(cur - prev))
+            .unwrap_or_else(|| Span::styled("—", Style::default().fg(Color::Gray))),
+        Span::raw("  "),
         Span::styled("Len: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format_option_f64(sample.episode_len_mean()),
             Style::default().fg(Color::LightBlue),
         ),
+        Span::raw("  "),
+        Span::styled("Δ: ", Style::default().fg(Color::DarkGray)),
+        sample
+            .episode_len_mean()
+            .zip(prev_sample.as_ref().and_then(|p| p.episode_len_mean()))
+            .map(|(cur, prev)| delta_span(cur - prev))
+            .unwrap_or_else(|| Span::styled("—", Style::default().fg(Color::Gray))),
     ]));
+
+    if let Some(metric) = app.current_chart_metric() {
+        let value = app
+            .selected_chart_value()
+            .map(|v| format!("{v:.4}"))
+            .unwrap_or_else(|| "—".to_string());
+        let mut spans = Vec::new();
+        spans.push(Span::styled("Metric: ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            metric.label().to_string(),
+            Style::default().fg(Color::Cyan),
+        ));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled("Value: ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(value, Style::default().fg(Color::White)));
+
+        if let Some(delta) = app
+            .selected_chart_value()
+            .zip(app.chart_value_at(offset.saturating_add(1)))
+            .map(|(cur, prev)| cur - prev)
+        {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled("Δ prev: ", Style::default().fg(Color::DarkGray)));
+            spans.push(delta_span(delta));
+        }
+        if let Some(delta) = app.selected_overlay_chart_delta() {
+            spans.push(Span::raw("  "));
+            let label = app.selected_overlay_label().unwrap_or("overlay");
+            spans.push(Span::styled(
+                format!("Δ {label}: "),
+                Style::default().fg(Color::DarkGray),
+            ));
+            spans.push(delta_span(delta));
+        }
+        if let Some(delta) = app
+            .selected_chart_value()
+            .zip(app.resume_marker_value(&metric))
+            .map(|(cur, resume)| cur - resume)
+        {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled("Δ resume: ", Style::default().fg(Color::DarkGray)));
+            spans.push(delta_span(delta));
+        }
+
+        lines.push(Line::from(spans));
+    }
 
     lines.push(Line::from(vec![
         Span::styled("Throughput: ", Style::default().fg(Color::DarkGray)),
@@ -4980,6 +5172,8 @@ fn metrics_help_lines(app: &App) -> Vec<String> {
         "Left / Right     Scroll expanded policies, or move chart marker when chart is focused"
             .to_string(),
         ", / .            Cycle the active chart metric".to_string(),
+        "p                Pick the active chart metric".to_string(),
+        "a                Toggle auto-follow latest metric".to_string(),
         "x (chart focus)  Export chart as PNG (adjust options after choosing path)".to_string(),
         "l                Load a saved run as the primary view (no overlays)".to_string(),
         "c                Load a saved run overlay from disk".to_string(),
@@ -5070,6 +5264,7 @@ fn file_browser_help_lines() -> Vec<String> {
         "Enter          Select file or descend into directory".to_string(),
         "Backspace / h  Go up to the parent directory".to_string(),
         "f              Finalize the current selection".to_string(),
+        "/              Type-to-filter the current folder".to_string(),
         "n              Create a new folder (when allowed)".to_string(),
         "Esc            Cancel file selection".to_string(),
     ]
@@ -5261,7 +5456,10 @@ pub fn render_file_browser(frame: &mut Frame<'_>, app: &App) {
     };
 
     let status = app.status();
-    let mut constraints = vec![Constraint::Length(3), Constraint::Min(5)];
+    let filter_visible = !app.file_browser_filter().trim().is_empty()
+        || app.file_browser_state() == FileBrowserState::Filtering;
+    let path_height = if filter_visible { 4 } else { 3 };
+    let mut constraints = vec![Constraint::Length(path_height), Constraint::Min(5)];
     if status.is_some() {
         constraints.push(Constraint::Length(3));
     }
@@ -5285,13 +5483,45 @@ pub fn render_file_browser(frame: &mut Frame<'_>, app: &App) {
     let instructions_chunk = chunks[next_chunk];
 
     // Path display
-    let path_text = format!(" Current: {} ", app.file_browser_path().display());
+    let mut path_lines: Vec<Line> = Vec::new();
+    path_lines.push(Line::from(Span::raw(format!(
+        " Current: {} ",
+        app.file_browser_path().display()
+    ))));
+    if filter_visible {
+        let filter_active = app.file_browser_state() == FileBrowserState::Filtering;
+        let label_style = if filter_active {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let value_style = if filter_active {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else if app.file_browser_filter().trim().is_empty() {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let value = if filter_active {
+            format!("{}_", app.file_browser_filter())
+        } else if app.file_browser_filter().trim().is_empty() {
+            "— (press /)".to_string()
+        } else {
+            app.file_browser_filter().to_string()
+        };
+        path_lines.push(Line::from(vec![
+            Span::styled(" Filter: ", label_style),
+            Span::styled(value, value_style),
+        ]));
+    }
     let path_block = Block::default()
         .borders(Borders::ALL)
         .title(" File Browser ")
         .title_alignment(Alignment::Center)
         .border_style(Style::default().fg(Color::Cyan));
-    let path_para = Paragraph::new(path_text)
+    let path_para = Paragraph::new(path_lines)
         .block(path_block)
         .style(Style::default().fg(Color::White));
     frame.render_widget(path_para, path_chunk);
@@ -5314,7 +5544,7 @@ pub fn render_file_browser(frame: &mut Frame<'_>, app: &App) {
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 ),
-                FileBrowserEntry::File(_) => ("� ", Style::default().fg(Color::White)),
+                FileBrowserEntry::File(_) => ("📄 ", Style::default().fg(Color::White)),
             };
             let mut spans = Vec::new();
             spans.push(Span::styled(prefix, style));
@@ -5378,7 +5608,8 @@ pub fn render_file_browser(frame: &mut Frame<'_>, app: &App) {
                 allow_create,
                 require_checkpoints,
             } => {
-                let mut text = String::from("↑/↓ navigate • Enter: open • f: choose here");
+                let mut text =
+                    String::from("↑/↓ navigate • Enter: open • f: choose here • /: filter");
                 if *allow_create {
                     text.push_str(" • n: new folder");
                 }
@@ -5397,17 +5628,23 @@ pub fn render_file_browser(frame: &mut Frame<'_>, app: &App) {
             }
             FileBrowserKind::ExistingFile { .. } => {
                 instructions.push(Line::from(Span::styled(
-                    "↑/↓ navigate • Enter: open • f: select file • Backspace: up • Esc: cancel",
+                    "↑/↓ navigate • Enter: open • f: select file • /: filter • Backspace: up • Esc: cancel",
                     Style::default().fg(Color::DarkGray),
                 )));
             }
             FileBrowserKind::OutputFile { .. } => {
                 instructions.push(Line::from(Span::styled(
-                        "↑/↓ navigate • Enter: open • f: choose name • n: new folder • Backspace: up • Esc: cancel",
+                        "↑/↓ navigate • Enter: open • f: choose name • /: filter • n: new folder • Backspace: up • Esc: cancel",
                         Style::default().fg(Color::DarkGray),
                     )));
             }
         },
+        FileBrowserState::Filtering => {
+            instructions.push(Line::from(Span::styled(
+                "Type to filter • Enter: done • Esc: clear filter • Backspace: delete • ↑/↓: move selection",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
         FileBrowserState::NamingFolder => {
             instructions.push(Line::from(vec![
                 Span::styled("New folder name: ", Style::default().fg(Color::Cyan)),
