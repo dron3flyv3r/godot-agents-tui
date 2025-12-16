@@ -791,6 +791,21 @@ if __name__ == "__main__":
     env_wrapper = None
 
     def env_creator(env_config):
+        cfg = dict(env_config) if env_config is not None else {}
+        show_window = bool(cfg.get("show_window", True))
+        try:
+            num_workers = int(
+                exp["config"].get("num_workers")
+                or exp["config"].get("num_rollout_workers")
+                or exp["config"].get("num_env_runners")
+                or 0
+            )
+        except Exception:
+            num_workers = 0
+        if num_workers > 0 and getattr(env_config, "worker_index", 0) == 0:
+            show_window = False
+        cfg["show_window"] = show_window
+
         index = (
             env_config.worker_index * exp["config"].get("num_envs_per_env_runner", 1)
             + env_config.vector_index
@@ -800,11 +815,11 @@ if __name__ == "__main__":
         if is_multiagent:
             return TrackingParallelPettingZooEnv(
                 NumpyObsGDRLPettingZooEnv(
-                    config=env_config, port=port, seed=seed, show_window=True
+                    config=cfg, port=port, seed=seed, show_window=show_window
                 )
             )
         else:
-            return NumpyObsRayVectorGodotEnv(config=env_config, port=port, seed=seed)
+            return NumpyObsRayVectorGodotEnv(config=cfg, port=port, seed=seed)
 
     tune.register_env(env_name, env_creator)
 
