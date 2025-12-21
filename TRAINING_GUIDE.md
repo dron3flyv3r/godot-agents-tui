@@ -1,152 +1,45 @@
 # Training Guide
 
-This guide explains how to use the training functionality in the controller.
+This guide focuses on running training jobs from the TUI.
 
-## Overview
+## Tabs and modes
+- **Home**: select or create a project; the active project decides where configs, logs, and runs are saved.
+- **Train**: configure SB3 or RLlib runs and launch them.
+- **Metrics**: inspect live samples from the active run and overlay saved runs.
+- **Projects**: browse stored runs and archives when you are not training.
 
-The controller supports two training modes:
-1. **Single-Agent (Stable Baselines 3)** - For single-agent reinforcement learning
-2. **Multi-Agent (RLlib)** - For multi-agent reinforcement learning scenarios
+## Preparing a project
+1. Create a project from the Home tab (`n`) and activate it (`Enter`).
+2. Confirm the `.rlcontroller` folder now exists in the project directory with `training_config.json` and `rllib_config.yaml`.
+3. Ensure your Python environment is active and has the packages from `requrements.txt`.
 
-## Getting Started
+## Training configuration
+Key fields in the Train tab map directly to `training_config.json`:
+- **Training Mode**: `single_agent` (SB3) or `multi_agent` (RLlib).
+- **Environment Path**: exported Godot binary for SB3; optional for RLlib if you connect to the editor.
+- **Timesteps / Experiment Name**: run length and label for SB3 runs.
+- **SB3 basics**: policy type (MLP/CNN/LSTM/GRN), speedup, parallel envs, PPO hyperparameters.
+- **RLlib basics**: algorithm (PPO/DQN/SAC/APPO/IMPALA), worker counts, rollout length, checkpoints, and stop criteria.
+- **Advanced RLlib**: policy backbone selection, learning rates, batch sizes, stopping by time/timesteps, and checkpoint frequency.
 
-### Prerequisites
+When you edit a field, the TUI writes changes back to `training_config.json`. RLlib-specific values are also mirrored into `.rlcontroller/rllib_config.yaml` before each run.
 
-1. **Python environment** with the required packages:
-   - For Single-Agent: `stable-baselines3`, `godot-rl`
-   - For Multi-Agent: `ray[rllib]`, `godot-rl`
+## Starting and stopping runs
+- Press `t` in the Train tab to launch the appropriate Python script (`stable_baselines3_training_script.py` or `rllib_training_script.py`).
+- The controller sets `CONTROLLER_METRICS` so both scripts emit structured `@METRIC` lines that the UI charts.
+- Press `c` to send SIGINT for a graceful stop; RLlib stop files and sustained reward thresholds are honored if configured.
 
-2. **Training scripts** must be present:
-   - `stable_baselines3_training_script.py` (for SB3)
-   - `rllib_training_script.py` (for RLlib)
+## Watching progress
+- Output from the Python process streams into the Train tab so you can see checkpoints and warnings immediately.
+- The Metrics tab charts reward and episode-length samples as they arrive. Switching focus allows you to view different sample buckets or compare against saved runs.
+- Completed runs are serialized into `.rlcontroller/runs/<timestamp>_<name>.json` along with optional paged metric logs for large jobs.
 
-3. **Godot environment binary** - The executable for your training environment
-
-### Quick Start
-
-1. **Navigate to Train tab**: Press `2` or use arrow keys to go to the "Train" tab
-
-2. **Select a project**: First, select a project from the Home tab (press `1` and select)
-
-3. **Toggle training mode**: Press `m` to switch between Single-Agent and Multi-Agent modes
-
-4. **Configure training**: 
-   - Environment path (required)
-   - Timesteps (default: 1,000,000)
-   - Experiment name (default: "training")
-
-5. **Start training**: Press `t` to start training
-
-6. **Monitor output**: Watch the training output stream in real-time
-
-7. **Cancel if needed**: Press `c` to send a keyboard interrupt (SIGINT) to the training process
-
-## Training Modes
-
-### Single-Agent (Stable Baselines 3)
-
-Uses the `stable_baselines3_training_script.py` script with these parameters:
-- `--env_path`: Path to the Godot environment binary
-- `--experiment_dir`: Directory for logs (defaults to `logs/sb3`)
-- `--experiment_name`: Name for this training run
-- `--timesteps`: Number of environment steps to train
-- `--speedup`: Physics speedup multiplier (default: 1)
-- `--n_parallel`: Number of parallel environment instances (default: 1)
-- `--viz`: Show visualization window (optional)
-
-**Configuration options:**
-- `sb3_viz`: Enable/disable visualization
-- `sb3_speedup`: Speed multiplier for physics
-- `sb3_n_parallel`: Number of parallel environments
-
-### Multi-Agent (RLlib)
-
-Uses the `rllib_training_script.py` script with these parameters:
-- `--config_file`: Path to RLlib config YAML (default: `rllib_config.yaml`; controller-managed projects output `.rlcontroller/rllib_config.yaml`)
-- `--experiment_dir`: Directory for logs (defaults to `logs/rllib`)
-
-**Configuration options:**
-- `rllib_config_file`: Path to the RLlib YAML configuration (defaults to `.rlcontroller/rllib_config.yaml` in new projects)
-
-## Keyboard Controls (Train Tab)
-
-- `t` or `T` - Start training with current configuration
-- `d` or `D` - Run demo training (uses demo.py for testing)
-- `m` or `M` - Toggle between Single-Agent and Multi-Agent modes
-- `c` or `C` - Cancel running training (sends SIGINT)
-- `Left/Right` - Switch tabs
-- `q` or `Esc` - Quit application
-
-## Output Streaming
-
-The training output streams in real-time, emulating a read-only terminal. You'll see:
-- Command being executed
-- Real-time output from the training script
-- Metrics (if enabled with `CONTROLLER_METRICS` environment variable)
-- Error messages (prefixed with `!`)
-- Exit status when training completes
-
-## Metrics Integration
-
-Both training scripts support emitting structured metrics when the `CONTROLLER_METRICS` environment variable is set. The controller automatically enables this, and metrics will appear in the output prefixed with `@METRIC`.
+## Resuming work
+- SB3 runs can resume via `resume_model_path` (set in `training_config.json`).
+- RLlib runs can resume from a checkpoint directory using the **Resume From** field; the controller keeps track of checkpoint frequency and offsets to label new checkpoints correctly.
+- Use the Projects tab to reopen saved runs, inspect logs, or export archives that include configs, runs, and optional model files.
 
 ## Tips
-
-1. **Testing setup**: Use the demo training (`d` key) to test that output streaming works
-
-2. **Script location**: Training scripts are searched in this order:
-   - Project directory
-   - Controller root directory
-   - Current working directory
-
-3. **Graceful cancellation**: Pressing `c` sends SIGINT (like Ctrl+C), allowing the script to clean up:
-   - SB3: Saves model and exports ONNX if configured
-   - RLlib: Attempts graceful Ray shutdown and locates latest checkpoint
-
-4. **Environment path**: Make sure your Godot binary has execute permissions:
-   ```bash
-   chmod +x path/to/your/environment.x86_64
-   ```
-
-5. **Configuration files**: For RLlib training, ensure `.rlcontroller/rllib_config.yaml` exists (press `g` to regenerate if needed)
-
-## Troubleshooting
-
-### "Environment path is required"
-Configure the environment path in your training settings before starting.
-
-### "No project selected"
-Go to the Home tab (press `1`) and select/activate a project first.
-
-### "Training script not found"
-Ensure the training scripts are accessible from your project or controller directory.
-
-### Output appears all at once
-This shouldn't happen anymore - the `-u` flag forces Python unbuffered output. If it does, check your Python version and environment.
-
-### Training won't cancel
-The controller sends SIGINT, but the script needs to handle it. Both provided scripts handle this correctly.
-
-## Example Workflow
-
-```
-1. Press `1` - Go to Home tab
-2. Select project with arrow keys
-3. Press Enter - Activate project
-4. Press `2` - Go to Train tab
-5. Press `m` - Toggle to desired mode (if needed)
-6. [Configure settings - feature to be added]
-7. Press `t` - Start training
-8. Watch output stream in real-time
-9. Press `c` if you need to stop early
-```
-
-## Future Enhancements
-
-The following features are planned:
-- Interactive configuration editor
-- Saved training presets
-- Training history and results viewer
-- Checkpoint management
-- Tensorboard integration
-- Metrics visualization
+- Start with short runs (e.g., 100k timesteps) to validate observation/action wiring before launching longer jobs.
+- Keep the Godot window hidden while training unless you are debugging visuals; both SB3 and RLlib have switches for this.
+- Use the simulator tab before training to confirm your environment produces sensible observations and rewards.

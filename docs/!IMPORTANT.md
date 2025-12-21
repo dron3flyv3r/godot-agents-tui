@@ -1,2 +1,2 @@
-> [!IMPORTANT] AI generated docs
-> This documentation was generated using Claude Sonnet 4.5, I can't personally check the accuracy of all details. Please keep this in mind when using the information provided here. I will try to review and correct any mistakes over time. If you find any errors, please open an issue on GitHub.
+> [!IMPORTANT]
+> The documentation in this repository is maintained by the project. If you notice gaps or inaccuracies, please open an issue so we can correct them quickly.
