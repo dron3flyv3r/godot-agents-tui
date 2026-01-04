@@ -5767,6 +5767,11 @@ pub fn render_chart_export_options(frame: &mut Frame<'_>, app: &App) {
                 ChartExportOptionField::XAxisTitle => "X axis title",
                 ChartExportOptionField::YAxisTitle => "Y axis title",
                 ChartExportOptionField::Smoothing => "Smoothing",
+                ChartExportOptionField::PerRunColors => "Per-run colors",
+                ChartExportOptionField::PaddingTop => "Padding top (%)",
+                ChartExportOptionField::PaddingBottom => "Padding bottom (%)",
+                ChartExportOptionField::PaddingLeft => "Padding left (%)",
+                ChartExportOptionField::PaddingRight => "Padding right (%)",
             };
             let value = app
                 .chart_export_option_value(*field)
@@ -5822,7 +5827,7 @@ pub fn render_chart_export_options(frame: &mut Frame<'_>, app: &App) {
                 Style::default().fg(Color::DarkGray),
             )),
             Line::from(Span::styled(
-                "Theme toggles dark/light; edit axis titles or file name before saving.",
+                "Theme toggles dark/light; edit titles, padding, or file name before saving.",
                 Style::default().fg(Color::DarkGray),
             )),
         ]

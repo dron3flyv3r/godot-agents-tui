@@ -644,6 +644,11 @@ pub struct ChartExportStyle {
     x_label: String,
     y_label: String,
     smoothing: ChartSmoothingKind,
+    padding_top: f64,
+    padding_bottom: f64,
+    padding_left: f64,
+    padding_right: f64,
+    deterministic_colors: bool,
 }
 
 impl Default for ChartExportStyle {
@@ -660,6 +665,11 @@ impl Default for ChartExportStyle {
             x_label: String::from("Training iteration"),
             y_label: String::from("Value"),
             smoothing: ChartSmoothingKind::None,
+            padding_top: 0.05,
+            padding_bottom: 0.05,
+            padding_left: 0.05,
+            padding_right: 0.05,
+            deterministic_colors: false,
         }
     }
 }
@@ -745,6 +755,48 @@ fn smooth_median(points: &[(f64, f64)], window: usize) -> Vec<(f64, f64)> {
     smoothed
 }
 
+fn export_resume_boundaries(
+    resume_markers: &[(f64, Option<f64>, Color, String)],
+) -> Vec<f64> {
+    let mut boundaries: Vec<f64> = resume_markers
+        .iter()
+        .map(|(x, _, _, _)| *x)
+        .filter(|x| x.is_finite())
+        .collect();
+    boundaries.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    boundaries.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+    boundaries
+}
+
+fn split_export_points(
+    points: Vec<(f64, f64)>,
+    boundaries: &[f64],
+) -> Vec<Vec<(f64, f64)>> {
+    if boundaries.is_empty() {
+        return vec![points];
+    }
+    let mut segments = Vec::new();
+    let mut current = Vec::new();
+    let mut boundary_iter = boundaries.iter().peekable();
+    for (x, y) in points {
+        while let Some(boundary) = boundary_iter.peek() {
+            if x >= **boundary {
+                if !current.is_empty() {
+                    segments.push(std::mem::take(&mut current));
+                }
+                boundary_iter.next();
+            } else {
+                break;
+            }
+        }
+        current.push((x, y));
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChartExportTheme {
     Dark,
@@ -765,6 +817,11 @@ pub enum ChartExportOptionField {
     XAxisTitle,
     YAxisTitle,
     Smoothing,
+    PerRunColors,
+    PaddingTop,
+    PaddingBottom,
+    PaddingLeft,
+    PaddingRight,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1037,6 +1094,8 @@ struct PersistedMetricsSettings {
     info: MetricsInfoSettings,
     colors: MetricsColorSettings,
     resume_points: Vec<ResumePoint>,
+    #[serde(default)]
+    chart_export: ChartExportStyle,
 }
 
 impl Default for PersistedMetricsSettings {
@@ -1049,6 +1108,7 @@ impl Default for PersistedMetricsSettings {
             info: MetricsInfoSettings::default(),
             colors: MetricsColorSettings::default(),
             resume_points: Vec::new(),
+            chart_export: ChartExportStyle::default(),
         }
     }
 }
@@ -3223,50 +3283,100 @@ impl App {
         points
     }
 
-    fn build_export_series(&self, option: &ChartMetricOption) -> Vec<ExportSeries> {
-        let smoothing = self.chart_export_style.smoothing;
+    fn build_export_series(
+        &self,
+        option: &ChartMetricOption,
+        style: &ChartExportStyle,
+        resume_boundaries: &[f64],
+    ) -> Vec<ExportSeries> {
+        let smoothing = style.smoothing;
+        let deterministic_colors = style.deterministic_colors;
         match option.kind() {
             ChartMetricKind::AllPoliciesRewardMean
             | ChartMetricKind::AllPoliciesEpisodeLenMean
             | ChartMetricKind::AllPoliciesLearnerStat(_) => {
-                let ghost_palette = [
-                    RGBColor(64, 64, 64),
-                    RGBColor(96, 96, 96),
-                    RGBColor(128, 128, 128),
-                    RGBColor(196, 196, 196),
-                ];
                 let mut series = Vec::new();
-                let mut primary_idx = 0;
-                for entry in self.chart_multi_series_data(option, usize::MAX, smoothing) {
-                    if entry.points.is_empty() {
-                        continue;
+                if deterministic_colors {
+                    let mut color_idx = 0;
+                    for entry in self.chart_multi_series_data(option, usize::MAX, smoothing) {
+                        if entry.points.is_empty() {
+                            continue;
+                        }
+                        let color = export_palette_color(color_idx);
+                        color_idx += 1;
+                        series.push(ExportSeries {
+                            label: entry.label,
+                            color,
+                            points: entry.points,
+                        });
                     }
-                    let color = if entry.is_ghost {
-                        ghost_palette[entry.ghost_index % ghost_palette.len()]
-                    } else {
-                        let c = export_palette_color(primary_idx);
-                        primary_idx += 1;
-                        c
-                    };
-                    series.push(ExportSeries {
-                        label: entry.label,
-                        color,
-                        points: entry.points,
-                    });
+                    series
+                } else {
+                    let ghost_palette = [
+                        RGBColor(64, 64, 64),
+                        RGBColor(96, 96, 96),
+                        RGBColor(128, 128, 128),
+                        RGBColor(196, 196, 196),
+                    ];
+                    let mut primary_idx = 0;
+                    for entry in self.chart_multi_series_data(option, usize::MAX, smoothing) {
+                        if entry.points.is_empty() {
+                            continue;
+                        }
+                        let color = if entry.is_ghost {
+                            ghost_palette[entry.ghost_index % ghost_palette.len()]
+                        } else {
+                            let c = export_palette_color(primary_idx);
+                            primary_idx += 1;
+                            c
+                        };
+                        series.push(ExportSeries {
+                            label: entry.label,
+                            color,
+                            points: entry.points,
+                        });
+                    }
+                    series
                 }
-                series
             }
             _ => {
                 let mut series = Vec::new();
                 let base_points =
                     apply_chart_smoothing(&self.chart_points_for_option(option), smoothing);
                 if !base_points.is_empty() {
-                    series.push(ExportSeries {
-                        label: option.label().to_string(),
-                        color: RGBColor(0, 196, 255),
-                        points: base_points,
-                    });
+                    if deterministic_colors && !resume_boundaries.is_empty() {
+                        let segments = split_export_points(base_points, resume_boundaries);
+                        let mut segment_idx = 0;
+                        for segment in segments {
+                            if segment.is_empty() {
+                                continue;
+                            }
+                            let color = export_palette_color(segment_idx);
+                            segment_idx += 1;
+                            series.push(ExportSeries {
+                                label: format!("{} part {}", option.label(), segment_idx),
+                                color,
+                                points: segment,
+                            });
+                        }
+                    } else {
+                        let color = if deterministic_colors {
+                            export_palette_color(0)
+                        } else {
+                            RGBColor(0, 196, 255)
+                        };
+                        series.push(ExportSeries {
+                            label: option.label().to_string(),
+                            color,
+                            points: base_points,
+                        });
+                    }
                 }
+                let mut color_idx = if deterministic_colors {
+                    series.len()
+                } else {
+                    0
+                };
                 for (idx, overlay) in self
                     .overlay_chart_series(option, usize::MAX, smoothing, false)
                     .into_iter()
@@ -3275,8 +3385,14 @@ impl App {
                     if overlay.points.is_empty() {
                         continue;
                     }
-                    let color = rgb_from_ratatui(overlay.color)
-                        .unwrap_or_else(|| export_palette_color(idx + 1));
+                    let color = if deterministic_colors {
+                        let color = export_palette_color(color_idx);
+                        color_idx += 1;
+                        color
+                    } else {
+                        rgb_from_ratatui(overlay.color)
+                            .unwrap_or_else(|| export_palette_color(idx + 1))
+                    };
                     series.push(ExportSeries {
                         label: overlay.label,
                         color,
@@ -3333,7 +3449,18 @@ impl App {
             bail!("No chart metric selected");
         };
 
-        let series = self.build_export_series(&metric_option);
+        let resume_markers = if options.style.show_resume || options.style.deterministic_colors {
+            self.resume_markers_for_metric(&metric_option)
+        } else {
+            Vec::new()
+        };
+        let resume_boundaries = if options.style.deterministic_colors {
+            export_resume_boundaries(&resume_markers)
+        } else {
+            Vec::new()
+        };
+
+        let series = self.build_export_series(&metric_option, &options.style, &resume_boundaries);
         if series.is_empty() {
             bail!("No chart data available to export");
         }
@@ -3354,13 +3481,19 @@ impl App {
             })?;
         }
 
-        let resume_x = if options.style.show_resume {
-            self.resume_marker_iteration().map(|iter| iter as f64)
+        let visible_resume_markers = if options.style.show_resume {
+            resume_markers.as_slice()
         } else {
-            None
+            &[]
         };
-        let ((x_min, x_max), (y_min, y_max)) = Self::export_bounds(&series, resume_x)
+        let resume_points: Vec<(f64, Option<f64>)> = visible_resume_markers
+            .iter()
+            .map(|(x, y, _, _)| (*x, *y))
+            .collect();
+        let ((x_min, x_max), (y_min, y_max)) = Self::export_bounds(&series, &resume_points)
             .ok_or_else(|| color_eyre::eyre::eyre!("Chart has no finite datapoints to export"))?;
+        let ((x_min, x_max), (y_min, y_max)) =
+            Self::apply_export_padding(((x_min, x_max), (y_min, y_max)), &options.style);
 
         let palette = export_colors(options.style.theme);
         let path_string = path.to_string_lossy().to_string();
@@ -3430,11 +3563,26 @@ impl App {
                 });
         }
 
-        if let Some(x) = resume_x {
-            chart.draw_series(LineSeries::new(
-                vec![(x, y_min), (x, y_max)],
-                ShapeStyle::from(&palette.resume).stroke_width(2),
-            ))?;
+        if options.style.show_resume {
+            for (x, y, color, _) in visible_resume_markers {
+                if !x.is_finite() {
+                    continue;
+                }
+                let marker_color = rgb_from_ratatui(*color).unwrap_or(palette.resume);
+                chart.draw_series(LineSeries::new(
+                    vec![(*x, y_min), (*x, y_max)],
+                    ShapeStyle::from(&marker_color).stroke_width(2),
+                ))?;
+                if let Some(val) = y {
+                    if val.is_finite() {
+                        chart.draw_series(std::iter::once(Circle::new(
+                            (*x, *val),
+                            5,
+                            ShapeStyle::from(&marker_color).filled(),
+                        )))?;
+                    }
+                }
+            }
         }
 
         if options.style.show_selection {
@@ -3498,7 +3646,7 @@ impl App {
 
     fn export_bounds(
         series: &[ExportSeries],
-        extra_x: Option<f64>,
+        extra_points: &[(f64, Option<f64>)],
     ) -> Option<((f64, f64), (f64, f64))> {
         let mut x_min = f64::INFINITY;
         let mut x_max = f64::NEG_INFINITY;
@@ -3518,10 +3666,16 @@ impl App {
             }
         }
 
-        if let Some(x) = extra_x {
+        for (x, y) in extra_points {
             if x.is_finite() {
-                x_min = x_min.min(x);
-                x_max = x_max.max(x);
+                x_min = x_min.min(*x);
+                x_max = x_max.max(*x);
+            }
+            if let Some(value) = y {
+                if value.is_finite() {
+                    y_min = y_min.min(*value);
+                    y_max = y_max.max(*value);
+                }
             }
         }
 
@@ -3539,6 +3693,34 @@ impl App {
         }
 
         Some(((x_min, x_max), (y_min, y_max)))
+    }
+
+    fn apply_export_padding(
+        bounds: ((f64, f64), (f64, f64)),
+        style: &ChartExportStyle,
+    ) -> ((f64, f64), (f64, f64)) {
+        let ((mut x_min, mut x_max), (mut y_min, mut y_max)) = bounds;
+        let x_range = (x_max - x_min).abs().max(1e-9);
+        let y_range = (y_max - y_min).abs().max(1e-9);
+
+        let pad_left = style.padding_left.clamp(0.0, 1.0);
+        let pad_right = style.padding_right.clamp(0.0, 1.0);
+        let pad_top = style.padding_top.clamp(0.0, 1.0);
+        let pad_bottom = style.padding_bottom.clamp(0.0, 1.0);
+
+        x_min -= x_range * pad_left;
+        x_max += x_range * pad_right;
+        y_min -= y_range * pad_bottom;
+        y_max += y_range * pad_top;
+
+        if (x_max - x_min).abs() < 1e-9 {
+            x_max = x_min + 1.0;
+        }
+        if (y_max - y_min).abs() < 1e-9 {
+            y_max = y_min + 1.0;
+        }
+
+        ((x_min, x_max), (y_min, y_max))
     }
 
     fn build_export_stats_lines(
@@ -5001,7 +5183,7 @@ impl App {
             return;
         };
 
-        let series = self.build_export_series(&option);
+        let series = self.build_export_series(&option, &self.chart_export_style, &[]);
         if series.is_empty() {
             self.set_status("No chart data available to export yet", StatusKind::Warning);
             return;
@@ -5063,7 +5245,7 @@ impl App {
         );
     }
 
-    pub fn chart_export_fields(&self) -> [ChartExportOptionField; 12] {
+    pub fn chart_export_fields(&self) -> [ChartExportOptionField; 17] {
         [
             ChartExportOptionField::FileName,
             ChartExportOptionField::Theme,
@@ -5077,6 +5259,11 @@ impl App {
             ChartExportOptionField::XAxisTitle,
             ChartExportOptionField::YAxisTitle,
             ChartExportOptionField::Smoothing,
+            ChartExportOptionField::PerRunColors,
+            ChartExportOptionField::PaddingTop,
+            ChartExportOptionField::PaddingBottom,
+            ChartExportOptionField::PaddingLeft,
+            ChartExportOptionField::PaddingRight,
         ]
     }
 
@@ -5106,6 +5293,11 @@ impl App {
             ChartExportOptionField::XAxisTitle => opts.style.x_label.clone(),
             ChartExportOptionField::YAxisTitle => opts.style.y_label.clone(),
             ChartExportOptionField::Smoothing => opts.style.smoothing.label().to_string(),
+            ChartExportOptionField::PerRunColors => format_bool(opts.style.deterministic_colors),
+            ChartExportOptionField::PaddingTop => format_padding(opts.style.padding_top),
+            ChartExportOptionField::PaddingBottom => format_padding(opts.style.padding_bottom),
+            ChartExportOptionField::PaddingLeft => format_padding(opts.style.padding_left),
+            ChartExportOptionField::PaddingRight => format_padding(opts.style.padding_right),
         };
         Some(value)
     }
@@ -5169,9 +5361,16 @@ impl App {
             ChartExportOptionField::Smoothing => {
                 opts.style.smoothing = opts.style.smoothing.cycle(1);
             }
+            ChartExportOptionField::PerRunColors => {
+                opts.style.deterministic_colors = !opts.style.deterministic_colors;
+            }
             ChartExportOptionField::FileName
             | ChartExportOptionField::XAxisTitle
-            | ChartExportOptionField::YAxisTitle => {
+            | ChartExportOptionField::YAxisTitle
+            | ChartExportOptionField::PaddingTop
+            | ChartExportOptionField::PaddingBottom
+            | ChartExportOptionField::PaddingLeft
+            | ChartExportOptionField::PaddingRight => {
                 self.start_chart_export_field_edit(field);
             }
         }
@@ -5183,6 +5382,14 @@ impl App {
                 ChartExportOptionField::FileName => opts.file_name.clone(),
                 ChartExportOptionField::XAxisTitle => opts.style.x_label.clone(),
                 ChartExportOptionField::YAxisTitle => opts.style.y_label.clone(),
+                ChartExportOptionField::PaddingTop => format_padding_value(opts.style.padding_top),
+                ChartExportOptionField::PaddingBottom => {
+                    format_padding_value(opts.style.padding_bottom)
+                }
+                ChartExportOptionField::PaddingLeft => format_padding_value(opts.style.padding_left),
+                ChartExportOptionField::PaddingRight => {
+                    format_padding_value(opts.style.padding_right)
+                }
                 _ => return,
             };
             self.active_chart_export_field = Some(field);
@@ -5233,6 +5440,34 @@ impl App {
                 ChartExportOptionField::YAxisTitle => {
                     opts.style.y_label = self.chart_export_edit_buffer.clone();
                 }
+                ChartExportOptionField::PaddingTop => {
+                    if let Some(value) = parse_padding_value(&self.chart_export_edit_buffer) {
+                        opts.style.padding_top = value;
+                    } else {
+                        self.set_status("Invalid padding value for top", StatusKind::Warning);
+                    }
+                }
+                ChartExportOptionField::PaddingBottom => {
+                    if let Some(value) = parse_padding_value(&self.chart_export_edit_buffer) {
+                        opts.style.padding_bottom = value;
+                    } else {
+                        self.set_status("Invalid padding value for bottom", StatusKind::Warning);
+                    }
+                }
+                ChartExportOptionField::PaddingLeft => {
+                    if let Some(value) = parse_padding_value(&self.chart_export_edit_buffer) {
+                        opts.style.padding_left = value;
+                    } else {
+                        self.set_status("Invalid padding value for left", StatusKind::Warning);
+                    }
+                }
+                ChartExportOptionField::PaddingRight => {
+                    if let Some(value) = parse_padding_value(&self.chart_export_edit_buffer) {
+                        opts.style.padding_right = value;
+                    } else {
+                        self.set_status("Invalid padding value for right", StatusKind::Warning);
+                    }
+                }
                 _ => {}
             }
         }
@@ -5253,6 +5488,7 @@ impl App {
                     StatusKind::Success,
                 );
                 self.chart_export_style = opts.style;
+                self.persist_metrics_settings_if_possible();
             }
             Err(error) => {
                 self.set_status(format!("Failed to save chart: {error}"), StatusKind::Error);
@@ -9427,6 +9663,7 @@ impl App {
                 info: self.metrics_info_settings.clone(),
                 colors: self.metrics_color_settings.clone(),
                 resume_points: self.metrics_resume_points.clone(),
+                chart_export: self.chart_export_style.clone(),
             };
             let json = serde_json::to_string_pretty(&state).wrap_err_with(|| {
                 format!(
@@ -9456,6 +9693,7 @@ impl App {
                                 self.metrics_info_settings = state.info;
                                 self.metrics_color_settings = state.colors;
                                 self.metrics_resume_points = state.resume_points;
+                                self.chart_export_style = state.chart_export;
                             }
                             Err(error) => {
                                 self.metrics_chart_settings = MetricsChartSettings::default();
@@ -9465,6 +9703,7 @@ impl App {
                                 self.metrics_info_settings = MetricsInfoSettings::default();
                                 self.metrics_color_settings = MetricsColorSettings::default();
                                 self.metrics_resume_points = Vec::new();
+                                self.chart_export_style = ChartExportStyle::default();
                                 self.set_status(
                                     format!("Invalid metrics settings, using defaults: {}", error),
                                     StatusKind::Warning,
@@ -9481,6 +9720,7 @@ impl App {
                         self.metrics_info_settings = MetricsInfoSettings::default();
                         self.metrics_color_settings = MetricsColorSettings::default();
                         self.metrics_resume_points = Vec::new();
+                        self.chart_export_style = ChartExportStyle::default();
                         self.set_status(
                             format!("Failed to read metrics settings, using defaults: {error}"),
                             StatusKind::Warning,
@@ -9496,6 +9736,7 @@ impl App {
                 self.metrics_info_settings = MetricsInfoSettings::default();
                 self.metrics_resume_points = Vec::new();
                 self.metrics_color_settings = MetricsColorSettings::default();
+                self.chart_export_style = ChartExportStyle::default();
             }
             self.metrics_policies_expanded = self.metrics_policies_settings.start_expanded;
             self.pending_resume_point = None;
@@ -16921,6 +17162,41 @@ fn format_bool(value: bool) -> String {
     } else {
         "Off".to_string()
     }
+}
+
+fn format_padding_value(value: f64) -> String {
+    let percent = (value * 100.0).max(0.0);
+    if (percent.fract()).abs() < 0.005 {
+        format!("{percent:.0}")
+    } else {
+        format!("{percent:.2}")
+    }
+}
+
+fn format_padding(value: f64) -> String {
+    format!("{}%", format_padding_value(value))
+}
+
+fn parse_padding_value(input: &str) -> Option<f64> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let has_percent = trimmed.ends_with('%');
+    let raw = trimmed.trim_end_matches('%').trim();
+    let parsed: f64 = raw.parse().ok()?;
+    if !parsed.is_finite() {
+        return None;
+    }
+    let mut value = if has_percent || parsed > 1.0 {
+        parsed / 100.0
+    } else {
+        parsed
+    };
+    if value.is_sign_negative() {
+        value = 0.0;
+    }
+    Some(value.clamp(0.0, 1.0))
 }
 
 fn legend_position(pos: ChartLegendPosition) -> Option<SeriesLabelPosition> {
