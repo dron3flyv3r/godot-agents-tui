@@ -644,12 +644,24 @@ pub struct ChartExportStyle {
     x_label: String,
     y_label: String,
     smoothing: ChartSmoothingKind,
+    #[serde(default)]
+    show_ghost_overlays: bool,
+    #[serde(default)]
     padding_top: f64,
+    #[serde(default)]
     padding_bottom: f64,
+    #[serde(default)]
     padding_left: f64,
+    #[serde(default)]
     padding_right: f64,
+    #[serde(default)]
     deterministic_colors: bool,
+    #[serde(default)]
+    metric_labels: HashMap<String, ChartExportMetricLabels>,
 }
+
+const CHART_EXPORT_DEFAULT_X_LABEL: &str = "Training iteration";
+const CHART_EXPORT_DEFAULT_Y_LABEL: &str = "Value";
 
 impl Default for ChartExportStyle {
     fn default() -> Self {
@@ -662,16 +674,24 @@ impl Default for ChartExportStyle {
             show_stats_box: false,
             show_caption: true,
             show_grid: true,
-            x_label: String::from("Training iteration"),
-            y_label: String::from("Value"),
+            x_label: CHART_EXPORT_DEFAULT_X_LABEL.to_string(),
+            y_label: CHART_EXPORT_DEFAULT_Y_LABEL.to_string(),
             smoothing: ChartSmoothingKind::None,
+            show_ghost_overlays: true,
             padding_top: 0.05,
             padding_bottom: 0.05,
             padding_left: 0.05,
             padding_right: 0.05,
             deterministic_colors: false,
+            metric_labels: HashMap::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChartExportMetricLabels {
+    x_label: String,
+    y_label: String,
 }
 
 fn apply_chart_smoothing(points: &[(f64, f64)], smoothing: ChartSmoothingKind) -> Vec<(f64, f64)> {
@@ -797,6 +817,47 @@ fn split_export_points(
     segments
 }
 
+fn export_labels_for_metric(
+    style: &ChartExportStyle,
+    metric_key: &str,
+    metric_label: &str,
+) -> (String, String) {
+    if let Some(labels) = style.metric_labels.get(metric_key) {
+        return (labels.x_label.clone(), labels.y_label.clone());
+    }
+    let y_label = if metric_label.is_empty() {
+        CHART_EXPORT_DEFAULT_Y_LABEL.to_string()
+    } else {
+        metric_label.to_string()
+    };
+    (CHART_EXPORT_DEFAULT_X_LABEL.to_string(), y_label)
+}
+
+fn update_export_metric_labels(
+    style: &mut ChartExportStyle,
+    metric_key: &str,
+    x_label: Option<String>,
+    y_label: Option<String>,
+) {
+    let entry = style
+        .metric_labels
+        .entry(metric_key.to_string())
+        .or_insert_with(|| ChartExportMetricLabels {
+            x_label: style.x_label.clone(),
+            y_label: style.y_label.clone(),
+        });
+    if let Some(value) = x_label {
+        entry.x_label = value;
+    }
+    if let Some(value) = y_label {
+        entry.y_label = value;
+    }
+}
+
+fn is_export_ghost_overlay(label: &str, color: Color) -> bool {
+    label.contains("(ghost)") || matches!(color, Color::Gray | Color::DarkGray)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChartExportTheme {
     Dark,
@@ -813,6 +874,7 @@ pub enum ChartExportOptionField {
     ShowSelectionMarker,
     ShowStatsBox,
     ShowCaption,
+    ShowGhostOverlays,
     ShowGrid,
     XAxisTitle,
     YAxisTitle,
@@ -829,6 +891,7 @@ pub struct ChartExportOptions {
     pub path: PathBuf,
     pub file_name: String,
     pub style: ChartExportStyle,
+    pub metric_key: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3302,6 +3365,9 @@ impl App {
                         if entry.points.is_empty() {
                             continue;
                         }
+                        if !style.show_ghost_overlays && entry.is_ghost {
+                            continue;
+                        }
                         let color = export_palette_color(color_idx);
                         color_idx += 1;
                         series.push(ExportSeries {
@@ -3321,6 +3387,9 @@ impl App {
                     let mut primary_idx = 0;
                     for entry in self.chart_multi_series_data(option, usize::MAX, smoothing) {
                         if entry.points.is_empty() {
+                            continue;
+                        }
+                        if !style.show_ghost_overlays && entry.is_ghost {
                             continue;
                         }
                         let color = if entry.is_ghost {
@@ -3383,6 +3452,11 @@ impl App {
                     .enumerate()
                 {
                     if overlay.points.is_empty() {
+                        continue;
+                    }
+                    if !style.show_ghost_overlays
+                        && is_export_ghost_overlay(&overlay.label, overlay.color)
+                    {
                         continue;
                     }
                     let color = if deterministic_colors {
@@ -5205,6 +5279,7 @@ impl App {
             self.set_status("No chart metric selected", StatusKind::Warning);
             return;
         };
+        let metric_key = Self::chart_metric_key(&option);
 
         let file_name = path
             .file_name()
@@ -5219,9 +5294,10 @@ impl App {
         final_path.push(&file_name);
 
         let mut style = self.chart_export_style.clone();
-        if style.y_label.is_empty() || style.y_label == "Value" {
-            style.y_label = option.label().to_string();
-        }
+        let (x_label, y_label) =
+            export_labels_for_metric(&style, &metric_key, option.label());
+        style.x_label = x_label;
+        style.y_label = y_label;
         self.chart_export_last_dir = Some(
             final_path
                 .parent()
@@ -5232,6 +5308,7 @@ impl App {
             path: final_path,
             file_name,
             style,
+            metric_key,
         };
 
         self.chart_export_options = Some(options);
@@ -5245,7 +5322,7 @@ impl App {
         );
     }
 
-    pub fn chart_export_fields(&self) -> [ChartExportOptionField; 17] {
+    pub fn chart_export_fields(&self) -> [ChartExportOptionField; 18] {
         [
             ChartExportOptionField::FileName,
             ChartExportOptionField::Theme,
@@ -5255,6 +5332,7 @@ impl App {
             ChartExportOptionField::ShowSelectionMarker,
             ChartExportOptionField::ShowStatsBox,
             ChartExportOptionField::ShowCaption,
+            ChartExportOptionField::ShowGhostOverlays,
             ChartExportOptionField::ShowGrid,
             ChartExportOptionField::XAxisTitle,
             ChartExportOptionField::YAxisTitle,
@@ -5289,6 +5367,9 @@ impl App {
             ChartExportOptionField::ShowSelectionMarker => format_bool(opts.style.show_selection),
             ChartExportOptionField::ShowStatsBox => format_bool(opts.style.show_stats_box),
             ChartExportOptionField::ShowCaption => format_bool(opts.style.show_caption),
+            ChartExportOptionField::ShowGhostOverlays => {
+                format_bool(opts.style.show_ghost_overlays)
+            }
             ChartExportOptionField::ShowGrid => format_bool(opts.style.show_grid),
             ChartExportOptionField::XAxisTitle => opts.style.x_label.clone(),
             ChartExportOptionField::YAxisTitle => opts.style.y_label.clone(),
@@ -5356,6 +5437,9 @@ impl App {
             }
             ChartExportOptionField::ShowCaption => {
                 opts.style.show_caption = !opts.style.show_caption
+            }
+            ChartExportOptionField::ShowGhostOverlays => {
+                opts.style.show_ghost_overlays = !opts.style.show_ghost_overlays
             }
             ChartExportOptionField::ShowGrid => opts.style.show_grid = !opts.style.show_grid,
             ChartExportOptionField::Smoothing => {
@@ -5435,10 +5519,24 @@ impl App {
                     opts.path = new_path;
                 }
                 ChartExportOptionField::XAxisTitle => {
-                    opts.style.x_label = self.chart_export_edit_buffer.clone();
+                    let value = self.chart_export_edit_buffer.clone();
+                    opts.style.x_label = value.clone();
+                    update_export_metric_labels(
+                        &mut opts.style,
+                        &opts.metric_key,
+                        Some(value),
+                        None,
+                    );
                 }
                 ChartExportOptionField::YAxisTitle => {
-                    opts.style.y_label = self.chart_export_edit_buffer.clone();
+                    let value = self.chart_export_edit_buffer.clone();
+                    opts.style.y_label = value.clone();
+                    update_export_metric_labels(
+                        &mut opts.style,
+                        &opts.metric_key,
+                        None,
+                        Some(value),
+                    );
                 }
                 ChartExportOptionField::PaddingTop => {
                     if let Some(value) = parse_padding_value(&self.chart_export_edit_buffer) {

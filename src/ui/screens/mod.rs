@@ -5763,6 +5763,7 @@ pub fn render_chart_export_options(frame: &mut Frame<'_>, app: &App) {
                 ChartExportOptionField::ShowSelectionMarker => "Selection marker",
                 ChartExportOptionField::ShowStatsBox => "Stats box",
                 ChartExportOptionField::ShowCaption => "Caption",
+                ChartExportOptionField::ShowGhostOverlays => "Ghost overlays",
                 ChartExportOptionField::ShowGrid => "Grid",
                 ChartExportOptionField::XAxisTitle => "X axis title",
                 ChartExportOptionField::YAxisTitle => "Y axis title",
